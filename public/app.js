@@ -70,6 +70,7 @@ async function loadClients(preferred = '') {
   select.value = state.selectedAccount;
   $('#accountBadge').textContent = state.clients.length ? `${state.clients.length} حساب متصل` : 'لا توجد حسابات';
   $('#connectionLabel').textContent = state.clients.length ? `${state.clients.length} حساب متصل` : 'جاهز للاتصال';
+  renderProfiles(state.clients);
   await loadGuilds();
 }
 async function loadGuilds() {
@@ -150,6 +151,39 @@ async function connect() {
     toast(error.message, 'error');
   } finally { setBusy('connect', false); }
 }
+async function bulkConnect() {
+  const lines = $('#bulkTokensInput').value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const accounts = lines.map((line, index) => {
+    const [maybeName, ...rest] = line.split('|').map((part) => part.trim());
+    return rest.length ? { name: maybeName, token: rest.join('|') } : { name: `account-${index + 1}`, token: maybeName };
+  });
+  if (!accounts.length) { feedback('#bulkFeedback', 'أضف توكنًا واحدًا على الأقل، كل توكن في سطر.', 'error'); return; }
+  $('#bulkConnectButton').disabled = true; feedback('#bulkFeedback', `جارٍ اتصال ${accounts.length} حساب بحد تزامن آمن…`);
+  try {
+    const result = await post('/api/discord/connect-bulk', { accounts });
+    const failed = result.results.filter((item) => !item.ok);
+    feedback('#bulkFeedback', `اكتمل الاتصال: ${result.summary.ok} نجح، ${result.summary.failed} فشل.`, failed.length ? 'error' : 'success');
+    addActivity('استيراد جماعي', `${result.summary.ok} حساب متصل`, failed.length ? 'error' : 'success');
+    toast(`تم اتصال ${result.summary.ok} حساب`, failed.length ? 'error' : 'success');
+    $('#bulkTokensInput').value = '';
+    await loadClients(); await refreshSessions();
+  } catch (error) { feedback('#bulkFeedback', error.message, 'error'); toast(error.message, 'error'); }
+  finally { $('#bulkConnectButton').disabled = false; }
+}
+
+function renderProfiles(clients = []) {
+  const list = $('#profilesList');
+  if (!list) return;
+  if (!clients.length) { list.innerHTML = '<div class="task-empty">لا توجد حسابات متصلة</div>'; return; }
+  list.innerHTML = clients.map((client) => {
+    const voice = client.voice;
+    const avatar = client.avatar ? `<img src="${escapeHTML(client.avatar)}" alt="" />` : escapeHTML((client.nickname || client.name || '?')[0].toUpperCase());
+    const voiceText = voice ? `${escapeHTML(voice.guildName || voice.guildId)} · ${escapeHTML(voice.channelName || voice.channelId)}` : 'خارج أي غرفة';
+    const flags = voice ? `${voice.selfMute ? 'كتم' : 'صوت'}${voice.selfDeaf ? ' · عزل' : ''}${voice.selfVideo ? ' · فيديو' : ''}${voice.selfStream ? ' · مشاركة' : ''}` : 'جاهز';
+    return `<div class="profile-row"><span class="profile-row-avatar">${avatar}</span><div class="profile-row-main"><strong>${escapeHTML(client.nickname || client.displayName || client.name)}</strong><small>@${escapeHTML(client.username || client.name)} · ID: ${escapeHTML(client.id || '—')}</small></div><div class="profile-row-voice"><span class="profile-online"></span><strong>${voiceText}</strong><small>${flags}</small></div></div>`;
+  }).join('');
+}
+
 async function disconnect() {
   if (!state.selectedAccount) { toast('لا يوجد حساب متصل لفصله', 'error'); return; }
   try {
@@ -240,7 +274,47 @@ async function refreshSessions() {
   try {
     const data = await api('/api/voice/sessions');
     renderSessions(data.sessions || []);
+    const clients = await api('/api/discord/clients');
+    state.clients = clients.clients || state.clients;
+    renderProfiles(state.clients);
+    await loadTasks();
   } catch (error) { console.warn('[voice] sessions refresh failed', error); }
+}
+async function loadTasks() {
+  try {
+    const [rotations, cycles] = await Promise.all([api('/api/voice/rotations'), api('/api/voice/state-cycles')]);
+    renderTasks([...(rotations.rotations || []).map((task) => ({ ...task, type: 'rotation', title: 'تنقل بين القنوات' })), ...(cycles.cycles || []).map((task) => ({ ...task, type: 'cycle', title: 'تدوير الحالات' }))]);
+  } catch (error) { console.warn('[voice] tasks refresh failed', error); }
+}
+function renderTasks(tasks) {
+  const list = $('#tasksList');
+  if (!list) return;
+  if (!tasks.length) { list.innerHTML = '<div class="task-empty">لا توجد مهام قيد التشغيل</div>'; return; }
+  list.innerHTML = tasks.map((task) => `<div class="task-row"><div><strong>${escapeHTML(task.title)}</strong><small>${task.accounts?.length || 0} حساب · كل ${Math.round((task.intervalMs || 0) / 60000)} دقيقة</small></div><button type="button" class="task-stop" data-task-type="${task.type}" data-task-id="${escapeHTML(task.id)}">إيقاف</button></div>`).join('');
+  list.querySelectorAll('.task-stop').forEach((button) => button.addEventListener('click', () => stopTask(button.dataset.taskType, button.dataset.taskId)));
+}
+async function startRotation() {
+  if (!requireTarget()) return;
+  const group = state.groups.find((item) => item.guildId === state.selectedTarget.guildId);
+  const channelIds = group?.voiceChannels?.map((channel) => channel.id) || [];
+  if (channelIds.length < 2) { toast('تحتاج إلى قناتين صوتيتين على الأقل للتنقل', 'error'); return; }
+  const intervalMs = Math.max(1, Number($('#automationMinutes').value || 5)) * 60000;
+  try { await post('/api/voice/rotation/start', { accounts: selectedAccounts(), guildId: state.selectedTarget.guildId, guildName: state.selectedTarget.guildName, channelIds, intervalMs, randomOrder: false }); toast('بدأ التنقل الدوري بين القنوات', 'success'); addActivity('مهمة جديدة', 'التنقل بين القنوات', 'success'); await loadTasks(); }
+  catch (error) { toast(error.message, 'error'); }
+}
+async function startCycle() {
+  if (!requireTarget()) return;
+  const selected = [...$('#automationStates').selectedOptions].map((option) => option.value);
+  if (selected.length < 2) { toast('اختر حالتين على الأقل', 'error'); return; }
+  const stateMap = { unmute: { selfMute: false, selfDeaf: false, selfVideo: false, selfStream: false }, mute: { selfMute: true, selfDeaf: false, selfVideo: false, selfStream: false }, deaf: { selfMute: true, selfDeaf: true, selfVideo: false, selfStream: false }, cam: { selfMute: false, selfDeaf: false, selfVideo: true, selfStream: false }, stream: { selfMute: false, selfDeaf: false, selfVideo: false, selfStream: true } };
+  const intervalMs = Math.max(1, Number($('#automationMinutes').value || 5)) * 60000;
+  try { await post('/api/voice/state-cycle/start', { accounts: selectedAccounts(), guildId: state.selectedTarget.guildId, states: selected.map((key) => stateMap[key]), intervalMs }); toast('بدأ تدوير الحالات الصوتية', 'success'); addActivity('مهمة جديدة', 'تدوير الحالات الصوتية', 'success'); await loadTasks(); }
+  catch (error) { toast(error.message, 'error'); }
+}
+async function stopTask(type, id) {
+  const endpoint = type === 'rotation' ? '/api/voice/rotation/stop' : '/api/voice/state-cycle/stop';
+  try { await post(endpoint, { id }); toast('تم إيقاف المهمة', 'success'); addActivity('إيقاف مهمة', id); await loadTasks(); }
+  catch (error) { toast(error.message, 'error'); }
 }
 async function quickLeave(name, guildId) {
   try { await post('/api/voice/leave', { accounts: [name], guildId }); toast('تم إنهاء الجلسة', 'success'); addActivity('إنهاء جلسة', name); await refreshSessions(); }
@@ -314,7 +388,7 @@ function initLanguage() {
 function initNavigation() { document.querySelectorAll('[data-scroll]').forEach((button) => button.addEventListener('click', () => document.getElementById(button.dataset.scroll)?.scrollIntoView({ behavior: 'smooth', block: 'center' }))); }
 function init() {
   initTheme(); initLanguage(); initNavigation();
-  $('#connectButton').addEventListener('click', connect); $('#disconnectButton').addEventListener('click', disconnect); $('#refreshButton').addEventListener('click', refreshChannels); $('#accountSelect').addEventListener('change', async (event) => { state.selectedAccount = event.target.value; await loadGuilds(); }); $('#channelSelect').addEventListener('change', handleChannelChange); $('#joinButton').addEventListener('click', join); $('#joinAllButton').addEventListener('click', joinAll); $('#leaveButton').addEventListener('click', leave); $('#cameraButton').addEventListener('click', toggleCamera); $('#screenButton').addEventListener('click', toggleScreen); $('#stopMediaButton').addEventListener('click', () => stopCurrentStream()); document.querySelectorAll('.state-button').forEach((button) => button.addEventListener('click', () => applyState(button.dataset.state)));
+  $('#connectButton').addEventListener('click', connect); $('#bulkConnectButton').addEventListener('click', bulkConnect); $('#disconnectButton').addEventListener('click', disconnect); $('#refreshButton').addEventListener('click', refreshChannels); $('#accountSelect').addEventListener('change', async (event) => { state.selectedAccount = event.target.value; await loadGuilds(); }); $('#channelSelect').addEventListener('change', handleChannelChange); $('#joinButton').addEventListener('click', join); $('#joinAllButton').addEventListener('click', joinAll); $('#leaveButton').addEventListener('click', leave); $('#cameraButton').addEventListener('click', toggleCamera); $('#screenButton').addEventListener('click', toggleScreen); $('#startRotationButton').addEventListener('click', startRotation); $('#startCycleButton').addEventListener('click', startCycle); $('#stopMediaButton').addEventListener('click', () => stopCurrentStream()); document.querySelectorAll('.state-button').forEach((button) => button.addEventListener('click', () => applyState(button.dataset.state)));
   window.addEventListener('beforeunload', () => stopCurrentStream({ updateDiscord: false }));
   loadClients().catch(() => {}); refreshSessions(); setInterval(refreshSessions, 8000);
 }

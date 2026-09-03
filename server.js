@@ -205,18 +205,47 @@ async function connectOne(token, name) {
 
 app.get('/api/health', (_req, res) => ok(res, { service: 'voice-studio', connected: clients.size }));
 app.get('/api/discord/clients', (_req, res) => ok(res, {
-  clients: [...clients.entries()].map(([name, entry]) => ({
-    name,
-    username: entry.client.user?.tag || entry.client.user?.username || name,
-    displayName: entry.client.user?.globalName || entry.client.user?.username || name,
-    id: entry.client.user?.id || null,
-    avatar: entry.client.user?.displayAvatarURL?.({ size: 64 }) || null,
-    status: entry.client.user?.presence?.status || 'online',
-  })),
+  clients: [...clients.entries()].map(([name, entry]) => {
+    const user = entry.client.user;
+    const voice = [...voiceSessions.values()].find((session) => session.name === name) || null;
+    const guild = voice ? entry.client.guilds?.cache?.get?.(voice.guildId) : null;
+    const member = guild?.members?.cache?.get?.(user?.id);
+    const channel = voice ? guild?.channels?.cache?.get?.(voice.channelId) : null;
+    return {
+      name,
+      username: user?.tag || user?.username || name,
+      displayName: user?.globalName || user?.username || name,
+      nickname: member?.displayName || user?.globalName || user?.username || name,
+      id: user?.id || null,
+      avatar: user?.displayAvatarURL?.({ size: 128 }) || null,
+      status: user?.presence?.status || 'online',
+      voice: voice ? { guildId: voice.guildId, guildName: guild?.name || voice.guildId, channelId: voice.channelId, channelName: channel?.name || voice.channelId, selfMute: !!voice.selfMute, selfDeaf: !!voice.selfDeaf, selfVideo: !!voice.selfVideo, selfStream: !!voice.selfStream } : null,
+    };
+  }),
 }));
 app.post('/api/discord/connect', async (req, res) => {
   try { return ok(res, await connectOne(req.body?.token, req.body?.name)); }
   catch (error) { return fail(res, error, 400); }
+});
+app.post('/api/discord/connect-bulk', async (req, res) => {
+  const items = Array.isArray(req.body?.accounts) ? req.body.accounts.slice(0, 500) : [];
+  if (!items.length) return fail(res, new Error('accounts must contain at least one token'), 400);
+  const results = [];
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < items.length) {
+      const index = cursor++;
+      const item = items[index] || {};
+      try {
+        const info = await connectOne(item.token, item.name || `account-${index + 1}`);
+        results[index] = { ok: true, ...info };
+      } catch (error) {
+        results[index] = { ok: false, name: item.name || `account-${index + 1}`, error: error.message };
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(3, items.length) }, worker));
+  return ok(res, { results, summary: summary(results) });
 });
 app.post('/api/discord/disconnect', async (req, res) => {
   const name = String(req.body?.name || [...clients.keys()][0] || '');

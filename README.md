@@ -26,6 +26,14 @@ npm test
 
 The tests cover the complete gateway OP4 payload, gateway confirmation, non-ready gateway errors, and the no-shard early-exit path that previously risked a hanging request.
 
+## Account dashboard and background tasks
+
+The dashboard accepts one account at a time or a bulk list. Bulk lines may be written as `name | token` or as a token alone. The server connects with a small concurrency window rather than opening hundreds of Gateway sessions at once; a single request accepts up to 500 entries and larger collections can be submitted in additional batches. There is no technically safe literal infinity: each connected account consumes memory, sockets, Discord rate-limit budget, and operating-system resources. The UI therefore reports individual successes and failures instead of failing the whole batch.
+
+Each connected account is shown with its avatar, display name, username, guild nickname when available, Discord user ID, presence status, current guild/channel, and current voice flags. Active sessions also show in the session list and refresh automatically.
+
+The automation panel starts and stops channel rotation and voice-state cycling. Rotation visits every available voice channel in the selected guild at the configured interval. State cycling applies the selected sequence of mute, deaf, video, and stream flags at the same interval. Both task types are kept in memory, exposed through status endpoints, and stopped cleanly by their task ID.
+
 ## Camera and screen-share behavior
 
 The camera and screen-share buttons are functional local capture controls. They request permission, show the selected source in the preview, expose a live status and timer, and clean up when the user stops the source or the browser ends the track. In a headless environment with no camera, the app shows the browser's explicit `Requested device not found` error instead of pretending the camera is live.

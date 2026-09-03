@@ -63,6 +63,7 @@
               </div>
               <div class="setup-actions"><button id="connectButton" class="primary-button" type="button"><span class="button-icon">↗</span><span>اتصال آمن</span></button><button id="disconnectButton" class="ghost-button" type="button">فصل الحساب</button></div>
               <div id="connectFeedback" class="inline-feedback" role="status" aria-live="polite"></div>
+              <div class="bulk-import"><div class="bulk-copy"><span>استيراد جماعي</span><small>كل سطر: اسم اختياري | التوكن</small></div><textarea id="bulkTokensInput" rows="2" placeholder="main | token...&#10;alt | token..."></textarea><button id="bulkConnectButton" class="ghost-button" type="button">إضافة الحسابات</button><div id="bulkFeedback" class="inline-feedback" role="status" aria-live="polite"></div></div>
             </article>
 
             <article class="card channel-card">
@@ -80,9 +81,20 @@
               </div>
             </article>
 
+            <article class="card automation-card">
+              <div class="card-heading compact"><div><span class="card-kicker">04 / الأتمتة</span><h2>المهام الدورية</h2></div><span class="soft-badge accent">تعمل بالخلفية</span></div>
+              <div class="automation-grid">
+                <label class="field"><span>كل كم دقيقة؟</span><input id="automationMinutes" type="number" min="1" max="1440" value="5" /></label>
+                <label class="select-field"><span>الحالات</span><select id="automationStates" multiple><option value="unmute" selected>صوت مفتوح</option><option value="mute" selected>كتم الصوت</option><option value="deaf">عزل كامل</option><option value="cam">فيديو</option><option value="stream">مشاركة الشاشة</option></select></label>
+              </div>
+              <div class="automation-actions"><button id="startRotationButton" class="action-button action-secondary" type="button">بدء التنقل بين القنوات</button><button id="startCycleButton" class="action-button action-secondary" type="button">بدء تدوير الحالات</button></div>
+              <div id="tasksList" class="tasks-list"><div class="task-empty">لا توجد مهام قيد التشغيل</div></div>
+            </article>
+
             <article id="sessionsCard" class="card sessions-card">
               <div class="card-heading compact"><div><span class="card-kicker">03 / المتابعة</span><h2>الجلسات النشطة</h2></div><span id="sessionLiveLabel" class="soft-badge accent">تحديث تلقائي</span></div>
               <div id="sessionsList" class="sessions-list"><div class="empty-state"><span class="empty-pulse"></span><p>لا توجد جلسات نشطة الآن</p><small>عند الدخول إلى غرفة ستظهر تفاصيلها هنا.</small></div></div>
+              <div class="profiles-heading"><span>ملفات الحسابات</span><small>الاسم، النيك نيم، المعرّف والحالة الحالية</small></div><div id="profilesList" class="profiles-list"><div class="task-empty">لا توجد حسابات متصلة</div></div>
             </article>
           </div>
 
