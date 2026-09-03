@@ -32,7 +32,15 @@ The dashboard accepts one account at a time or a bulk list. Bulk lines may be wr
 
 Each connected account is shown with its avatar, display name, username, guild nickname when available, Discord user ID, presence status, current guild/channel, and current voice flags. Active sessions also show in the session list and refresh automatically.
 
-The automation panel starts and stops channel rotation and voice-state cycling. Rotation visits every available voice channel in the selected guild at the configured interval. State cycling applies the selected sequence of mute, deaf, video, and stream flags at the same interval. Both task types are kept in memory, exposed through status endpoints, and stopped cleanly by their task ID.
+The automation panel starts and stops channel rotation and voice-state cycling. Rotation visits only the voice channels explicitly selected by the user in the selected guild at the configured interval. State cycling applies the selected sequence of mute, deaf, video, and stream flags at the same interval. Both task types are kept in memory, exposed through status endpoints, and stopped cleanly by their task ID.
+
+## تخصص اختيار الحسابات والسيرفر والرومات
+
+يبدأ الاستخدام من قسم الاتصال. يمكنك إضافة حساب واحد بإدخال اسم اختياري والتوكن، أو إضافة مجموعة حسابات في مربع الاستيراد الجماعي؛ استخدم الصيغة `name | token`، أو ضع توكنًا واحدًا في كل سطر. بعد الاتصال، تظهر الحسابات في قائمة الحسابات وفي دليل البروفايلات مع الأفاتار والنيك نيم والـ ID والحالة.
+
+للمهام الدورية، انتقل إلى قسم **المهام الدورية**. في الخطوة الأولى حدّد حسابًا أو أكثر باستخدام الاختيار المتعدد. في الخطوة الثانية اختر السيرفر. بعدها تظهر فقط القنوات الصوتية التي يستطيع الحساب المحدد الوصول إليها. ضع علامة على الرومات التي تريدها يدويًا؛ لن تستخدم مهمة التنقل أي روم خارج هذه القائمة. يجب تحديد رومتين على الأقل. فعّل خيار التنقل العشوائي إذا أردت تغيير ترتيب الرومات في كل دورة، أو اتركه مغلقًا للتنقل بالتسلسل. عند الضغط على بدء التنقل، ينقل النظام الحسابات المختارة إلى أول روم محدد ثم يبدأ التنقل بينها حسب الفترة. الحسابات التي تفشل في الدخول لا تُضاف إلى المهمة النشطة.
+
+لتدوير الحالة الصوتية، استخدم نفس اختيار الحسابات والسيرفر، ثم اختر حالتين أو أكثر من قائمة الحالات، مثل كتم ثم صوت مفتوح أو فيديو ثم صوت مفتوح، وحدد الفترة بالدقائق. هذه المهمة تطبق أعلام الحالة على الجلسات الصوتية للحسابات المستهدفة، ويمكن إيقاف أي مهمة من قائمة المهام النشطة.
 
 ## Camera and screen-share behavior
 

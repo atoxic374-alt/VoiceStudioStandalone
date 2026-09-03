@@ -2,6 +2,7 @@ const $ = (selector) => document.querySelector(selector);
 const state = {
   clients: [],
   groups: [],
+  allGroups: [],
   selectedAccount: '',
   selectedTarget: null,
   mediaStream: null,
@@ -72,7 +73,35 @@ async function loadClients(preferred = '') {
   $('#connectionLabel').textContent = state.clients.length ? `${state.clients.length} حساب متصل` : 'جاهز للاتصال';
   renderProfiles(state.clients);
   await loadGuilds();
+  await loadAutomationCatalog();
 }
+async function loadAutomationCatalog() {
+  const accountSelect = $('#automationAccounts');
+  const guildSelect = $('#automationGuild');
+  if (!accountSelect || !guildSelect) return;
+  try {
+    const data = await api('/api/voice/guilds');
+    state.allGroups = data.guilds || [];
+    const selectedBefore = new Set([...accountSelect.selectedOptions].map((option) => option.value));
+    accountSelect.innerHTML = state.clients.length ? state.clients.map((client) => `<option value="${escapeHTML(client.name)}">${escapeHTML(client.nickname || client.displayName || client.name)}</option>`).join('') : '<option value="">لا توجد حسابات متصلة</option>';
+    [...accountSelect.options].forEach((option) => { option.selected = state.clients.length ? (!selectedBefore.size || selectedBefore.has(option.value)) : false; });
+    const guilds = [...new Map(state.allGroups.map((group) => [group.guildId, group])).values()];
+    guildSelect.innerHTML = guilds.length ? `<option value="">اختر السيرفر</option>${guilds.map((group) => `<option value="${escapeHTML(group.guildId)}">${escapeHTML(group.guildName)}</option>`).join('')}` : '<option value="">لا توجد سيرفرات متاحة</option>';
+    renderAutomationChannels();
+  } catch (error) { console.warn('[voice] automation catalog failed', error); }
+}
+function selectedAutomationAccounts() { return [...$('#automationAccounts').selectedOptions].map((option) => option.value).filter(Boolean); }
+function renderAutomationChannels() {
+  const wrapper = $('#automationChannels');
+  const guildId = $('#automationGuild')?.value;
+  const accounts = selectedAutomationAccounts();
+  const groups = state.allGroups.filter((group) => group.guildId === guildId && (!accounts.length || accounts.includes(group.account)));
+  const channels = [...new Map(groups.flatMap((group) => group.voiceChannels || []).map((channel) => [channel.id, channel])).values()];
+  if (!guildId) { wrapper.innerHTML = '<div class="task-empty">اختر سيرفرًا لعرض الرومات</div>'; return; }
+  if (!channels.length) { wrapper.innerHTML = '<div class="task-empty">لا توجد رومات متاحة للحسابات المحددة</div>'; return; }
+  wrapper.innerHTML = channels.map((channel) => `<label class="channel-check"><input type="checkbox" value="${escapeHTML(channel.id)}" /><span><strong>${escapeHTML(channel.name)}</strong><small>${channel.members || 0} متصل · ${channel.bitrate || 64} kbps</small></span></label>`).join('');
+}
+function selectedAutomationChannels() { return [...document.querySelectorAll('#automationChannels input[type="checkbox"]:checked')].map((input) => input.value); }
 async function loadGuilds() {
   state.groups = [];
   state.selectedTarget = null;
@@ -294,21 +323,29 @@ function renderTasks(tasks) {
   list.querySelectorAll('.task-stop').forEach((button) => button.addEventListener('click', () => stopTask(button.dataset.taskType, button.dataset.taskId)));
 }
 async function startRotation() {
-  if (!requireTarget()) return;
-  const group = state.groups.find((item) => item.guildId === state.selectedTarget.guildId);
-  const channelIds = group?.voiceChannels?.map((channel) => channel.id) || [];
-  if (channelIds.length < 2) { toast('تحتاج إلى قناتين صوتيتين على الأقل للتنقل', 'error'); return; }
+  if (!state.clients.length) { toast('اتصل بحساب واحد على الأقل أولًا', 'error'); return; }
+  const accounts = selectedAutomationAccounts();
+  const guildId = $('#automationGuild').value;
+  const channelIds = selectedAutomationChannels();
+  if (accounts.length < 1) { toast('اختر حسابًا واحدًا على الأقل للمهمة', 'error'); return; }
+  if (!guildId) { toast('اختر السيرفر الذي ستعمل عليه المهمة', 'error'); return; }
+  if (channelIds.length < 2) { toast('حدد رومتين على الأقل للتنقل بينهما', 'error'); return; }
+  const guild = state.allGroups.find((group) => group.guildId === guildId);
   const intervalMs = Math.max(1, Number($('#automationMinutes').value || 5)) * 60000;
-  try { await post('/api/voice/rotation/start', { accounts: selectedAccounts(), guildId: state.selectedTarget.guildId, guildName: state.selectedTarget.guildName, channelIds, intervalMs, randomOrder: false }); toast('بدأ التنقل الدوري بين القنوات', 'success'); addActivity('مهمة جديدة', 'التنقل بين القنوات', 'success'); await loadTasks(); }
+  try { await post('/api/voice/rotation/start', { accounts, guildId, guildName: guild?.guildName || guildId, channelIds, intervalMs, randomOrder: $('#randomRotation').checked }); toast('بدأ التنقل الدوري بين القنوات', 'success'); addActivity('مهمة جديدة', 'التنقل بين القنوات', 'success'); await loadTasks(); }
   catch (error) { toast(error.message, 'error'); }
 }
 async function startCycle() {
-  if (!requireTarget()) return;
+  if (!requireAccount()) return;
+  const accounts = selectedAutomationAccounts();
+  const guildId = $('#automationGuild').value;
+  if (!accounts.length) { toast('اختر الحسابات المستهدفة للمهمة', 'error'); return; }
+  if (!guildId) { toast('اختر السيرفر الذي سيطبق الحالات', 'error'); return; }
   const selected = [...$('#automationStates').selectedOptions].map((option) => option.value);
   if (selected.length < 2) { toast('اختر حالتين على الأقل', 'error'); return; }
   const stateMap = { unmute: { selfMute: false, selfDeaf: false, selfVideo: false, selfStream: false }, mute: { selfMute: true, selfDeaf: false, selfVideo: false, selfStream: false }, deaf: { selfMute: true, selfDeaf: true, selfVideo: false, selfStream: false }, cam: { selfMute: false, selfDeaf: false, selfVideo: true, selfStream: false }, stream: { selfMute: false, selfDeaf: false, selfVideo: false, selfStream: true } };
   const intervalMs = Math.max(1, Number($('#automationMinutes').value || 5)) * 60000;
-  try { await post('/api/voice/state-cycle/start', { accounts: selectedAccounts(), guildId: state.selectedTarget.guildId, states: selected.map((key) => stateMap[key]), intervalMs }); toast('بدأ تدوير الحالات الصوتية', 'success'); addActivity('مهمة جديدة', 'تدوير الحالات الصوتية', 'success'); await loadTasks(); }
+  try { await post('/api/voice/state-cycle/start', { accounts, guildId, states: selected.map((key) => stateMap[key]), intervalMs }); toast('بدأ تدوير الحالات الصوتية', 'success'); addActivity('مهمة جديدة', 'تدوير الحالات الصوتية', 'success'); await loadTasks(); }
   catch (error) { toast(error.message, 'error'); }
 }
 async function stopTask(type, id) {
@@ -388,7 +425,7 @@ function initLanguage() {
 function initNavigation() { document.querySelectorAll('[data-scroll]').forEach((button) => button.addEventListener('click', () => document.getElementById(button.dataset.scroll)?.scrollIntoView({ behavior: 'smooth', block: 'center' }))); }
 function init() {
   initTheme(); initLanguage(); initNavigation();
-  $('#connectButton').addEventListener('click', connect); $('#bulkConnectButton').addEventListener('click', bulkConnect); $('#disconnectButton').addEventListener('click', disconnect); $('#refreshButton').addEventListener('click', refreshChannels); $('#accountSelect').addEventListener('change', async (event) => { state.selectedAccount = event.target.value; await loadGuilds(); }); $('#channelSelect').addEventListener('change', handleChannelChange); $('#joinButton').addEventListener('click', join); $('#joinAllButton').addEventListener('click', joinAll); $('#leaveButton').addEventListener('click', leave); $('#cameraButton').addEventListener('click', toggleCamera); $('#screenButton').addEventListener('click', toggleScreen); $('#startRotationButton').addEventListener('click', startRotation); $('#startCycleButton').addEventListener('click', startCycle); $('#stopMediaButton').addEventListener('click', () => stopCurrentStream()); document.querySelectorAll('.state-button').forEach((button) => button.addEventListener('click', () => applyState(button.dataset.state)));
+  $('#connectButton').addEventListener('click', connect); $('#bulkConnectButton').addEventListener('click', bulkConnect); $('#disconnectButton').addEventListener('click', disconnect); $('#refreshButton').addEventListener('click', refreshChannels); $('#accountSelect').addEventListener('change', async (event) => { state.selectedAccount = event.target.value; await loadGuilds(); await loadAutomationCatalog(); }); $('#automationAccounts').addEventListener('change', renderAutomationChannels); $('#automationGuild').addEventListener('change', renderAutomationChannels); $('#channelSelect').addEventListener('change', handleChannelChange); $('#joinButton').addEventListener('click', join); $('#joinAllButton').addEventListener('click', joinAll); $('#leaveButton').addEventListener('click', leave); $('#cameraButton').addEventListener('click', toggleCamera); $('#screenButton').addEventListener('click', toggleScreen); $('#startRotationButton').addEventListener('click', startRotation); $('#startCycleButton').addEventListener('click', startCycle); $('#stopMediaButton').addEventListener('click', () => stopCurrentStream()); document.querySelectorAll('.state-button').forEach((button) => button.addEventListener('click', () => applyState(button.dataset.state)));
   window.addEventListener('beforeunload', () => stopCurrentStream({ updateDiscord: false }));
   loadClients().catch(() => {}); refreshSessions(); setInterval(refreshSessions, 8000);
 }

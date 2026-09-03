@@ -349,13 +349,16 @@ app.post('/api/voice/distribute-random', async (req, res) => {
   return ok(res, { results, summary: summary(results) });
 });
 
-app.post('/api/voice/rotation/start', (req, res) => {
+app.post('/api/voice/rotation/start', async (req, res) => {
   const accounts = cleanAccounts(req.body?.accounts);
   const { guildId, guildName, channelIds, intervalMs, randomOrder = false } = req.body || {};
   const delay = Math.max(5000, Number(intervalMs || 60000));
   if (!accounts.length || !guildId || !Array.isArray(channelIds) || channelIds.length < 2) return fail(res, new Error('At least two channels and one account are required'), 400);
+  const initial = await Promise.all(accounts.map((name) => moveAccount(name, guildId, channelIds[0])));
+  const readyAccounts = initial.filter((result) => result.ok).map((result) => result.name);
+  if (!readyAccounts.length) return ok(res, { id: null, started: false, initial, summary: summary(initial) });
   const id = crypto.randomUUID();
-  const task = { id, accounts, guildId, guildName: guildName || guildId, channels: channelIds, intervalMs: delay, randomOrder: !!randomOrder, currentIdx: 0, nextAt: Date.now() + delay };
+  const task = { id, accounts: readyAccounts, guildId, guildName: guildName || guildId, channels: channelIds, intervalMs: delay, randomOrder: !!randomOrder, currentIdx: 0, nextAt: Date.now() + delay };
   task.timer = setInterval(async () => {
     task.currentIdx = (task.currentIdx + 1) % task.channels.length;
     const ids = task.randomOrder ? [...task.channels].sort(() => Math.random() - 0.5) : task.channels;
@@ -363,7 +366,7 @@ app.post('/api/voice/rotation/start', (req, res) => {
     task.nextAt = Date.now() + task.intervalMs;
   }, delay);
   rotations.set(id, task);
-  return ok(res, { id });
+  return ok(res, { id, started: true, initial, summary: summary(initial) });
 });
 app.post('/api/voice/rotation/stop', (req, res) => {
   const id = String(req.body?.id || '');

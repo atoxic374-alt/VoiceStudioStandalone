@@ -83,11 +83,17 @@
 
             <article class="card automation-card">
               <div class="card-heading compact"><div><span class="card-kicker">04 / الأتمتة</span><h2>المهام الدورية</h2></div><span class="soft-badge accent">تعمل بالخلفية</span></div>
+              <div class="automation-step"><span class="step-number">1</span><div><strong>الحسابات المستهدفة</strong><small>اختر حسابًا أو أكثر لهذه المهمة</small></div></div>
+              <select id="automationAccounts" class="multi-select" multiple size="3"><option value="">لا توجد حسابات متصلة</option></select>
+              <div class="automation-step"><span class="step-number">2</span><div><strong>السيرفر والرومات</strong><small>حدد السيرفر ثم الرومات التي تريد التنقل بينها فقط</small></div></div>
+              <select id="automationGuild" class="automation-guild"><option value="">اختر السيرفر</option></select>
+              <div id="automationChannels" class="automation-channels"><div class="task-empty">اختر سيرفرًا لعرض الرومات</div></div>
               <div class="automation-grid">
                 <label class="field"><span>كل كم دقيقة؟</span><input id="automationMinutes" type="number" min="1" max="1440" value="5" /></label>
                 <label class="select-field"><span>الحالات</span><select id="automationStates" multiple><option value="unmute" selected>صوت مفتوح</option><option value="mute" selected>كتم الصوت</option><option value="deaf">عزل كامل</option><option value="cam">فيديو</option><option value="stream">مشاركة الشاشة</option></select></label>
               </div>
-              <div class="automation-actions"><button id="startRotationButton" class="action-button action-secondary" type="button">بدء التنقل بين القنوات</button><button id="startCycleButton" class="action-button action-secondary" type="button">بدء تدوير الحالات</button></div>
+              <label class="random-toggle"><input id="randomRotation" type="checkbox" checked /><span>تنقل عشوائي داخل الرومات المحددة</span></label>
+              <div class="automation-actions"><button id="startRotationButton" class="action-button action-secondary" type="button">بدء التنقل بين الرومات</button><button id="startCycleButton" class="action-button action-secondary" type="button">بدء تدوير الحالات</button></div>
               <div id="tasksList" class="tasks-list"><div class="task-empty">لا توجد مهام قيد التشغيل</div></div>
             </article>
 
