@@ -1,0 +1,20 @@
+{
+  "name": "voice-studio-standalone",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Standalone personal voice control studio with reliable camera and screen-share previews.",
+  "main": "server.js",
+  "engines": { "node": ">=20.0.0" },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test",
+    "check": "node --check server.js && node --check public/app.js"
+  },
+  "dependencies": {
+    "discord.js-selfbot-v13": "^3.7.1",
+    "express": "^5.2.1",
+    "helmet": "^8.1.0"
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,381 @@
+const express = require('express');
+const path = require('path');
+const fs = require('fs');
+const crypto = require('crypto');
+const { Client } = require('discord.js-selfbot-v13');
+const helmet = require('helmet');
+
+const app = express();
+const PORT = Number(process.env.PORT || 5050);
+const DATA_DIR = path.join(__dirname, 'data');
+const VOICE_STATE_FILE = path.join(DATA_DIR, 'voice-sessions.json');
+fs.mkdirSync(DATA_DIR, { recursive: true });
+
+app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
+app.use(express.json({ limit: '1mb' }));
+app.use(express.static(path.join(__dirname, 'public'), { extensions: ['html'] }));
+
+// This standalone app intentionally keeps tokens in memory only.
+const clients = new Map();
+const voiceSessions = new Map();
+const rotations = new Map();
+const stateCycles = new Map();
+
+function ok(res, payload = {}) { return res.json({ success: true, ...payload }); }
+function fail(res, error, status = 200) {
+  const message = error?.message || String(error || 'Unknown error');
+  return res.status(status).json({ success: false, error: message });
+}
+function sessionKey(name, guildId) { return `${name}__${guildId}`; }
+function cleanAccounts(accounts) {
+  const values = Array.isArray(accounts) ? accounts : [accounts];
+  return [...new Set(values.map((value) => String(value || '').trim()).filter(Boolean))];
+}
+function summary(results) {
+  const okCount = results.filter((item) => item.ok).length;
+  return { total: results.length, ok: okCount, failed: results.length - okCount };
+}
+function readPersistedSessions() {
+  try {
+    const value = JSON.parse(fs.readFileSync(VOICE_STATE_FILE, 'utf8'));
+    return Array.isArray(value) ? value : [];
+  } catch { return []; }
+}
+function persistSessions() {
+  const safe = [...voiceSessions.values()].map(({ name, guildId, channelId, selfMute, selfDeaf, selfVideo, selfStream }) => ({
+    name, guildId, channelId, selfMute: !!selfMute, selfDeaf: !!selfDeaf, selfVideo: !!selfVideo, selfStream: !!selfStream,
+  }));
+  const temp = `${VOICE_STATE_FILE}.tmp`;
+  try {
+    fs.writeFileSync(temp, JSON.stringify(safe, null, 2));
+    fs.renameSync(temp, VOICE_STATE_FILE);
+  } catch (error) {
+    try { fs.rmSync(temp, { force: true }); } catch {}
+    console.warn('[voice] unable to persist sessions:', error.message);
+  }
+}
+for (const session of readPersistedSessions()) {
+  if (session?.name && session?.guildId && session?.channelId) voiceSessions.set(sessionKey(session.name, session.guildId), session);
+}
+
+function getClient(name) {
+  const entry = clients.get(String(name || ''));
+  return entry?.client || null;
+}
+function getGatewayShard(client) {
+  return client?.ws?.shards?.first?.() || client?.ws?.shards?.get?.(0) || null;
+}
+function sendVoiceOp(client, guildId, channelId, opts = {}) {
+  try {
+    const shard = getGatewayShard(client);
+    if (!shard) return { ok: false, error: 'No active gateway shard' };
+    if (shard.status !== undefined && shard.status !== 0) return { ok: false, error: `Gateway not ready (status=${shard.status})` };
+    shard.send({
+      op: 4,
+      d: {
+        guild_id: guildId,
+        channel_id: channelId ?? null,
+        self_mute: !!opts.selfMute,
+        self_deaf: !!opts.selfDeaf,
+        self_video: !!opts.selfVideo,
+        self_stream: !!opts.selfStream,
+      },
+    });
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: error?.message || 'Unable to send voice state' };
+  }
+}
+
+// Fixed confirmation flow: timer is allocated before any early failure can call cleanup.
+// The old implementation could leave the request pending because clearTimeout() ran
+// while `timer` was still in the temporal dead zone.
+function sendVoiceOpConfirmed(client, guildId, channelId, opts = {}, timeoutMs = 4500) {
+  return new Promise((resolve) => {
+    const userId = client?.user?.id;
+    if (!userId) return resolve({ ok: false, error: 'Client not ready (no user id)' });
+
+    let settled = false;
+    let timer = null;
+    const cleanup = () => {
+      try { client.ws?.off?.('VOICE_STATE_UPDATE', onWsState); } catch {}
+      try { client.off?.('voiceStateUpdate', onJsState); } catch {}
+      if (timer) clearTimeout(timer);
+      timer = null;
+    };
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(result);
+    };
+    const matches = (guild, channel) => String(guild) === String(guildId)
+      && (channelId == null ? channel == null : String(channel) === String(channelId));
+    const onWsState = (data) => {
+      if (!data || String(data.user_id) !== String(userId)) return;
+      if (matches(data.guild_id, data.channel_id)) finish({ ok: true });
+    };
+    const onJsState = (_oldState, newState) => {
+      const id = newState?.member?.id || newState?.id || newState?.userId;
+      if (String(id) !== String(userId)) return;
+      const guild = newState?.guild?.id || newState?.guildId;
+      const channel = newState?.channelId ?? newState?.channel_id;
+      if (matches(guild, channel)) finish({ ok: true });
+    };
+
+    try { client.ws?.on?.('VOICE_STATE_UPDATE', onWsState); } catch {}
+    try { client.on?.('voiceStateUpdate', onJsState); } catch {}
+    timer = setTimeout(() => finish({ ok: false, error: 'Discord did not confirm the voice state in time' }), timeoutMs);
+
+    const sent = sendVoiceOp(client, guildId, channelId, opts);
+    if (!sent.ok) finish(sent);
+  });
+}
+
+function isVoiceChannel(channel) {
+  return channel?.type === 'GUILD_VOICE' || channel?.type === 'GUILD_STAGE_VOICE' || channel?.type === 2 || channel?.type === 13;
+}
+function canJoin(channel, memberOrId) {
+  const permissions = channel?.permissionsFor?.(memberOrId);
+  return (permissions?.has?.('VIEW_CHANNEL') ?? true) && (permissions?.has?.('CONNECT') ?? true);
+}
+function validateTarget(client, guildId, channelId) {
+  const guild = client?.guilds?.cache?.get?.(guildId);
+  if (!guild) return { ok: false, error: 'Guild not found in this account' };
+  const channel = guild.channels?.cache?.get?.(channelId);
+  if (!channel) return { ok: false, error: 'Channel not found in this server' };
+  if (!isVoiceChannel(channel)) return { ok: false, error: 'Selected channel is not a voice channel' };
+  const me = guild.members?.me || guild.members?.cache?.get?.(client.user?.id) || client.user?.id;
+  if (!canJoin(channel, me)) return { ok: false, error: 'Missing permission to view or join this channel' };
+  const limit = Number(channel.userLimit || 0);
+  const current = channel.members?.size || 0;
+  const alreadyIn = guild.voiceStates?.cache?.get?.(client.user?.id)?.channelId === channelId;
+  if (!alreadyIn && limit > 0 && current >= limit) return { ok: false, error: 'Voice channel is full' };
+  return { ok: true, guild, channel };
+}
+function upsertSession(name, guildId, channelId, opts = {}) {
+  voiceSessions.set(sessionKey(name, guildId), {
+    name, guildId, channelId,
+    selfMute: !!opts.selfMute,
+    selfDeaf: !!opts.selfDeaf,
+    selfVideo: !!opts.selfVideo,
+    selfStream: !!opts.selfStream,
+    joinedAt: Date.now(),
+  });
+  persistSessions();
+}
+async function moveAccount(name, guildId, channelId, opts = {}) {
+  const client = getClient(name);
+  if (!client) return { name, ok: false, error: 'Account is not connected' };
+  const target = validateTarget(client, guildId, channelId);
+  if (!target.ok) return { name, ok: false, error: target.error };
+  const result = await sendVoiceOpConfirmed(client, guildId, channelId, opts);
+  if (result.ok) upsertSession(name, guildId, channelId, opts);
+  return { name, ok: result.ok, error: result.ok ? null : result.error, channelId };
+}
+
+async function connectOne(token, name) {
+  if (typeof token !== 'string' || !token.trim()) throw new Error('A Discord token is required');
+  const finalName = String(name || `account-${clients.size + 1}`).trim().slice(0, 48);
+  if (clients.has(finalName)) {
+    try { await clients.get(finalName).client.destroy(); } catch {}
+    clients.delete(finalName);
+  }
+  const client = new Client({ checkUpdate: false, fetchAllMembers: false });
+  await client.login(token.trim());
+  clients.set(finalName, { client, token: token.trim() });
+
+  // Restore only the channel state; media capture remains browser-owned and must be
+  // explicitly re-enabled by the user after reconnecting.
+  setTimeout(() => {
+    for (const session of voiceSessions.values()) {
+      if (session.name !== finalName) continue;
+      sendVoiceOp(client, session.guildId, session.channelId, {
+        selfMute: session.selfMute, selfDeaf: session.selfDeaf, selfVideo: false, selfStream: false,
+      });
+    }
+  }, 1200).unref?.();
+
+  return {
+    name: finalName,
+    username: client.user?.tag || client.user?.username || finalName,
+    id: client.user?.id || null,
+  };
+}
+
+app.get('/api/health', (_req, res) => ok(res, { service: 'voice-studio', connected: clients.size }));
+app.get('/api/discord/clients', (_req, res) => ok(res, {
+  clients: [...clients.entries()].map(([name, entry]) => ({
+    name,
+    username: entry.client.user?.tag || entry.client.user?.username || name,
+    displayName: entry.client.user?.globalName || entry.client.user?.username || name,
+    id: entry.client.user?.id || null,
+    avatar: entry.client.user?.displayAvatarURL?.({ size: 64 }) || null,
+    status: entry.client.user?.presence?.status || 'online',
+  })),
+}));
+app.post('/api/discord/connect', async (req, res) => {
+  try { return ok(res, await connectOne(req.body?.token, req.body?.name)); }
+  catch (error) { return fail(res, error, 400); }
+});
+app.post('/api/discord/disconnect', async (req, res) => {
+  const name = String(req.body?.name || [...clients.keys()][0] || '');
+  const entry = clients.get(name);
+  if (!entry) return ok(res);
+  try { await entry.client.destroy(); } catch {}
+  clients.delete(name);
+  return ok(res, { name });
+});
+app.post('/api/discord/disconnect-all', async (_req, res) => {
+  for (const entry of clients.values()) { try { await entry.client.destroy(); } catch {} }
+  clients.clear();
+  return ok(res);
+});
+
+app.get('/api/voice/guilds', (req, res) => {
+  const requested = String(req.query?.account || '').trim();
+  const entries = requested ? [[requested, clients.get(requested)]] : [...clients.entries()];
+  const guilds = [];
+  for (const [name, entry] of entries) {
+    if (!entry?.client?.guilds?.cache) continue;
+    for (const guild of entry.client.guilds.cache.values()) {
+      const me = guild.members?.me || entry.client.user?.id;
+      const voiceChannels = [...guild.channels.cache.values()]
+        .filter((channel) => isVoiceChannel(channel) && canJoin(channel, me))
+        .map((channel) => ({
+          id: channel.id,
+          name: channel.name,
+          userLimit: Number(channel.userLimit || 0),
+          members: channel.members?.size || 0,
+          bitrate: Math.round((Number(channel.bitrate || 64000)) / 1000),
+        }))
+        .sort((a, b) => a.name.localeCompare(b.name));
+      if (voiceChannels.length) guilds.push({ account: name, guildId: guild.id, guildName: guild.name, guildIcon: guild.iconURL?.({ size: 64 }) || null, voiceChannels });
+    }
+  }
+  return ok(res, { guilds });
+});
+app.get('/api/voice/sessions', (_req, res) => ok(res, { sessions: [...voiceSessions.values()] }));
+app.get('/api/voice/rotations', (_req, res) => ok(res, { rotations: [...rotations.values()].map(({ timer, ...item }) => item) }));
+app.get('/api/voice/state-cycles', (_req, res) => ok(res, { cycles: [...stateCycles.values()].map(({ timer, ...item }) => item) }));
+
+app.post('/api/voice/join', async (req, res) => {
+  const accounts = cleanAccounts(req.body?.accounts);
+  const { guildId, channelId, selfMute = false, selfDeaf = false } = req.body || {};
+  if (!accounts.length || !guildId || !channelId) return fail(res, new Error('accounts, guildId and channelId are required'), 400);
+  if (typeof selfMute !== 'boolean' || typeof selfDeaf !== 'boolean') return fail(res, new Error('Mute values must be boolean'), 400);
+  const results = await Promise.all(accounts.map((name) => moveAccount(name, guildId, channelId, { selfMute, selfDeaf })));
+  return ok(res, { results, summary: summary(results) });
+});
+app.post('/api/voice/leave', async (req, res) => {
+  const accounts = cleanAccounts(req.body?.accounts);
+  const guildId = String(req.body?.guildId || '');
+  if (!accounts.length || !guildId) return fail(res, new Error('accounts and guildId are required'), 400);
+  const results = await Promise.all(accounts.map(async (name) => {
+    const client = getClient(name);
+    if (!client) return { name, ok: false, error: 'Account is not connected' };
+    const result = await sendVoiceOpConfirmed(client, guildId, null, {}, 3000);
+    if (result.ok) { voiceSessions.delete(sessionKey(name, guildId)); persistSessions(); }
+    return { name, ok: result.ok, error: result.ok ? null : result.error };
+  }));
+  return ok(res, { results, summary: summary(results) });
+});
+app.post('/api/voice/state', async (req, res) => {
+  const accounts = cleanAccounts(req.body?.accounts);
+  const { guildId, selfMute, selfDeaf, selfVideo, selfStream } = req.body || {};
+  if (!accounts.length || !guildId) return fail(res, new Error('accounts and guildId are required'), 400);
+  for (const value of [selfMute, selfDeaf, selfVideo, selfStream]) if (value !== undefined && typeof value !== 'boolean') return fail(res, new Error('Voice state values must be boolean'), 400);
+  if (selfDeaf === true && (selfVideo === true || selfStream === true)) return fail(res, new Error('Video or screen share cannot be enabled while deafened'), 400);
+  const results = await Promise.all(accounts.map(async (name) => {
+    const client = getClient(name);
+    const current = voiceSessions.get(sessionKey(name, guildId));
+    if (!client) return { name, ok: false, error: 'Account is not connected' };
+    if (!current?.channelId) return { name, ok: false, error: 'Account is not in a voice channel' };
+    const next = {
+      selfMute: selfMute !== undefined ? selfMute : !!current.selfMute,
+      selfDeaf: selfDeaf !== undefined ? selfDeaf : !!current.selfDeaf,
+      selfVideo: selfVideo !== undefined ? selfVideo : !!current.selfVideo,
+      selfStream: selfStream !== undefined ? selfStream : !!current.selfStream,
+    };
+    if (next.selfDeaf && (next.selfVideo || next.selfStream)) return { name, ok: false, error: 'Video or screen share cannot be enabled while deafened' };
+    const result = await sendVoiceOpConfirmed(client, guildId, current.channelId, next, 3000);
+    if (result.ok) { Object.assign(current, next); persistSessions(); }
+    return { name, ok: result.ok, error: result.ok ? null : result.error };
+  }));
+  return ok(res, { results, summary: summary(results) });
+});
+app.post('/api/voice/join-all', async (req, res) => {
+  const { guildId, channelId, selfMute = false, selfDeaf = false } = req.body || {};
+  const accounts = [...clients.keys()];
+  if (!guildId || !channelId) return fail(res, new Error('guildId and channelId are required'), 400);
+  const results = await Promise.all(accounts.map((name) => moveAccount(name, guildId, channelId, { selfMute, selfDeaf })));
+  return ok(res, { results, summary: summary(results) });
+});
+app.post('/api/voice/distribute-random', async (req, res) => {
+  const accounts = cleanAccounts(req.body?.accounts).length ? cleanAccounts(req.body.accounts) : [...clients.keys()];
+  const { guildId, channelIds } = req.body || {};
+  if (!guildId || !Array.isArray(channelIds) || !channelIds.length) return fail(res, new Error('guildId and channelIds are required'), 400);
+  const shuffled = [...channelIds].sort(() => Math.random() - 0.5);
+  const results = await Promise.all(accounts.map((name, index) => moveAccount(name, guildId, shuffled[index % shuffled.length])));
+  return ok(res, { results, summary: summary(results) });
+});
+
+app.post('/api/voice/rotation/start', (req, res) => {
+  const accounts = cleanAccounts(req.body?.accounts);
+  const { guildId, guildName, channelIds, intervalMs, randomOrder = false } = req.body || {};
+  const delay = Math.max(5000, Number(intervalMs || 60000));
+  if (!accounts.length || !guildId || !Array.isArray(channelIds) || channelIds.length < 2) return fail(res, new Error('At least two channels and one account are required'), 400);
+  const id = crypto.randomUUID();
+  const task = { id, accounts, guildId, guildName: guildName || guildId, channels: channelIds, intervalMs: delay, randomOrder: !!randomOrder, currentIdx: 0, nextAt: Date.now() + delay };
+  task.timer = setInterval(async () => {
+    task.currentIdx = (task.currentIdx + 1) % task.channels.length;
+    const ids = task.randomOrder ? [...task.channels].sort(() => Math.random() - 0.5) : task.channels;
+    await Promise.all(task.accounts.map((name, index) => moveAccount(name, task.guildId, ids[(task.currentIdx + index) % ids.length])));
+    task.nextAt = Date.now() + task.intervalMs;
+  }, delay);
+  rotations.set(id, task);
+  return ok(res, { id });
+});
+app.post('/api/voice/rotation/stop', (req, res) => {
+  const id = String(req.body?.id || '');
+  const task = rotations.get(id);
+  if (!task) return fail(res, new Error('Rotation not found'), 404);
+  clearInterval(task.timer); rotations.delete(id); return ok(res);
+});
+app.post('/api/voice/state-cycle/start', (req, res) => {
+  const accounts = cleanAccounts(req.body?.accounts);
+  const { guildId, states, intervalMs } = req.body || {};
+  const delay = Math.max(5000, Number(intervalMs || 60000));
+  if (!accounts.length || !guildId || !Array.isArray(states) || states.length < 2) return fail(res, new Error('At least two states and one account are required'), 400);
+  const id = crypto.randomUUID();
+  const task = { id, accounts, guildId, states, intervalMs: delay, currentIdx: 0, nextAt: Date.now() + delay };
+  task.timer = setInterval(async () => {
+    task.currentIdx = (task.currentIdx + 1) % task.states.length;
+    const state = task.states[task.currentIdx];
+    await Promise.all(task.accounts.map(async (name) => {
+      const current = voiceSessions.get(sessionKey(name, task.guildId));
+      if (!current) return;
+      const client = getClient(name);
+      if (!client) return;
+      const result = await sendVoiceOpConfirmed(client, task.guildId, current.channelId, state, 3000);
+      if (result.ok) { Object.assign(current, state); persistSessions(); }
+    }));
+    task.nextAt = Date.now() + task.intervalMs;
+  }, delay);
+  stateCycles.set(id, task);
+  return ok(res, { id });
+});
+app.post('/api/voice/state-cycle/stop', (req, res) => {
+  const id = String(req.body?.id || '');
+  const task = stateCycles.get(id);
+  if (!task) return fail(res, new Error('State cycle not found'), 404);
+  clearInterval(task.timer); stateCycles.delete(id); return ok(res);
+});
+
+app.get('/{*splat}', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+
+if (require.main === module) {
+  app.listen(PORT, '0.0.0.0', () => console.log(`Voice Studio listening on http://localhost:${PORT}`));
+}
+
+module.exports = { app, clients, voiceSessions, sendVoiceOp, sendVoiceOpConfirmed, validateTarget };

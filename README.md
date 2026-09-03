@@ -1,0 +1,47 @@
+# Voice Studio Standalone
+
+Voice Studio is a single-purpose dashboard extracted from the original Discord Account Manager. It focuses on one personal workflow: connect a Discord account, choose a voice channel, control the voice state, and preview a camera or screen source locally before changing the corresponding Discord gateway state.
+
+## What changed
+
+The extracted app has its own Express server, browser UI, in-memory account pool, persisted voice-session metadata, and focused test suite. The interface was rebuilt as a personal control room with a glass-card layout, subtle animated signal bars, animated media stage, responsive mobile layout, dark/light theme support, and Arabic/English direction switching. The browser media flow now uses the real `getUserMedia` and `getDisplayMedia` APIs, binds the stream to a muted inline video preview, handles the browser's native track-ended event, and always stops tracks during source changes and page unload.
+
+The gateway confirmation path was also hardened. The timer is created before any early failure can call cleanup, so a missing shard or a non-ready gateway returns immediately instead of leaving a request stuck. State changes are validated so a deafened account cannot be marked as broadcasting video or screen share.
+
+## Run locally
+
+```bash
+npm install
+npm start
+```
+
+Open [http://localhost:5050](http://localhost:5050). The app keeps the Discord token in memory only and does not write it to disk. Use HTTPS or `localhost` when deploying the browser UI so browser media permissions are available.
+
+## Test and check
+
+```bash
+npm run check
+npm test
+```
+
+The tests cover the complete gateway OP4 payload, gateway confirmation, non-ready gateway errors, and the no-shard early-exit path that previously risked a hanging request.
+
+## Camera and screen-share behavior
+
+The camera and screen-share buttons are functional local capture controls. They request permission, show the selected source in the preview, expose a live status and timer, and clean up when the user stops the source or the browser ends the track. In a headless environment with no camera, the app shows the browser's explicit `Requested device not found` error instead of pretending the camera is live.
+
+The original backend sends Discord Gateway voice-state flags (`self_video` and `self_stream`) but does not implement Discord's RTP/WebRTC media transport. This standalone version therefore does **not** claim to publish the browser's pixels or camera frames into a Discord voice channel. It provides a reliable local preview and synchronizes the state flag when a voice session is selected. Actual Discord media publishing requires an approved Discord client/media transport rather than a self-bot gateway flag.
+
+## Project layout
+
+| Path | Responsibility |
+| --- | --- |
+| `server.js` | Standalone Express API, account connections, voice state, session persistence, rotations, and state cycles |
+| `public/index.html` | Single-purpose dashboard structure |
+| `public/styles.css` | Visual system, responsive layout, animation, and themes |
+| `public/app.js` | UI state, API calls, media capture lifecycle, and notifications |
+| `test/voice-core.test.js` | Gateway payload and failure-path tests |
+
+## Security note
+
+Automating Discord user accounts can violate Discord's Terms of Service and may result in account action. Use this project only with accounts and credentials you are authorized to control. Never commit a real token.

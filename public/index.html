@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#080b18" />
+  <title>Voice Studio — مساحة التحكم الصوتي</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="ambient ambient-one"></div>
+  <div class="ambient ambient-two"></div>
+  <div class="noise"></div>
+
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="التنقل الرئيسي">
+      <div class="brand-lockup">
+        <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+        <div><strong>VOICE</strong><small>STUDIO</small></div>
+      </div>
+      <div class="side-status"><span class="status-dot"></span><span id="connectionLabel">جاهز للاتصال</span></div>
+      <nav class="side-nav">
+        <button class="side-nav-item is-active" type="button"><span class="nav-glyph">⌂</span><span>لوحة التحكم</span></button>
+        <button class="side-nav-item" type="button" data-scroll="mediaCard"><span class="nav-glyph">◉</span><span>الكاميرا والبث</span></button>
+        <button class="side-nav-item" type="button" data-scroll="sessionsCard"><span class="nav-glyph">≋</span><span>الجلسات النشطة</span><span id="navSessionCount" class="nav-count">0</span></button>
+      </nav>
+      <div class="sidebar-footer">
+        <div class="mini-orb"></div>
+        <div><span>مساحة شخصية</span><small>تحكم هادئ وواضح</small></div>
+      </div>
+    </aside>
+
+    <main class="main-panel">
+      <header class="topbar">
+        <div class="breadcrumb"><span>VOICE STUDIO</span><i>/</i><strong>لوحة التحكم</strong></div>
+        <div class="top-actions">
+          <button id="themeToggle" class="icon-button" type="button" title="تبديل المظهر" aria-label="تبديل المظهر">☼</button>
+          <button id="languageToggle" class="language-button" type="button">EN</button>
+          <div class="profile-chip"><span class="profile-avatar">V</span><span>مساحتي</span></div>
+        </div>
+      </header>
+
+      <div class="content-wrap">
+        <section class="hero-block">
+          <div>
+            <div class="eyebrow"><span class="eyebrow-line"></span> غرفة التحكم الشخصية</div>
+            <h1>صوتك، <em>بإيقاعك.</em></h1>
+            <p>تحكم في الجلسات، بدّل الحالات، وشغّل الكاميرا أو مشاركة الشاشة من مساحة واحدة مصممة لك.</p>
+          </div>
+          <div class="hero-signal" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
+        </section>
+
+        <section class="dashboard-grid">
+          <div class="column-main">
+            <article class="card setup-card">
+              <div class="card-heading">
+                <div><span class="card-kicker">01 / الاتصال</span><h2>ابدأ من هنا</h2></div>
+                <span id="accountBadge" class="soft-badge">لا توجد حسابات</span>
+              </div>
+              <div class="form-grid">
+                <label class="field"><span>اسم الحساب</span><input id="accountName" type="text" placeholder="مثال: حسابي الأساسي" autocomplete="off" /></label>
+                <label class="field"><span>Discord Token</span><input id="tokenInput" type="password" placeholder="أدخل التوكن محليًا" autocomplete="off" /></label>
+              </div>
+              <div class="setup-actions"><button id="connectButton" class="primary-button" type="button"><span class="button-icon">↗</span><span>اتصال آمن</span></button><button id="disconnectButton" class="ghost-button" type="button">فصل الحساب</button></div>
+              <div id="connectFeedback" class="inline-feedback" role="status" aria-live="polite"></div>
+            </article>
+
+            <article class="card channel-card">
+              <div class="card-heading compact"><div><span class="card-kicker">02 / الوجهة</span><h2>اختر غرفة الصوت</h2></div><span id="channelStatus" class="live-label"><span></span> غير محدد</span></div>
+              <div class="selection-row">
+                <label class="select-field"><span>الحساب</span><select id="accountSelect"><option value="">اتصل بحساب أولًا</option></select></label>
+                <label class="select-field wide"><span>الخادم والغرفة</span><select id="channelSelect"><option value="">اختر قناة صوتية</option></select></label>
+                <button id="refreshButton" class="refresh-button" type="button" title="تحديث القنوات" aria-label="تحديث القنوات">↻</button>
+              </div>
+              <div id="channelSummary" class="channel-summary empty"><span class="summary-icon">⌁</span><div><strong>لم يتم اختيار وجهة بعد</strong><small>بعد الاتصال، ستظهر الخوادم والقنوات المتاحة هنا.</small></div></div>
+              <div class="voice-actions">
+                <button id="joinButton" class="action-button action-join" type="button"><span>＋</span> دخول للغرفة</button>
+                <button id="joinAllButton" class="action-button action-secondary" type="button">دخول الجميع</button>
+                <button id="leaveButton" class="action-button action-danger" type="button">خروج</button>
+              </div>
+            </article>
+
+            <article id="sessionsCard" class="card sessions-card">
+              <div class="card-heading compact"><div><span class="card-kicker">03 / المتابعة</span><h2>الجلسات النشطة</h2></div><span id="sessionLiveLabel" class="soft-badge accent">تحديث تلقائي</span></div>
+              <div id="sessionsList" class="sessions-list"><div class="empty-state"><span class="empty-pulse"></span><p>لا توجد جلسات نشطة الآن</p><small>عند الدخول إلى غرفة ستظهر تفاصيلها هنا.</small></div></div>
+            </article>
+          </div>
+
+          <div class="column-side">
+            <article id="mediaCard" class="card media-card">
+              <div class="card-heading compact"><div><span class="card-kicker">MEDIA ROOM</span><h2>الكاميرا والبث</h2></div><span id="mediaStatus" class="media-status"><span></span> متوقف</span></div>
+              <div class="media-stage" id="mediaStage">
+                <video id="cameraPreview" class="preview-video" autoplay muted playsinline></video>
+                <div id="stagePlaceholder" class="stage-placeholder"><div class="stage-glow"></div><div class="stage-icon">✦</div><strong>مساحتك المرئية</strong><small>فعّل الكاميرا أو مشاركة الشاشة<br />لرؤية المعاينة قبل الإرسال.</small></div>
+                <div id="stageOverlay" class="stage-overlay"><span id="stageSource">—</span><span id="stageTimer">00:00</span></div>
+              </div>
+              <div class="media-controls"><button id="cameraButton" class="media-control" type="button"><span class="control-icon">●</span><span>كاميرا</span><small id="cameraState">متوقف</small></button><button id="screenButton" class="media-control" type="button"><span class="control-icon">▣</span><span>مشاركة الشاشة</span><small id="screenState">متوقف</small></button></div>
+              <div class="media-notice"><span>i</span><p>المعاينة تعمل محليًا داخل المتصفح. لا يتم تفعيل أي مصدر إلا بعد موافقتك.</p></div>
+              <button id="stopMediaButton" class="stop-media-button" type="button" disabled>إيقاف المصدر الحالي</button>
+            </article>
+
+            <article class="card quick-card">
+              <div class="card-heading compact"><div><span class="card-kicker">QUICK STATE</span><h2>الحالة السريعة</h2></div><span class="shortcut-hint">⌘ K</span></div>
+              <div class="state-grid"><button class="state-button" data-state="mute" type="button"><span class="state-icon">♩</span><span>كتم الصوت</span><small>صامت</small></button><button class="state-button" data-state="deaf" type="button"><span class="state-icon">◌</span><span>صمم</span><small>عزل كامل</small></button><button class="state-button" data-state="unmute" type="button"><span class="state-icon">♫</span><span>صوت مفتوح</span><small>متاح</small></button><button class="state-button" data-state="cam" type="button"><span class="state-icon">▣</span><span>حالة فيديو</span><small>كاميرا</small></button></div>
+              <div id="stateFeedback" class="inline-feedback" role="status" aria-live="polite"></div>
+            </article>
+
+            <article class="card activity-card"><div class="card-heading compact"><div><span class="card-kicker">ACTIVITY LOG</span><h2>آخر النشاطات</h2></div><span class="activity-led"></span></div><div id="activityList" class="activity-list"><div class="activity-row"><span class="activity-dot"></span><div><strong>المساحة جاهزة</strong><small>بانتظار أول اتصال</small></div><time>الآن</time></div></div></article>
+          </div>
+        </section>
+        <footer class="app-footer"><span>Voice Studio v1.0</span><span>كل شيء تحت سيطرتك <i>·</i> وبشكل واضح</span></footer>
+      </div>
+    </main>
+  </div>
+  <div id="toastRegion" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
