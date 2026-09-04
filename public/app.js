@@ -313,6 +313,12 @@ function requireAccount() {
   if (!state.selectedAccount) { toast('اتصل بحساب قبل تنفيذ الأمر', 'error'); return false; }
   return true;
 }
+function currentVoiceTarget() {
+  const voice = state.clients.find((client) => client.name === state.selectedAccount)?.voice;
+  return state.selectedTarget || (voice?.guildId && voice?.channelId
+    ? { guildId: voice.guildId, channelId: voice.channelId, channelName: voice.channelName || voice.channelId }
+    : null);
+}
 
 async function connect() {
   if (state.busy.has('connect')) return;
@@ -431,8 +437,8 @@ async function applyState(kind) {
     cam: { selfMute: false, selfDeaf: false, selfVideo: true, selfStream: false, label: 'Video enabled' },
     stream: { selfMute: false, selfDeaf: false, selfVideo: false, selfStream: true, label: 'Stream enabled' },
   };
+  if (!values[kind]) return;
   const next = { ...values[kind] };
-  if (!next) return;
   const currentVoice = state.clients.find((client) => client.name === state.selectedAccount)?.voice;
   if (accounts.length === 1 && kind === 'mute' && currentVoice?.selfMute) { next.selfMute = false; next.selfDeaf = false; next.label = 'Mute disabled'; }
   if (accounts.length === 1 && kind === 'deaf' && currentVoice?.selfDeaf) { next.selfMute = false; next.selfDeaf = false; next.label = 'Deafen disabled'; }
@@ -445,10 +451,12 @@ async function applyState(kind) {
     await toggleScreen();
     return;
   }
-  if (!state.selectedTarget) { toast('ادخل غرفة أولًا لتغيير الحالة', 'error'); return; }
+  const target = currentVoiceTarget();
+  if (!target) { toast('ادخل غرفة أولًا لتغيير الحالة', 'error'); return; }
+  state.selectedTarget = target;
   const buttons = [...document.querySelectorAll('.state-button')]; buttons.forEach((button) => { button.disabled = true; button.classList.add('is-pending'); });
   try {
-    const result = await post('/api/voice/state', { accounts, guildId: state.selectedTarget.guildId, ...next });
+    const result = await post('/api/voice/state', { accounts, guildId: target.guildId, ...next });
     if (!result.summary?.ok) throw new Error(result.results?.find((item) => !item.ok)?.error || 'تعذر تحديث الحالة');
     updateQuickStateButtons();
     const failed = result.summary.failed || 0;
@@ -552,7 +560,7 @@ async function quickLeave(name, guildId) {
 
 async function syncMediaVoiceState(next, kind) {
   const current = state.clients.find((client) => client.name === state.selectedAccount)?.voice;
-  const target = state.selectedTarget || (current?.guildId && current?.channelId ? { guildId: current.guildId, channelId: current.channelId, channelName: current.channelName || current.channelId } : null);
+  const target = currentVoiceTarget();
   if (!target || !state.selectedAccount) {
     if ($('#mediaNotice')) $('#mediaNotice').textContent = 'Join a voice room first to request a Discord voice-state update.';
     return { synced: false };
@@ -613,16 +621,17 @@ async function toggleCamera() {
     const canvas = document.createElement('canvas'); canvas.width = 1280; canvas.height = 720;
     const ctx = canvas.getContext('2d'); ctx.fillStyle = '#080b18'; ctx.fillRect(0, 0, canvas.width, canvas.height);
     const stream = canvas.captureStream(15);
+    const synced = await syncMediaVoiceState({ selfVideo: true, selfStream: false }, 'Camera');
+    if (!synced.synced) throw synced.error || new Error('Discord did not confirm camera state');
     showMediaStream(stream, 'camera');
     if ($('#mediaNotice')) $('#mediaNotice').textContent = 'Safe camera preview: a blank frame is used; no camera permission is requested.';
-    await syncMediaVoiceState({ selfVideo: true, selfStream: false }, 'Camera');
   } catch (error) { toast(`تعذر تشغيل المعاينة: ${error.message}`, 'error'); addActivity('فشل تشغيل الكاميرا', error.message, 'error'); } finally { state.mediaBusy = false; updateQuickStateButtons(); }
 }
 async function toggleScreen() {
   if (state.mediaBusy) return;
   if (!state.selectedAccount) { toast('ادخل الحساب إلى غرفة صوتية أولًا', 'error'); return; }
   const current = state.clients.find((client) => client.name === state.selectedAccount)?.voice;
-  const target = state.selectedTarget || (current?.guildId && current?.channelId ? { guildId: current.guildId, channelId: current.channelId, channelName: current.channelName || current.channelId } : null);
+  const target = currentVoiceTarget();
   if (!target) { toast('ادخل الحساب إلى غرفة صوتية أولًا', 'error'); return; }
   state.selectedTarget = target;
   const enabled = !current?.selfStream;
