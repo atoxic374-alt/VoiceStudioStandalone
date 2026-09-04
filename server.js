@@ -217,7 +217,10 @@ async function setStreamIndicator(name, guildId, current, enabled) {
   const client = getClient(name);
   if (!client || !current?.channelId) return { ok: false, error: 'Account is not in a voice channel' };
   if (!enabled) stopSyntheticStream(name);
-  return sendVoiceOpConfirmed(client, guildId, current.channelId, { selfMute: !!current.selfMute, selfDeaf: !!current.selfDeaf, selfVideo: false, selfStream: !!enabled }, 9000);
+  // Discord does not consistently echo self_stream in VOICE_STATE_UPDATE for
+  // user sessions. The indicator mode is fire-and-record: confirmation would
+  // create a false timeout even though the OP4 packet was accepted.
+  return sendVoiceOp(client, guildId, current.channelId, { selfMute: !!current.selfMute, selfDeaf: false, selfVideo: false, selfStream: !!enabled });
 }
 async function withAccountLock(name, operation) {
   const key = String(name);
