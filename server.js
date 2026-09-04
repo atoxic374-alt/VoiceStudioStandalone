@@ -73,6 +73,7 @@ const voiceSessions = new Map();
 const rotations = new Map();
 const stateCycles = new Map();
 const syntheticStreams = new Map();
+let videoStreamModulePromise;
 const liveEvents = new EventEmitter();
 liveEvents.setMaxListeners(0);
 const accountLocks = new Map();
@@ -167,6 +168,9 @@ function ensureSyntheticVideo() {
 function stopSyntheticStream(name) {
   const active = syntheticStreams.get(name);
   if (!active) return;
+  try { active.controller?.abort?.(); } catch {}
+  try { active.streamer?.stopStream?.(); } catch {}
+  try { active.streamer?.signalVideo?.(false); } catch {}
   try { active.dispatcher?.destroy?.(); } catch {}
   try { active.streamConnection?.disconnect?.(); } catch {}
   syntheticStreams.delete(name);
@@ -175,7 +179,11 @@ function withTimeout(promise, timeoutMs, message) {
   let timer;
   return Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), timeoutMs); })]).finally(() => clearTimeout(timer));
 }
-async function startSyntheticStream(name, guildId) {
+async function loadVideoStreamModule() {
+  videoStreamModulePromise ||= import('@dank074/discord-video-stream');
+  return videoStreamModulePromise;
+}
+async function startSyntheticStream(name, guildId, mediaKind = 'go-live') {
   const client = getClient(name);
   const session = voiceSessions.get(sessionKey(name, guildId));
   if (!client || !session?.channelId) return { ok: false, error: 'Account is not in a voice channel' };
@@ -188,31 +196,27 @@ async function startSyntheticStream(name, guildId) {
   logMediaEvent('info', 'stream.start', { account: name, guildId, channelId: session.channelId });
   try {
     const source = ensureSyntheticVideo();
+    const { Streamer, playStream } = await loadVideoStreamModule();
     for (let attempt = 1; attempt <= 2; attempt += 1) {
-      let connection;
+      let streamer;
+      let controller;
       try {
-        const existing = client.voice.connection;
-        connection = existing?.channel?.id === session.channelId ? existing : await withTimeout(client.voice.joinChannel(channel, { selfMute: !!session.selfMute, selfDeaf: false, selfVideo: false, videoCodec: 'H264' }), 12000, 'Voice connection timed out while starting stream');
+        streamer = new Streamer(client);
+        await withTimeout(streamer.joinVoice(guildId, session.channelId), 20000, 'Voice WebRTC connection timed out');
         logMediaEvent('info', 'stream.media_connecting', { account: name, guildId, channelId: session.channelId, attempt });
-        const streamConnection = await withTimeout(connection.createStreamConnection(), 20000, 'Stream connection timed out while waiting for Discord Media');
-        let dispatcher;
-        let playError;
-        for (const options of [{ fps: 15, presetH26x: 'superfast', bitrate: 500, inputFFmpegArgs: ['-stream_loop', '-1'], outputFFmpegArgs: ['-g', '30'] }, { fps: 10, presetH26x: 'veryfast', bitrate: 300, inputFFmpegArgs: ['-stream_loop', '-1'], outputFFmpegArgs: ['-g', '20'] }]) {
-          try { dispatcher = streamConnection.playVideo(source, options); break; } catch (error) { playError = error; }
-        }
-        if (!dispatcher) { try { streamConnection.disconnect?.(); } catch {} throw playError || new Error('Unable to create video dispatcher'); }
-        syntheticStreams.set(name, { connection, streamConnection, dispatcher, guildId, channelId: session.channelId });
-        const confirmed = await sendVoiceOpConfirmed(client, guildId, session.channelId, { selfMute: !!session.selfMute, selfDeaf: false, selfVideo: false, selfStream: true }, 7000);
-        if (!confirmed.ok) throw new Error(confirmed.error || 'Discord did not confirm screen share state');
-        dispatcher.on?.('error', (error) => logMediaEvent('error', 'stream.runtime_failed', { account: name, guildId, channelId: session.channelId, error: error?.message || String(error) }));
-        dispatcher.once?.('finish', () => { if (syntheticStreams.get(name)?.dispatcher === dispatcher) stopSyntheticStream(name); });
+        controller = new AbortController();
+        syntheticStreams.set(name, { streamer, controller, guildId, channelId: session.channelId, mediaKind });
+        const task = playStream(source, streamer, { type: mediaKind, width: 640, height: 360, frameRate: 15 }, controller.signal);
+        syntheticStreams.get(name).task = task;
+        task.then(() => { if (syntheticStreams.get(name)?.task === task) stopSyntheticStream(name); }).catch((error) => logMediaEvent('error', 'stream.runtime_failed', { account: name, guildId, channelId: session.channelId, error: error?.message || String(error) }));
+        await new Promise((resolve) => setTimeout(resolve, 700));
         logMediaEvent('info', 'stream.ready', { account: name, guildId, channelId: session.channelId, durationMs: Date.now() - startedAt, attempt });
         return { ok: true };
       } catch (error) {
         lastError = error;
-        try { connection?.streamConnection?.disconnect?.(); } catch {}
-        try { connection?.streamConnection?.disconnect?.(); } catch {}
-        try { sendVoiceOp(client, guildId, session.channelId, { selfMute: !!session.selfMute, selfDeaf: !!session.selfDeaf, selfVideo: false, selfStream: false }); } catch {}
+        try { controller?.abort?.(); } catch {}
+        try { streamer?.stopStream?.(); } catch {}
+        if (syntheticStreams.get(name)?.streamer === streamer) syntheticStreams.delete(name);
         logMediaEvent('error', 'stream.attempt_failed', { account: name, guildId, channelId: session.channelId, attempt, durationMs: Date.now() - startedAt, error: error?.message || String(error) });
         if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 250));
       }
@@ -720,6 +724,7 @@ app.post('/api/voice/state', async (req, res) => {
     const current = {
       ...(observed || voiceSessions.get(sessionKey(name, guildId)) || {}),
       selfStream: syntheticStreams.has(name) || !!observed?.selfStream,
+      selfVideo: syntheticStreams.get(name)?.mediaKind === 'camera' || !!observed?.selfVideo,
     };
     if (!client) return { name, ok: false, error: 'Account is not connected' };
     if (!current?.channelId) return { name, ok: false, error: 'Account is not in a voice channel' };
@@ -730,12 +735,12 @@ app.post('/api/voice/state', async (req, res) => {
       selfStream: selfStream !== undefined ? selfStream : !!current.selfStream,
     };
     if (next.selfDeaf && (next.selfVideo || next.selfStream)) return { name, ok: false, error: 'Video or screen share cannot be enabled while deafened' };
-    if (next.selfVideo) return { name, ok: false, error: 'Camera transport is not available in this self-bot build; screen share uses the supported media connection.' };
     let result;
-    if (next.selfStream && !syntheticStreams.has(name)) result = await startSyntheticStream(name, guildId);
+    if (next.selfStream && !syntheticStreams.has(name)) result = await startSyntheticStream(name, guildId, 'go-live');
+    else if (next.selfVideo && !syntheticStreams.has(name)) result = await startSyntheticStream(name, guildId, 'camera');
     else result = await sendVoiceOpConfirmed(client, guildId, current.channelId, next, 9000);
     if (result.ok) {
-      if (!next.selfStream && current.selfStream) stopSyntheticStream(name);
+      if (!next.selfStream && !next.selfVideo && (current.selfStream || current.selfVideo)) stopSyntheticStream(name);
       const actual = readGatewayVoiceState(client, guildId);
       Object.assign(current, actual || {}, next, { selfStream: !!next.selfStream, selfVideo: !!next.selfVideo, updatedAt: Date.now() });
       persistSessions();

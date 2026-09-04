@@ -591,7 +591,7 @@ function stopCurrentStream({ updateDiscord = true } = {}) {
   if ($('#cameraState')) $('#cameraState').textContent = 'Off'; if ($('#screenState')) $('#screenState').textContent = 'Off';
   if ($('#mediaStatus')) { $('#mediaStatus').classList.remove('is-live'); $('#mediaStatus').innerHTML = '<span></span> Offline'; }
   if ($('#mediaNotice')) $('#mediaNotice').textContent = 'Media preview is disabled.';
-  if (updateDiscord && previousKind && state.selectedTarget && state.selectedAccount) {
+  if (updateDiscord && previousKind && currentVoiceTarget() && state.selectedAccount) {
     syncMediaVoiceState({ selfVideo: false, selfStream: false }, 'Media').catch(() => {});
   }
 }
