@@ -538,12 +538,15 @@ async function quickLeave(name, guildId) {
 }
 
 async function syncMediaVoiceState(next, kind) {
-  if (!state.selectedTarget || !state.selectedAccount) {
+  const current = state.clients.find((client) => client.name === state.selectedAccount)?.voice;
+  const target = state.selectedTarget || (current?.guildId && current?.channelId ? { guildId: current.guildId, channelId: current.channelId, channelName: current.channelName || current.channelId } : null);
+  if (!target || !state.selectedAccount) {
     if ($('#mediaNotice')) $('#mediaNotice').textContent = 'Join a voice room first to request a Discord voice-state update.';
     return { synced: false };
   }
+  state.selectedTarget = target;
   try {
-    const result = await post('/api/voice/state', { accounts: selectedAccounts(), guildId: state.selectedTarget.guildId, ...next });
+    const result = await post('/api/voice/state', { accounts: selectedAccounts(), guildId: target.guildId, ...next });
     if (!result.summary?.ok) throw new Error(result.results?.find((item) => !item.ok)?.error || 'Discord did not apply the media state');
     if ($('#mediaNotice')) $('#mediaNotice').textContent = `${kind} state confirmed by Discord.`;
     return { synced: true };
