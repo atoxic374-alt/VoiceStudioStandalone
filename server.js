@@ -185,9 +185,12 @@ async function startSyntheticStream(name, guildId) {
         const existing = client.voice.connection;
         if (existing?.channel?.id !== session.channelId) throw new Error('Active voice connection is required before starting stream');
         connection = existing;
+        const videoReady = sendVoiceOp(client, guildId, session.channelId, { selfMute: !!session.selfMute, selfDeaf: false, selfVideo: true, selfStream: false });
+        if (!videoReady.ok) throw new Error(videoReady.error || 'Unable to prepare voice connection for stream');
         const streamConnection = await withTimeout(connection.createStreamConnection(), 4000, 'Stream connection timed out');
         const dispatcher = streamConnection.playVideo(source, { fps: 15, preset: 'ultrafast', bitrate: 500 });
         syntheticStreams.set(name, { connection, streamConnection, dispatcher, guildId, channelId: session.channelId });
+        sendVoiceOp(client, guildId, session.channelId, { selfMute: !!session.selfMute, selfDeaf: false, selfVideo: false, selfStream: true });
         dispatcher.once?.('finish', () => { if (syntheticStreams.get(name)?.dispatcher === dispatcher) stopSyntheticStream(name); });
         return { ok: true };
       } catch (error) {
