@@ -100,7 +100,7 @@ const api = async (url, options = {}) => {
   return payload;
 };
 const operationNames = { connect: 'Connect account', 'connect-bulk': 'Connect accounts', join: 'Join voice room', 'join-all': 'Join accounts', leave: 'Leave voice room', state: 'Update voice state', 'rotation/start': 'Start channel rotation', 'rotation/stop': 'Stop channel rotation', 'state-cycle/start': 'Start state cycle', 'state-cycle/stop': 'Stop state cycle' };
-function operationStart(url, body = {}) { const modal = $('#operationModal'); if (!modal) return; const key = Object.keys(operationNames).find((item) => url.includes(item)); $('#operationTitle').textContent = operationNames[key] || 'Processing'; $('#operationSubtitle').textContent = 'Preparing request…'; $('#operationResult').textContent = ''; $('#operationClose').hidden = true; const names = Array.isArray(body.accounts) ? body.accounts.map((item) => typeof item === 'string' ? item : item.name).filter(Boolean) : (body.name ? [body.name] : []); const profiles = names.map((name) => state.clients.find((client) => client.name === name) || { name, nickname: name }).filter(Boolean); modal.dataset.accountNames = JSON.stringify(names); $('#operationAccounts').innerHTML = profiles.length ? profiles.map((profile) => `<div class="operation-account" data-operation-name="${escapeHTML(profile.name)}"><span>${profile.avatar ? `<img src="${escapeHTML(profile.avatar)}" alt="" />` : escapeHTML((profile.nickname || profile.name || '?')[0])}</span><strong>${escapeHTML(profile.nickname || profile.displayName || profile.name)}</strong><small>Waiting…</small></div>`).join('') : '<div class="operation-empty">Working on the selected accounts…</div>'; modal.hidden = false; }
+function operationStart(url, body = {}) { const modal = $('#operationModal'); if (!modal) return; const key = Object.keys(operationNames).find((item) => url.includes(item)); $('#operationTitle').textContent = operationNames[key] || 'Processing'; $('#operationSubtitle').textContent = 'Preparing request…'; $('#operationResult').textContent = ''; $('#operationClose').hidden = true; $('.operation-loader')?.classList.remove('is-done', 'is-error'); const names = Array.isArray(body.accounts) ? body.accounts.map((item) => typeof item === 'string' ? item : item.name).filter(Boolean) : (body.name ? [body.name] : []); const profiles = names.map((name) => state.clients.find((client) => client.name === name) || { name, nickname: name }).filter(Boolean); modal.dataset.accountNames = JSON.stringify(names); $('#operationAccounts').innerHTML = profiles.length ? profiles.map((profile) => `<div class="operation-account" data-operation-name="${escapeHTML(profile.name)}"><span>${profile.avatar ? `<img src="${escapeHTML(profile.avatar)}" alt="" />` : escapeHTML((profile.nickname || profile.name || '?')[0])}</span><strong>${escapeHTML(profile.nickname || profile.displayName || profile.name)}</strong><small>Waiting…</small></div>`).join('') : '<div class="operation-empty">Working on the selected accounts…</div>'; modal.hidden = false; }
 function operationFinish(payload) { const modal = $('#operationModal'); if (!modal) return; const results = Array.isArray(payload?.results) ? payload.results : []; const byName = new Map(results.filter((item) => item?.name).map((item) => [String(item.name), item])); $('#operationSubtitle').textContent = 'Completed'; $('#operationResult').textContent = payload?.summary ? `${payload.summary.ok} succeeded · ${payload.summary.failed} failed` : 'Done'; let rows = [...$('#operationAccounts').querySelectorAll('.operation-account')]; if (!rows.length && results.length) { $('#operationAccounts').innerHTML = results.map((result) => `<div class="operation-account" data-operation-name="${escapeHTML(result.name || '')}"><span>${escapeHTML((result.name || '?')[0])}</span><strong>${escapeHTML(result.name || 'Account')}</strong><small></small></div>`).join(''); rows = [...$('#operationAccounts').querySelectorAll('.operation-account')]; } rows.forEach((row, index) => { const result = byName.get(row.dataset.operationName) || results[index]; if (result) { row.classList.remove('is-error','is-success'); row.classList.add(result.ok ? 'is-success' : 'is-error'); const detail = row.querySelector('small'); if (detail) detail.textContent = result.ok ? 'Success' : (result.error || 'Failed'); } }); $('.operation-loader')?.classList.add(payload?.summary?.failed ? 'is-error' : 'is-done'); $('#operationClose').hidden = false; }
 function operationFail(error) { const modal = $('#operationModal'); if (!modal) return; $('#operationSubtitle').textContent = 'Failed'; $('#operationResult').textContent = error.message || 'Request failed'; $('.operation-loader')?.classList.add('is-error'); $('#operationClose').hidden = false; }
 const post = async (url, body) => { operationStart(url, body); try { const result = await api(url, { method: 'POST', body: JSON.stringify(body) }); operationFinish(result); return result; } catch (error) { operationFail(error); throw error; } };
@@ -108,7 +108,26 @@ const post = async (url, body) => { operationStart(url, body); try { const resul
 function escapeHTML(value) {
   return String(value ?? '').replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
 }
-function selectedAccounts() { return state.selectedAccount ? [state.selectedAccount] : []; }
+function selectedAccounts() {
+  const selectedBulk = [...document.querySelectorAll('#automationAccounts input[type="checkbox"]:checked')].map((input) => input.value);
+  return selectedBulk.length > 1 ? selectedBulk : (state.selectedAccount ? [state.selectedAccount] : []);
+}
+function updateQuickStateButtons() {
+  const selectedBulk = [...document.querySelectorAll('#automationAccounts input[type="checkbox"]:checked')];
+  if (selectedBulk.length > 1) {
+    document.querySelectorAll('.state-button').forEach((button) => button.classList.remove('is-active'));
+    return;
+  }
+  const voice = state.clients.find((client) => client.name === state.selectedAccount)?.voice;
+  const active = {
+    mute: !!voice?.selfMute,
+    deaf: !!voice?.selfDeaf,
+    unmute: !!voice && !voice.selfMute && !voice.selfDeaf,
+    cam: !!voice?.selfVideo,
+    stream: !!voice?.selfStream,
+  };
+  document.querySelectorAll('.state-button').forEach((button) => button.classList.toggle('is-active', !!active[button.dataset.state]));
+}
 function selectedSession() {
   return state.selectedTarget && state.selectedAccount ? { account: state.selectedAccount, ...state.selectedTarget } : null;
 }
@@ -226,6 +245,14 @@ async function loadGuilds() {
     const data = await api(`/api/voice/guilds?account=${encodeURIComponent(state.selectedAccount)}`);
     state.groups = data.guilds || [];
     renderChannels();
+    const voice = state.clients.find((client) => client.name === state.selectedAccount)?.voice;
+    if (voice) {
+      const value = `${voice.guildId}::${voice.channelId}`;
+      if ([...$('#channelSelect').options].some((option) => option.value === value)) {
+        $('#channelSelect').value = value;
+        handleChannelChange();
+      }
+    }
   } catch (error) {
     feedback('#connectFeedback', error.message, 'error');
   }
@@ -324,6 +351,7 @@ function renderProfiles(clients = []) {
     return `<div class="profile-row"><span class="profile-row-avatar">${avatar}</span><div class="profile-row-main"><strong>${escapeHTML(client.nickname || client.displayName || client.name)}</strong><small>@${escapeHTML(client.username || client.name)} · ID: ${escapeHTML(client.id || '—')} · <span class="health-${escapeHTML(health.state || 'unknown')}">${escapeHTML(healthText)}</span></small></div><div class="profile-row-voice"><span class="profile-online"></span><strong>${voiceText}</strong><small>${flags}</small></div><button class="profile-leave" type="button" data-profile-leave="${escapeHTML(client.name)}" data-profile-guild="${escapeHTML(voice?.guildId || '')}" ${voice ? '' : 'disabled'}>Leave</button></div>`;
   }).join('');
   list.querySelectorAll('[data-profile-leave]').forEach((button) => button.addEventListener('click', () => quickLeave(button.dataset.profileLeave, button.dataset.profileGuild)));
+  updateQuickStateButtons();
 }
 
 async function disconnect() {
@@ -380,6 +408,7 @@ async function leave() {
 }
 async function applyState(kind) {
   if (!requireAccount()) return;
+  const accounts = selectedAccounts();
   const values = {
     mute: { selfMute: true, selfDeaf: false, selfVideo: false, selfStream: false, label: 'Mute enabled' },
     deaf: { selfMute: true, selfDeaf: true, selfVideo: false, selfStream: false, label: 'Deafen enabled' },
@@ -390,29 +419,27 @@ async function applyState(kind) {
   const next = { ...values[kind] };
   if (!next) return;
   const currentVoice = state.clients.find((client) => client.name === state.selectedAccount)?.voice;
-  if (kind === 'mute' && currentVoice?.selfMute) { next.selfMute = false; next.selfDeaf = false; next.label = 'Mute disabled'; }
-  if (kind === 'deaf' && currentVoice?.selfDeaf) { next.selfMute = false; next.selfDeaf = false; next.label = 'Deafen disabled'; }
-  if (kind === 'unmute' && !currentVoice?.selfMute && !currentVoice?.selfDeaf) { next.selfMute = true; next.selfDeaf = false; next.label = 'Mute enabled'; }
-  if (kind === 'cam' && state.mediaKind === 'camera') { stopCurrentStream(); return; }
-  if (kind === 'stream' && state.mediaKind === 'screen') { stopCurrentStream(); return; }
-  if (kind === 'cam') {
+  if (accounts.length === 1 && kind === 'mute' && currentVoice?.selfMute) { next.selfMute = false; next.selfDeaf = false; next.label = 'Mute disabled'; }
+  if (accounts.length === 1 && kind === 'deaf' && currentVoice?.selfDeaf) { next.selfMute = false; next.selfDeaf = false; next.label = 'Deafen disabled'; }
+  if (accounts.length === 1 && kind === 'unmute' && !currentVoice?.selfMute && !currentVoice?.selfDeaf) { next.selfMute = true; next.selfDeaf = false; next.label = 'Mute enabled'; }
+  if (kind === 'cam' && accounts.length === 1) {
     await toggleCamera();
     return;
   }
-  if (kind === 'stream') {
+  if (kind === 'stream' && accounts.length === 1) {
     await toggleScreen();
     return;
   }
   if (!state.selectedTarget) { toast('ادخل غرفة أولًا لتغيير الحالة', 'error'); return; }
   const buttons = [...document.querySelectorAll('.state-button')]; buttons.forEach((button) => { button.disabled = true; button.classList.add('is-pending'); });
   try {
-    const result = await post('/api/voice/state', { accounts: selectedAccounts(), guildId: state.selectedTarget.guildId, ...next });
+    const result = await post('/api/voice/state', { accounts, guildId: state.selectedTarget.guildId, ...next });
     if (!result.summary?.ok) throw new Error(result.results?.find((item) => !item.ok)?.error || 'تعذر تحديث الحالة');
-    document.querySelectorAll('.state-button').forEach((button) => button.classList.toggle('is-active', button.dataset.state === kind));
+    updateQuickStateButtons();
     const failed = result.summary.failed || 0;
     const message = failed ? `${next.label}: ${result.summary.ok} succeeded, ${failed} failed` : next.label;
     feedback('#stateFeedback', message, failed ? 'error' : 'success'); addActivity('تحديث حالة صوتية', `${state.clients.find((client) => client.name === state.selectedAccount)?.nickname || state.selectedAccount} · ${message}`, failed ? 'error' : 'success', state.selectedAccount); toast(message, failed ? 'error' : 'success'); await refreshSessions();
-  } catch (error) { feedback('#stateFeedback', error.message, 'error'); toast(error.message, 'error'); } finally { buttons.forEach((button) => { button.disabled = false; button.classList.remove('is-pending'); }); }
+  } catch (error) { feedback('#stateFeedback', error.message, 'error'); toast(error.message, 'error'); } finally { buttons.forEach((button) => { button.disabled = false; button.classList.remove('is-pending'); }); updateQuickStateButtons(); }
 }
 
 function formatDuration(seconds) { return `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`; }
@@ -553,6 +580,13 @@ function showMediaStream(stream, kind) {
   addActivity(kind === 'camera' ? 'الكاميرا تعمل' : 'مشاركة الشاشة تعمل', 'المعاينة المحلية جاهزة', 'success'); toast(kind === 'camera' ? 'تم تشغيل الكاميرا' : 'تم تشغيل مشاركة الشاشة', 'success');
 }
 async function toggleCamera() {
+  const current = state.clients.find((client) => client.name === state.selectedAccount)?.voice;
+  if (current?.selfVideo) {
+    stopCurrentStream({ updateDiscord: false });
+    await syncMediaVoiceState({ selfVideo: false, selfStream: false }, 'Camera');
+    await refreshSessions();
+    return;
+  }
   if (state.mediaKind === 'camera') { stopCurrentStream(); return; }
   try {
     const canvas = document.createElement('canvas'); canvas.width = 1280; canvas.height = 720;
@@ -568,11 +602,12 @@ async function toggleScreen() {
   const current = state.clients.find((client) => client.name === state.selectedAccount)?.voice;
   const enabled = !current?.selfStream;
   try {
-    const result = await api('/api/voice/state', { method: 'POST', body: JSON.stringify({ accounts: selectedAccounts(), guildId: state.selectedTarget.guildId, selfVideo: enabled, selfStream: enabled }) });
+    const result = await api('/api/voice/state', { method: 'POST', body: JSON.stringify({ accounts: selectedAccounts(), guildId: state.selectedTarget.guildId, selfVideo: false, selfStream: enabled }) });
     if (!result.summary?.ok) throw new Error(result.results?.find((item) => !item.ok)?.error || 'تعذر تشغيل البث الاصطناعي');
     const button = document.querySelector('.state-button[data-state="stream"]');
     button?.classList.toggle('is-active', enabled);
     button?.querySelector('small') && (button.querySelector('small').textContent = enabled ? 'Synthetic stream on' : 'Screen share off');
+    if (!enabled && state.mediaKind === 'screen') stopCurrentStream({ updateDiscord: false });
     await refreshSessions();
     addActivity(enabled ? 'بدأ بث اصطناعي' : 'أوقف البث الاصطناعي', `${state.clients.find((client) => client.name === state.selectedAccount)?.nickname || state.selectedAccount} · ${state.selectedTarget.channelName}`, 'success', state.selectedAccount);
     toast(enabled ? 'تم تشغيل البث الاصطناعي' : 'تم إيقاف البث الاصطناعي', 'success');
@@ -605,6 +640,7 @@ function init() {
   initTheme(); initLanguage(); initNavigation(); initActivity();
   $('#connectButton').addEventListener('click', connect); $('#bulkConnectButton').addEventListener('click', bulkConnect); $('#disconnectButton').addEventListener('click', disconnect); $('#refreshButton').addEventListener('click', refreshChannels); $('#accountSelect').addEventListener('change', async (event) => { state.selectedAccount = event.target.value; await loadGuilds(); await loadAutomationCatalog(); }); $('#automationGuild').addEventListener('change', renderAutomationChannels); $('#automationChannel').addEventListener('change', renderTargetAccounts); $('#rotationRoomFilter').addEventListener('input', (event) => { state.rotationRoomFilter = event.target.value; state.rotationRoomPage = 0; renderRotationRooms(); }); $('#rotationPrevButton').addEventListener('click', () => { state.rotationRoomPage -= 1; renderRotationRooms(); }); $('#rotationNextButton').addEventListener('click', () => { state.rotationRoomPage += 1; renderRotationRooms(); }); $('#bulkJoinButton').addEventListener('click', bulkJoinSelected); $('#channelSelect').addEventListener('change', handleChannelChange); $('#joinButton').addEventListener('click', join); $('#joinAllButton').addEventListener('click', joinAll); $('#leaveButton').addEventListener('click', leave); $('#cameraButton')?.addEventListener('click', toggleCamera); $('#screenButton')?.addEventListener('click', toggleScreen); $('#startRotationButton').addEventListener('click', startRotation); $('#startCycleButton').addEventListener('click', startCycle); $('#stopMediaButton')?.addEventListener('click', () => stopCurrentStream()); $('#applyBulkStateButton')?.addEventListener('click', applyBulkState); $('#overviewFilter')?.addEventListener('input', (event) => { state.overviewFilter = event.target.value; refreshSessions(); }); $('#overviewSort')?.addEventListener('change', (event) => { state.overviewSort = event.target.value; refreshSessions(); }); document.querySelectorAll('.state-button').forEach((button) => button.addEventListener('click', () => applyState(button.dataset.state))); document.querySelectorAll('#statePicker input').forEach((input) => input.addEventListener('change', () => input.closest('.state-option')?.classList.toggle('is-selected', input.checked)));
   $('#operationClose').addEventListener('click', () => { $('#operationModal').hidden = true; $('.operation-loader')?.classList.remove('is-done', 'is-error'); }); $('#leaveAllButton')?.addEventListener('click', openLeaveAll); $('#confirmLeaveButton')?.addEventListener('click', leaveAllSelected); $('#cancelLeaveButton')?.addEventListener('click', () => { $('#leaveModal').hidden = true; }); window.addEventListener('beforeunload', () => stopCurrentStream({ updateDiscord: false }));
+  document.addEventListener('change', (event) => { if (event.target.closest('#automationAccounts')) updateQuickStateButtons(); });
   loadClients().catch(() => {}); refreshSessions(); connectLiveEvents(); setInterval(refreshSessions, 15000);
 }
 init();
