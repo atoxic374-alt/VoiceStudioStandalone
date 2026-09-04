@@ -33,6 +33,14 @@ test('confirms a voice state from the gateway', async () => {
   assert.equal(result.ok, true);
 });
 
+test('confirms a raw gateway envelope and rejects mismatched requested flags', async () => {
+  const { client } = fakeClient({ confirms: false });
+  const pending = sendVoiceOpConfirmed(client, 'guild-1', 'channel-1', { selfVideo: true }, 250);
+  client.ws.emit('VOICE_STATE_UPDATE', { d: { user_id: 'user-1', guild_id: 'guild-1', channel_id: 'channel-1', self_video: false } });
+  setImmediate(() => client.ws.emit('VOICE_STATE_UPDATE', { d: { user_id: 'user-1', guild_id: 'guild-1', channel_id: 'channel-1', self_video: true } }));
+  assert.equal((await pending).ok, true);
+});
+
 test('returns a clear error when the gateway is not ready', async () => {
   const { client } = fakeClient({ ready: false });
   const result = await sendVoiceOpConfirmed(client, 'guild-1', 'channel-1', {}, 250);
