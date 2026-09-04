@@ -2,7 +2,7 @@ const express = require('express');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
-const { execFileSync } = require('child_process');
+const { execFileSync, spawn } = require('child_process');
 const FFMPEG_PATH = require('ffmpeg-static');
 const { EventEmitter } = require('events');
 const { Client } = require('discord.js-selfbot-v13');
@@ -169,11 +169,21 @@ function stopSyntheticStream(name) {
   const active = syntheticStreams.get(name);
   if (!active) return;
   try { active.controller?.abort?.(); } catch {}
+  try { active.sourceProcess?.kill?.('SIGTERM'); } catch {}
   try { active.streamer?.stopStream?.(); } catch {}
   try { active.streamer?.signalVideo?.(false); } catch {}
   try { active.dispatcher?.destroy?.(); } catch {}
   try { active.streamConnection?.disconnect?.(); } catch {}
   syntheticStreams.delete(name);
+}
+function createBlackMediaSource() {
+  const sourceProcess = spawn(FFMPEG_PATH || 'ffmpeg', [
+    '-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'color=c=black:s=640x360:r=15',
+    '-an', '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-pix_fmt', 'yuv420p',
+    '-f', 'nut', 'pipe:1',
+  ], { stdio: ['ignore', 'pipe', 'pipe'] });
+  sourceProcess.stderr.on('data', (chunk) => logMediaEvent('warn', 'stream.source_warning', { error: String(chunk).trim().slice(0, 300) }));
+  return { stream: sourceProcess.stdout, sourceProcess };
 }
 function withTimeout(promise, timeoutMs, message) {
   let timer;
@@ -195,7 +205,6 @@ async function startSyntheticStream(name, guildId, mediaKind = 'go-live') {
   const startedAt = Date.now();
   logMediaEvent('info', 'stream.start', { account: name, guildId, channelId: session.channelId });
   try {
-    const source = ensureSyntheticVideo();
     const { Streamer, playStream } = await loadVideoStreamModule();
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       let streamer;
@@ -214,9 +223,10 @@ async function startSyntheticStream(name, guildId, mediaKind = 'go-live') {
         await withTimeout(streamer.joinVoice(guildId, session.channelId), 8000, 'Voice WebRTC connection timed out after 8 seconds');
         logMediaEvent('info', 'stream.media_connecting', { account: name, guildId, channelId: session.channelId, attempt });
         controller = new AbortController();
-        const active = { streamer, controller, guildId, channelId: session.channelId, mediaKind, startedAt: Date.now() };
+        const source = createBlackMediaSource();
+        const active = { streamer, controller, sourceProcess: source.sourceProcess, guildId, channelId: session.channelId, mediaKind, startedAt: Date.now() };
         syntheticStreams.set(name, active);
-        const task = playStream(source, streamer, { type: mediaKind, width: 640, height: 360, frameRate: 15 }, controller.signal);
+        const task = playStream(source.stream, streamer, { type: mediaKind, format: 'nut', width: 640, height: 360, frameRate: 15 }, controller.signal);
         active.task = task;
         task.then(() => {
           active.completedAt = Date.now();
@@ -886,7 +896,7 @@ async function restoreSavedAccounts() {
 }
 app.get('/{*splat}', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 if (require.main === module) {
-  app.listen(PORT, '0.0.0.0', () => { console.log(`Voice Studio listening on http://localhost:${PORT}`); setImmediate(() => { try { ensureSyntheticVideo(); } catch (error) { console.warn('[stream] source prewarm failed:', error.message); } }); setInterval(() => { try { reconcileVoiceSessions(); } catch (error) { console.warn('[voice] session reconciliation failed:', error.message); } }, 3000).unref?.(); restoreSavedAccounts().catch((error) => console.warn('[accounts] restore failed:', error.message)); });
+  app.listen(PORT, '0.0.0.0', () => { console.log(`Voice Studio listening on http://localhost:${PORT}`); setInterval(() => { try { reconcileVoiceSessions(); } catch (error) { console.warn('[voice] session reconciliation failed:', error.message); } }, 3000).unref?.(); restoreSavedAccounts().catch((error) => console.warn('[accounts] restore failed:', error.message)); });
 }
 
 module.exports = { app, clients, voiceSessions, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, saveAccounts, loadAccounts };
