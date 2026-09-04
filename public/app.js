@@ -213,7 +213,7 @@ function renderRotationRooms(channels = rotationRooms()) {
   const wrapper = $('#rotationChannels');
   const filter = state.rotationRoomFilter.trim().toLocaleLowerCase();
   const filtered = channels.filter((channel) => channel.name.toLocaleLowerCase().includes(filter));
-  const pageSize = 60;
+  const pageSize = 20;
   const pages = Math.max(1, Math.ceil(filtered.length / pageSize));
   state.rotationRoomPage = Math.min(state.rotationRoomPage, pages - 1);
   const visible = filtered.slice(state.rotationRoomPage * pageSize, (state.rotationRoomPage + 1) * pageSize);
