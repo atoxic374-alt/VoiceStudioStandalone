@@ -212,3 +212,9 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .profile-guild-icon { display: inline-grid; width: 18px; height: 18px; flex: 0 0 18px; place-items: center; overflow: hidden; border: 1px solid rgba(72,217,210,.28); border-radius: 6px; background: rgba(72,217,210,.1); color: var(--cyan); font-size: 9px; }
 .profile-guild-icon img { width: 100%; height: 100%; object-fit: cover; }
 .profile-voice-destination > span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.top-mic { position: relative; display: grid; width: 34px; height: 34px; place-items: center; border: 1px solid rgba(72,217,210,.35); border-radius: 12px; background: linear-gradient(145deg, rgba(72,217,210,.14), rgba(140,124,255,.16)); color: var(--cyan); box-shadow: 0 0 18px rgba(72,217,210,.12); }
+.top-mic svg { position: relative; z-index: 1; width: 18px; height: 18px; }
+.top-mic-pulse { position: absolute; inset: 5px; border: 1px solid rgba(72,217,210,.55); border-radius: 9px; animation: mic-pulse 1.8s ease-out infinite; }
+@keyframes mic-pulse { 0% { opacity: .75; transform: scale(.82); } 70%, 100% { opacity: 0; transform: scale(1.38); } }
+@media (prefers-reduced-motion: reduce) { .top-mic-pulse { animation: none; opacity: .45; } }
