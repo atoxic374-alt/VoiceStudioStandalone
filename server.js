@@ -357,6 +357,24 @@ function removeSessionsForAccount(name, guildId) {
   persistSessions();
   emitLive('session.removed', { name, guildId });
 }
+function reconcileVoiceSessions() {
+  for (const [name, entry] of clients.entries()) {
+    for (const session of [...voiceSessions.values()].filter((item) => item.name === name)) {
+      const actual = readGatewayVoiceState(entry.client, session.guildId);
+      if (!actual || !actual.channelId) {
+        stopSyntheticStream(name);
+        removeSessionsForAccount(name, session.guildId);
+        continue;
+      }
+      const observed = { ...actual, selfStream: syntheticStreams.has(name) ? true : actual.selfStream };
+      const changed = observed.channelId !== session.channelId || observed.selfMute !== !!session.selfMute || observed.selfDeaf !== !!session.selfDeaf || observed.selfVideo !== !!session.selfVideo || observed.selfStream !== !!session.selfStream;
+      if (changed) {
+        if (observed.channelId !== session.channelId) stopSyntheticStream(name);
+        upsertSession(name, session.guildId, observed.channelId, observed);
+      }
+    }
+  }
+}
 async function moveAccount(name, guildId, channelId, opts = {}) {
   return withAccountLock(name, async () => {
     const client = getClient(name);
@@ -788,7 +806,7 @@ async function restoreSavedAccounts() {
 }
 app.get('/{*splat}', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 if (require.main === module) {
-  app.listen(PORT, '0.0.0.0', () => { console.log(`Voice Studio listening on http://localhost:${PORT}`); setImmediate(() => { try { ensureSyntheticVideo(); } catch (error) { console.warn('[stream] source prewarm failed:', error.message); } }); restoreSavedAccounts().catch((error) => console.warn('[accounts] restore failed:', error.message)); });
+  app.listen(PORT, '0.0.0.0', () => { console.log(`Voice Studio listening on http://localhost:${PORT}`); setImmediate(() => { try { ensureSyntheticVideo(); } catch (error) { console.warn('[stream] source prewarm failed:', error.message); } }); setInterval(() => { try { reconcileVoiceSessions(); } catch (error) { console.warn('[voice] session reconciliation failed:', error.message); } }, 3000).unref?.(); restoreSavedAccounts().catch((error) => console.warn('[accounts] restore failed:', error.message)); });
 }
 
 module.exports = { app, clients, voiceSessions, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, saveAccounts, loadAccounts };
