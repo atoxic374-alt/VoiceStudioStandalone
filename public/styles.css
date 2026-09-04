@@ -118,6 +118,8 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .activity-modal-head { align-items: center; }
 .modal-close-button { display: grid; place-items: center; width: 38px; height: 38px; flex-shrink: 0; border: 1px solid rgba(255,113,139,.28); border-radius: 11px; background: rgba(255,113,139,.08); color: var(--red); cursor: pointer; font-size: 24px; line-height: 1; }
 .modal-close-button:hover { border-color: rgba(255,113,139,.6); background: rgba(255,113,139,.16); transform: scale(1.04); }
+.operation-account.is-success { border-color: rgba(96,230,167,.48); background: rgba(96,230,167,.07); }
+.operation-account.is-error { border-color: rgba(255,113,139,.48); background: rgba(255,113,139,.07); }
 .automation-card .bulk-voice-controls { margin-top: 4px; padding-top: 16px; border-top: 1px solid rgba(173,184,255,.16); border-bottom: 1px solid rgba(173,184,255,.1); }
 .automation-card .automation-step { margin-top: 24px; padding-top: 14px; border-top: 1px solid rgba(173,184,255,.12); }
 .automation-card .automation-step:first-of-type { margin-top: 20px; }

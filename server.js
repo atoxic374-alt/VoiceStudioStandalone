@@ -130,7 +130,7 @@ async function mapWithConcurrency(items, limit, worker) {
   return results;
 }
 function summary(results) {
-  const okCount = results.filter((item) => item.ok).length;
+  const okCount = results.filter((item) => item?.ok === true).length;
   return { total: results.length, ok: okCount, failed: results.length - okCount };
 }
 function readPersistedSessions() {
@@ -577,7 +577,10 @@ async function connectOne(token, name) {
   return {
     name: finalName,
     username: client.user?.tag || client.user?.username || finalName,
+    displayName: client.user?.globalName || client.user?.username || finalName,
+    nickname: client.user?.globalName || client.user?.username || finalName,
     id: client.user?.id || null,
+    avatar: client.user?.displayAvatarURL?.({ size: 128 }) || null,
   };
 }
 
