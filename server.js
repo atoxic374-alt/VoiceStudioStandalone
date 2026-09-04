@@ -192,9 +192,7 @@ async function startSyntheticStream(name, guildId) {
       let connection;
       try {
         const existing = client.voice.connection;
-        connection = existing?.channel?.id === session.channelId ? existing : await withTimeout(client.voice.joinChannel(channel, { selfMute: !!session.selfMute, selfDeaf: false, selfVideo: true, videoCodec: 'H264' }), 12000, 'Voice connection timed out while starting stream');
-        const videoReady = sendVoiceOp(client, guildId, session.channelId, { selfMute: !!session.selfMute, selfDeaf: false, selfVideo: true, selfStream: false });
-        if (!videoReady.ok) throw new Error(videoReady.error || 'Unable to prepare voice connection for stream');
+        connection = existing?.channel?.id === session.channelId ? existing : await withTimeout(client.voice.joinChannel(channel, { selfMute: !!session.selfMute, selfDeaf: false, selfVideo: false, videoCodec: 'H264' }), 12000, 'Voice connection timed out while starting stream');
         const streamConnection = await withTimeout(connection.createStreamConnection(), 8000, 'Stream connection timed out');
         let dispatcher;
         let playError;
