@@ -211,7 +211,7 @@ async function startSyntheticStream(name, guildId, mediaKind = 'go-live') {
           self_deaf: false,
           self_video: !!enabled,
         });
-        await withTimeout(streamer.joinVoice(guildId, session.channelId), 20000, 'Voice WebRTC connection timed out');
+        await withTimeout(streamer.joinVoice(guildId, session.channelId), 12000, 'Voice WebRTC connection timed out after 12 seconds');
         logMediaEvent('info', 'stream.media_connecting', { account: name, guildId, channelId: session.channelId, attempt });
         controller = new AbortController();
         const active = { streamer, controller, guildId, channelId: session.channelId, mediaKind, startedAt: Date.now() };
