@@ -202,6 +202,15 @@ async function startSyntheticStream(name, guildId, mediaKind = 'go-live') {
       let controller;
       try {
         streamer = new Streamer(client);
+        // The upstream helper currently signals video with self_deaf=true.
+        // That makes Discord reject both camera and Go Live transitions.
+        streamer.signalVideo = (enabled) => streamer.sendOpcode(4, {
+          guild_id: guildId,
+          channel_id: session.channelId,
+          self_mute: !!session.selfMute,
+          self_deaf: false,
+          self_video: !!enabled,
+        });
         await withTimeout(streamer.joinVoice(guildId, session.channelId), 20000, 'Voice WebRTC connection timed out');
         logMediaEvent('info', 'stream.media_connecting', { account: name, guildId, channelId: session.channelId, attempt });
         controller = new AbortController();
@@ -733,9 +742,10 @@ app.post('/api/voice/state', async (req, res) => {
     };
     if (!client) return { name, ok: false, error: 'Account is not connected' };
     if (!current?.channelId) return { name, ok: false, error: 'Account is not in a voice channel' };
+    const enablingMedia = selfVideo === true || selfStream === true;
     const next = {
       selfMute: selfMute !== undefined ? selfMute : !!current.selfMute,
-      selfDeaf: selfDeaf !== undefined ? selfDeaf : !!current.selfDeaf,
+      selfDeaf: selfDeaf !== undefined ? selfDeaf : enablingMedia ? false : !!current.selfDeaf,
       selfVideo: selfVideo !== undefined ? selfVideo : !!current.selfVideo,
       selfStream: selfStream !== undefined ? selfStream : !!current.selfStream,
     };
