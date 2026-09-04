@@ -18,16 +18,79 @@ const state = {
   refreshPromise: null, liveEvents: null, liveRefreshTimer: null,
 };
 
+let authPromptPromise = null;
+function requestAuthentication(message = 'أدخل كلمة مرور المساحة للمتابعة. لا يمكن استخدام الموقع قبل المصادقة.') {
+  if (state.authenticated) return Promise.resolve(true);
+  if (authPromptPromise) return authPromptPromise;
+  const modal = $('#authModal');
+  const form = $('#authForm');
+  const input = $('#authPasswordInput');
+  const feedback = $('#authFeedback');
+  const submit = $('#authSubmitButton');
+  const cancel = $('#authCancelButton');
+  if (!modal || !form || !input || !feedback || !submit || !cancel) return Promise.reject(new Error('Authentication UI unavailable'));
+
+  authPromptPromise = new Promise((resolve) => {
+    let submitting = false;
+    const setFeedback = (text = '', tone = '') => { feedback.textContent = text; feedback.className = `auth-feedback ${tone}`; };
+    const finish = () => {
+      state.authenticated = true;
+      modal.hidden = true;
+      document.body.classList.remove('auth-locked');
+      form.reset();
+      setFeedback();
+      cleanup();
+      resolve(true);
+      authPromptPromise = null;
+    };
+    const cleanup = () => {
+      form.removeEventListener('submit', onSubmit);
+      cancel.removeEventListener('click', onCancel);
+    };
+    const onCancel = () => {
+      // Deliberately keep the modal open: cancelling must never leave the app usable.
+      input.value = '';
+      setFeedback('يلزم إدخال كلمة المرور لاستخدام الموقع.', 'error');
+      input.focus();
+    };
+    const onSubmit = async (event) => {
+      event.preventDefault();
+      if (submitting) return;
+      const password = input.value;
+      if (!password) { setFeedback('أدخل كلمة المرور أولًا.', 'error'); input.focus(); return; }
+      submitting = true;
+      submit.disabled = true;
+      cancel.disabled = true;
+      setFeedback('جارٍ التحقق…');
+      try {
+        const auth = await fetch('/api/auth', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password }), credentials: 'same-origin' });
+        const payload = await auth.json().catch(() => ({}));
+        if (!auth.ok || payload.success === false) throw new Error(auth.status === 429 ? 'محاولات كثيرة. حاول لاحقًا.' : 'كلمة المرور غير صحيحة.');
+        finish();
+      } catch (error) {
+        setFeedback(error.message || 'تعذر التحقق من كلمة المرور.', 'error');
+        input.select();
+        submitting = false;
+        submit.disabled = false;
+        cancel.disabled = false;
+        input.focus();
+      }
+    };
+    form.addEventListener('submit', onSubmit);
+    cancel.addEventListener('click', onCancel);
+    $('#authMessage').textContent = message;
+    modal.hidden = false;
+    document.body.classList.add('auth-locked');
+    requestAnimationFrame(() => input.focus());
+  });
+  return authPromptPromise;
+}
+
 const api = async (url, options = {}) => {
   const response = await fetch(url, { ...options, headers: { 'Content-Type': 'application/json', ...(options.headers || {}) } });
   const payload = await response.json().catch(() => ({}));
   if (response.status === 401 && !options._authRetry) {
-    const password = window.prompt('Enter the Voice Studio access password');
-    if (!password) throw new Error('Authentication required');
-    const auth = await fetch('/api/auth', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password }) });
-    const authPayload = await auth.json().catch(() => ({}));
-    if (!auth.ok || authPayload.success === false) throw new Error('Invalid access password');
-    state.authenticated = true;
+    await requestAuthentication();
     return api(url, { ...options, _authRetry: true });
   }
   if (!response.ok || payload.success === false) throw new Error(payload.error || `Request failed (${response.status})`);
