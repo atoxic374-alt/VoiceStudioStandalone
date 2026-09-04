@@ -15,7 +15,7 @@ const state = {
   rotationRoomSelection: new Set(),
   busy: new Set(),
   overviewFilter: '', overviewSort: 'account',
-  lastOperation: null, authenticated: false, mediaBusy: false,
+  lastOperation: null, authenticated: false, mediaBusy: false, tasks: [],
   refreshPromise: null, liveEvents: null, liveRefreshTimer: null,
 };
 
@@ -365,13 +365,16 @@ function renderProfiles(clients = []) {
   list.innerHTML = clients.map((client) => {
     const voice = client.voice;
     const avatar = client.avatar ? `<img src="${escapeHTML(client.avatar)}" alt="" />` : escapeHTML((client.nickname || client.name || '?')[0].toUpperCase());
-    const voiceText = voice ? `<span class="profile-voice-destination"><span class="profile-guild-icon">${voice.guildIcon ? `<img src="${escapeHTML(voice.guildIcon)}" alt="" />` : '◆'}</span><span>${escapeHTML(voice.guildName || voice.guildId)} · ${escapeHTML(voice.channelName || voice.channelId)}</span></span>` : 'Not in a room';
+    const rotation = state.tasks.find((task) => task.type === 'rotation' && task.accounts?.includes(client.name));
+    const voiceText = voice ? `<span class="profile-voice-destination"><span class="profile-guild-icon">${voice.guildIcon ? `<img src="${escapeHTML(voice.guildIcon)}" alt="" />` : '◆'}</span><span><small>Voice: ${escapeHTML(voice.channelName || voice.channelId)}</small><small>Server: ${escapeHTML(voice.guildName || voice.guildId)}</small></span></span>${rotation ? `<span class="rotation-status">Rotation active</span><button type="button" class="rotation-info-button" data-rotation-info="${escapeHTML(rotation.id)}">Details · ${Math.round((rotation.intervalMs || 0) / 60000)} min</button>` : ''}` : 'Not in a room';
     const flags = voice ? `${voice.selfMute ? 'Mute' : 'Unmute'}${voice.selfDeaf ? ' · Deafen' : ''}${voice.selfVideo ? ' · Video' : ''}${voice.selfStream ? ' · Stream' : ''}` : 'Offline'; const health = client.health || {}; const healthText = health.state === 'healthy' ? 'Healthy' : health.state === 'degraded' ? `Degraded${health.lastError ? ` · ${health.lastError}` : ''}` : 'Unknown';
     return `<div class="profile-row"><span class="profile-row-avatar">${avatar}</span><div class="profile-row-main"><strong>${escapeHTML(client.nickname || client.displayName || client.name)}</strong><small>@${escapeHTML(client.username || client.name)} · ID: ${escapeHTML(client.id || '—')} · <span class="health-${escapeHTML(health.state || 'unknown')}">${escapeHTML(healthText)}</span></small></div><div class="profile-row-voice"><span class="profile-online"></span><strong>${voiceText}</strong><small>${flags}</small></div><button class="profile-leave" type="button" data-profile-leave="${escapeHTML(client.name)}" data-profile-guild="${escapeHTML(voice?.guildId || '')}" ${voice ? '' : 'disabled'}>Leave</button></div>`;
   }).join('');
   list.querySelectorAll('[data-profile-leave]').forEach((button) => button.addEventListener('click', () => quickLeave(button.dataset.profileLeave, button.dataset.profileGuild)));
+  list.querySelectorAll('[data-rotation-info]').forEach((button) => button.addEventListener('click', () => showRotationDetails(button.dataset.rotationInfo)));
   updateQuickStateButtons();
 }
+function showRotationDetails(id) { const task = state.tasks.find((item) => item.id === id); if (!task) return; const rooms = (task.channels || []).join(' · '); toast(`Rotation · every ${Math.round((task.intervalMs || 0) / 60000)} min · ${task.accounts?.length || 0} accounts · ${rooms}`, 'success'); }
 
 function openDisconnect() {
   const list = $('#disconnectAccountList');
@@ -506,7 +509,8 @@ async function refreshSessions() {
 async function loadTasks() {
   try {
     const [rotations, cycles] = await Promise.all([api('/api/voice/rotations'), api('/api/voice/state-cycles')]);
-    renderTasks([...(rotations.rotations || []).map((task) => ({ ...task, type: 'rotation', title: 'تنقل بين القنوات' })), ...(cycles.cycles || []).map((task) => ({ ...task, type: 'cycle', title: 'تدوير الحالات' }))]);
+    state.tasks = [...(rotations.rotations || []).map((task) => ({ ...task, type: 'rotation', title: 'تنقل بين القنوات' })), ...(cycles.cycles || []).map((task) => ({ ...task, type: 'cycle', title: 'تدوير الحالات' }))];
+    renderTasks(state.tasks); renderProfiles(state.clients);
   } catch (error) { console.warn('[voice] tasks refresh failed', error); }
 }
 function renderTasks(tasks) {

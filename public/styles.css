@@ -218,3 +218,11 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .top-mic-pulse { position: absolute; inset: 5px; border: 1px solid rgba(72,217,210,.55); border-radius: 9px; animation: mic-pulse 1.8s ease-out infinite; }
 @keyframes mic-pulse { 0% { opacity: .75; transform: scale(.82); } 70%, 100% { opacity: 0; transform: scale(1.38); } }
 @media (prefers-reduced-motion: reduce) { .top-mic-pulse { animation: none; opacity: .45; } }
+
+.profile-row-voice { display: flex; flex-direction: column; align-items: center; gap: 5px; text-align: center; }
+.profile-voice-destination { display: flex; flex-direction: column; align-items: center; gap: 6px; width: 100%; }
+.profile-voice-destination > span:last-child { display: grid; gap: 3px; width: 100%; }
+.profile-voice-destination small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rotation-status { padding: 3px 7px; border: 1px solid rgba(72,217,210,.38); border-radius: 99px; background: rgba(72,217,210,.1); color: var(--cyan); font-size: 8px; }
+.rotation-info-button { padding: 4px 8px; border: 1px solid rgba(140,124,255,.35); border-radius: 7px; background: rgba(140,124,255,.1); color: var(--violet-bright); cursor: pointer; font-size: 8px; }
+.rotation-info-button:hover { background: rgba(140,124,255,.2); border-color: rgba(140,124,255,.65); }
