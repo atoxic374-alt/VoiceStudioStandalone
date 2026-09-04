@@ -543,7 +543,8 @@ async function syncMediaVoiceState(next, kind) {
     return { synced: false };
   }
   try {
-    const result = await post('/api/voice/state', { accounts: selectedAccounts(), guildId: state.selectedTarget.guildId, ...next });
+    // Media state updates should not open the blocking operation overlay.
+    const result = await api('/api/voice/state', { method: 'POST', body: JSON.stringify({ accounts: selectedAccounts(), guildId: state.selectedTarget.guildId, ...next }) });
     if (!result.summary?.ok) throw new Error(result.results?.find((item) => !item.ok)?.error || 'Discord did not apply the media state');
     if ($('#mediaNotice')) $('#mediaNotice').textContent = `${kind} state confirmed by Discord.`;
     return { synced: true };
