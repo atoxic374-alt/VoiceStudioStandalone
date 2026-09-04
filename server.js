@@ -313,10 +313,16 @@ async function startSyntheticStream(name, guildId, mediaKind = 'go-live') {
         check();
       }), 6000, 'WebRTC media transport was not ready');
       if (active.completedAt || syntheticStreams.get(name) !== active) throw new Error('Media transport stopped before activation');
-      const confirmed = await sendVoiceOpConfirmed(client, guildId, session.channelId, mediaKind === 'camera'
+      const mediaState = mediaKind === 'camera'
         ? { selfMute: !!session.selfMute, selfDeaf: false, selfVideo: true, selfStream: false }
-        : { selfMute: !!session.selfMute, selfDeaf: false, selfVideo: false, selfStream: true }, 3000);
-      if (!confirmed.ok) throw new Error(confirmed.error || 'Discord did not confirm media state');
+        : { selfMute: !!session.selfMute, selfDeaf: false, selfVideo: false, selfStream: true };
+      // STREAM_CREATE/STREAM_SERVER_UPDATE plus a ready media transport are the
+      // authoritative confirmation for Go Live. Discord may not echo
+      // self_stream through the normal VOICE_STATE_UPDATE event in time.
+      const confirmed = mediaKind === 'camera'
+        ? await sendVoiceOpConfirmed(client, guildId, session.channelId, mediaState, 3000)
+        : sendVoiceOp(client, guildId, session.channelId, mediaState);
+      if (!confirmed.ok) throw new Error(confirmed.error || 'Discord did not accept media state');
       logMediaEvent('info', 'media.ready', { account: name, guildId, channelId: session.channelId, mediaKind, durationMs: Date.now() - startedAt, attempt });
       return { ok: true };
     } catch (error) {
