@@ -363,11 +363,12 @@ async function moveAccount(name, guildId, channelId, opts = {}) {
     if (!client) return { name, ok: false, error: 'Account is not connected' };
     const target = validateTarget(client, guildId, channelId);
     if (!target.ok) return { name, ok: false, error: target.error };
-    const result = await sendVoiceOpConfirmed(client, guildId, channelId, opts);
+    if (syntheticStreams.has(name)) stopSyntheticStream(name);
+    const result = await sendVoiceOpConfirmed(client, guildId, channelId, { ...opts, selfVideo: false, selfStream: false });
     if (result.ok) {
       for (const key of [...voiceSessions.keys()]) if (key.startsWith(`${name}__`) && key !== sessionKey(name, guildId)) voiceSessions.delete(key);
       const actual = readGatewayVoiceState(client, guildId);
-      upsertSession(name, guildId, channelId, { ...opts, ...(actual || {}) });
+      upsertSession(name, guildId, channelId, { ...opts, ...(actual || {}), selfVideo: false, selfStream: false });
     }
     return { name, ok: result.ok, error: result.ok ? null : result.error, channelId };
   });
