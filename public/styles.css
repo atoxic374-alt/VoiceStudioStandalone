@@ -114,7 +114,22 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .operation-account.is-success { border-color: rgba(72,217,210,.45); background: rgba(72,217,210,.05); }
 .state-button.is-pending { opacity: .65; cursor: wait; }
 .activity-expand { width: 100%; margin-top: 10px; }
-.activity-dialog { width: min(680px, 100%); }
+.activity-dialog { width: min(920px, calc(100vw - 32px)); }
+.activity-modal-head { align-items: center; }
+.modal-close-button { display: grid; place-items: center; width: 38px; height: 38px; flex-shrink: 0; border: 1px solid rgba(255,113,139,.28); border-radius: 11px; background: rgba(255,113,139,.08); color: var(--red); cursor: pointer; font-size: 24px; line-height: 1; }
+.modal-close-button:hover { border-color: rgba(255,113,139,.6); background: rgba(255,113,139,.16); transform: scale(1.04); }
+.automation-card .bulk-voice-controls { margin-top: 4px; padding-top: 16px; border-top: 1px solid rgba(173,184,255,.16); border-bottom: 1px solid rgba(173,184,255,.1); }
+.automation-card .automation-step { margin-top: 24px; padding-top: 14px; border-top: 1px solid rgba(173,184,255,.12); }
+.automation-card .automation-step:first-of-type { margin-top: 20px; }
+.automation-card .automation-step + .automation-step { margin-top: 26px; }
+.automation-card .automation-join { margin-top: 16px; }
+.automation-card .automation-grid { margin-top: 22px; padding-top: 20px; border-top: 1px solid rgba(173,184,255,.14); }
+.automation-card .random-toggle { margin-top: 18px; }
+.automation-card .automation-actions { margin-top: 10px; padding-top: 18px; border-top: 1px solid rgba(173,184,255,.14); }
+.automation-card .tasks-list { margin-top: 20px; padding-top: 16px; border-top: 1px solid rgba(173,184,255,.12); }
+.activity-card { grid-column: 1 / -1; min-width: 0; }
+@media (min-width: 1001px) { .activity-card { min-height: 360px; } }
+@media (max-width: 690px) { .activity-dialog { width: calc(100vw - 24px); max-height: 88vh; padding: 14px; }.modal-close-button { width: 36px; height: 36px; }.activity-card { min-height: 300px; } }
 .full-activity-list { max-height: min(65vh, 620px); overflow: auto; }
 .activity-pagination { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 12px; }
 @media (max-width: 760px) { .profile-row { grid-template-columns: 36px minmax(0, 1fr) auto; } .profile-row-voice { grid-column: 2 / -1; } }
