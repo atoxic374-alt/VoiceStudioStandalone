@@ -65,3 +65,10 @@ The original backend sends Discord Gateway voice-state flags (`self_video` and `
 ## Security note
 
 Automating Discord user accounts can violate Discord's Terms of Service and may result in account action. Use this project only with accounts and credentials you are authorized to control. Never commit a real token.
+
+
+## Simple interface
+
+The interface is intentionally organized into six English product sections: `Dashboard`, `Accounts`, `Voice`, `Automation`, `Media`, and `Activity`. Only one section is shown at a time, so connection forms, voice controls, automation settings, media preview, and logs do not compete for attention on the same screen. The breadcrumb updates with the active section.
+
+All write operations use one consistent processing dialog. It shows the operation name, a loading state while the request is running, the selected account avatar and nickname when available, and an individual `Success` or failure message after completion. The dialog remains available until the user closes it, while background refreshes stay silent so they do not interrupt the workflow.
