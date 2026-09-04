@@ -159,3 +159,17 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 @media (prefers-reduced-motion: reduce) { .custom-select-menu button, .custom-select-trigger, .custom-select-trigger i { transition: none !important; }.custom-select.is-open .custom-select-menu button { transform: none; } }
 
 .room-search-input { width: 100%; margin-top: 6px; padding: 0 10px; height: 30px; border: 1px solid rgba(72,217,210,.18); border-radius: 9px; background: rgba(7,16,28,.48); color: var(--text); outline: none; font-size: 10px; transition: border-color .18s var(--ease), box-shadow .18s var(--ease); }.room-search-input::placeholder { color: var(--muted); }.room-search-input:focus { border-color: rgba(72,217,210,.58); box-shadow: 0 0 0 3px rgba(72,217,210,.08); }
+/* Responsive destination controls: keep every selector visible on desktop and mobile. */
+.selection-row { grid-template-columns: minmax(145px, .75fr) minmax(180px, 1fr) minmax(220px, 1.7fr) 44px; min-width: 0; }
+.selection-row > * { min-width: 0; }
+.selection-row .room-search-input { min-width: 0; max-width: 100%; }
+@media (max-width: 900px) and (min-width: 691px) {
+  .selection-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .selection-row .select-field.wide, .selection-row .refresh-button { grid-column: span 2; }
+}
+@media (max-width: 690px) {
+  .selection-row { grid-template-columns: minmax(0, 1fr) !important; gap: 12px; padding-left: 18px; padding-right: 18px; }
+  .selection-row .select-field, .selection-row .select-field.wide, .selection-row .refresh-button { grid-column: auto; width: 100%; min-width: 0; }
+  .selection-row .refresh-button { min-height: 43px; }
+  .selection-row .room-search-input { height: 40px; margin-top: 7px; font-size: 12px; }
+}
