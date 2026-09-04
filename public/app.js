@@ -73,7 +73,7 @@ async function loadClients(preferred = '') {
     : '<option value="">اتصل بحساب أولًا</option>';
   state.selectedAccount = state.clients.some((client) => client.name === current) ? current : (state.clients[0]?.name || '');
   select.value = state.selectedAccount;
-  $('#accountBadge').textContent = state.clients.length ? `${state.clients.length} حساب متصل` : 'لا توجد حسابات';
+  $('#accountBadge').textContent = state.clients.length ? `${state.clients.length} connected` : 'No accounts'; $('#navAccountCount').textContent = String(state.clients.length);
   $('#connectionLabel').textContent = state.clients.length ? `${state.clients.length} حساب متصل` : 'جاهز للاتصال';
   renderProfiles(state.clients);
   await loadGuilds();
@@ -92,6 +92,7 @@ async function loadAutomationCatalog() {
 }
 function selectedAutomationAccounts() { return [...document.querySelectorAll('#automationAccounts input[type="checkbox"]:checked')].map((input) => input.value); }
 function selectedRotationChannels() { return [...document.querySelectorAll('#rotationChannels input[type="checkbox"]:checked')].map((input) => input.value); }
+function selectedAutomationStates() { return [...document.querySelectorAll('#statePicker input[type="checkbox"]:checked')].map((input) => input.value); }
 function selectedAutomationChannel() { return $('#automationChannel')?.value || ''; }
 function renderAutomationChannels() {
   const guildId = $('#automationGuild')?.value;
@@ -111,7 +112,7 @@ async function renderTargetAccounts() {
   if (!guildId || !channelId) { wrapper.innerHTML = '<div class="task-empty">اختر سيرفرًا ورومًا لعرض الحسابات</div>'; return; }
   try {
     const data = await api(`/api/voice/target-accounts?guildId=${encodeURIComponent(guildId)}&channelId=${encodeURIComponent(channelId)}`);
-    wrapper.innerHTML = data.accounts.length ? data.accounts.map((account) => `<label class="account-target ${account.available ? '' : 'is-disabled'}"><input type="checkbox" value="${escapeHTML(account.name)}" ${account.available ? '' : 'disabled'} /><span class="target-avatar">${account.avatar ? `<img src="${escapeHTML(account.avatar)}" alt="" />` : escapeHTML((account.nickname || '?')[0])}</span><span class="target-copy"><strong>${escapeHTML(account.nickname)}</strong><small>ID: ${escapeHTML(account.id || '—')} · ${account.available ? (account.current ? `حاليًا في ${escapeHTML(account.current.channelName)} · ${account.current.selfMute ? 'مكتوم' : 'صوت مفتوح'}${account.current.selfDeaf ? ' · معزول' : ''}${account.current.selfVideo ? ' · فيديو' : ''}${account.current.selfStream ? ' · مشاركة' : ''}` : 'جاهز للدخول') : escapeHTML(account.reason)}</small></span><span class="target-status">${account.available ? 'متاح' : 'مستبعد'}</span></label>`).join('') : '<div class="task-empty">لا توجد حسابات متصلة</div>';
+    wrapper.innerHTML = data.accounts.length ? data.accounts.map((account) => `<label class="account-target ${account.available ? '' : 'is-disabled'}"><input type="checkbox" value="${escapeHTML(account.name)}" ${account.available ? '' : 'disabled'} /><span class="target-avatar">${account.avatar ? `<img src="${escapeHTML(account.avatar)}" alt="" />` : escapeHTML((account.nickname || '?')[0])}</span><span class="target-copy"><strong>${escapeHTML(account.nickname)}</strong><small>ID: ${escapeHTML(account.id || '—')} · ${account.available ? (account.current ? `حاليًا في ${escapeHTML(account.current.channelName)} · ${account.current.selfMute ? 'Mute' : 'Unmute'}${account.current.selfDeaf ? ' · Deafen' : ''}${account.current.selfVideo ? ' · Video' : ''}${account.current.selfStream ? ' · Stream' : ''}` : 'جاهز للدخول') : escapeHTML(account.reason)}</small></span><span class="target-status">${account.available ? 'متاح' : 'مستبعد'}</span></label>`).join('') : '<div class="task-empty">لا توجد حسابات متصلة</div>';
   } catch (error) { wrapper.innerHTML = `<div class="task-empty">تعذر تحميل الحسابات: ${escapeHTML(error.message)}</div>`; }
 }
 async function loadGuilds() {
@@ -219,8 +220,8 @@ function renderProfiles(clients = []) {
   list.innerHTML = clients.map((client) => {
     const voice = client.voice;
     const avatar = client.avatar ? `<img src="${escapeHTML(client.avatar)}" alt="" />` : escapeHTML((client.nickname || client.name || '?')[0].toUpperCase());
-    const voiceText = voice ? `${escapeHTML(voice.guildName || voice.guildId)} · ${escapeHTML(voice.channelName || voice.channelId)}` : 'خارج أي غرفة';
-    const flags = voice ? `${voice.selfMute ? 'كتم' : 'صوت'}${voice.selfDeaf ? ' · عزل' : ''}${voice.selfVideo ? ' · فيديو' : ''}${voice.selfStream ? ' · مشاركة' : ''}` : 'جاهز';
+    const voiceText = voice ? `${escapeHTML(voice.guildName || voice.guildId)} · ${escapeHTML(voice.channelName || voice.channelId)}` : 'Not in a room';
+    const flags = voice ? `${voice.selfMute ? 'Mute' : 'Unmute'}${voice.selfDeaf ? ' · Deafen' : ''}${voice.selfVideo ? ' · Video' : ''}${voice.selfStream ? ' · Stream' : ''}` : 'Offline';
     return `<div class="profile-row"><span class="profile-row-avatar">${avatar}</span><div class="profile-row-main"><strong>${escapeHTML(client.nickname || client.displayName || client.name)}</strong><small>@${escapeHTML(client.username || client.name)} · ID: ${escapeHTML(client.id || '—')}</small></div><div class="profile-row-voice"><span class="profile-online"></span><strong>${voiceText}</strong><small>${flags}</small></div></div>`;
   }).join('');
 }
@@ -280,10 +281,11 @@ async function leave() {
 async function applyState(kind) {
   if (!requireAccount()) return;
   const values = {
-    mute: { selfMute: true, selfDeaf: false, selfVideo: false, selfStream: false, label: 'تم كتم الصوت' },
-    deaf: { selfMute: true, selfDeaf: true, selfVideo: false, selfStream: false, label: 'تم تفعيل العزل' },
-    unmute: { selfMute: false, selfDeaf: false, selfVideo: false, selfStream: false, label: 'تم فتح الصوت' },
-    cam: { selfMute: false, selfDeaf: false, selfVideo: true, selfStream: false, label: 'تم تحديث حالة الفيديو' },
+    mute: { selfMute: true, selfDeaf: false, selfVideo: false, selfStream: false, label: 'Mute enabled' },
+    deaf: { selfMute: true, selfDeaf: true, selfVideo: false, selfStream: false, label: 'Deafen enabled' },
+    unmute: { selfMute: false, selfDeaf: false, selfVideo: false, selfStream: false, label: 'Unmute enabled' },
+    cam: { selfMute: false, selfDeaf: false, selfVideo: true, selfStream: false, label: 'Video enabled' },
+    stream: { selfMute: false, selfDeaf: false, selfVideo: false, selfStream: true, label: 'Stream enabled' },
   };
   const next = values[kind];
   if (!next) return;
@@ -308,7 +310,7 @@ function renderSessions(sessions = []) {
     list.innerHTML = '<div class="empty-state"><span class="empty-pulse"></span><p>لا توجد جلسات نشطة الآن</p><small>عند الدخول إلى غرفة ستظهر تفاصيلها هنا.</small></div>';
     return;
   }
-  list.innerHTML = sessions.map((session) => `<div class="session-row"><span class="session-avatar">${escapeHTML((session.name || '?')[0].toUpperCase())}</span><div class="session-info"><strong>${escapeHTML(session.name)}</strong><small>${escapeHTML(session.guildId)} · ${escapeHTML(session.channelId)}</small></div><div class="session-state">${session.selfMute ? '◌' : '♫'}${session.selfDeaf ? ' ⊘' : ''}${session.selfVideo ? ' ▣' : ''}${session.selfStream ? ' ▤' : ''}</div><button class="session-leave" type="button" data-leave-name="${escapeHTML(session.name)}" data-leave-guild="${escapeHTML(session.guildId)}" title="خروج">×</button></div>`).join('');
+  list.innerHTML = sessions.map((session) => `<div class="session-row"><span class="session-avatar">${escapeHTML((session.name || '?')[0].toUpperCase())}</span><div class="session-info"><strong>${escapeHTML(session.name)}</strong><small>${escapeHTML(session.guildId)} · ${escapeHTML(session.channelId)}</small></div><div class="session-state">${session.selfMute ? 'Mute' : 'Unmute'}${session.selfDeaf ? ' · Deafen' : ''}${session.selfVideo ? ' · Video' : ''}${session.selfStream ? ' · Stream' : ''}</div><button class="session-leave" type="button" data-leave-name="${escapeHTML(session.name)}" data-leave-guild="${escapeHTML(session.guildId)}" title="خروج">×</button></div>`).join('');
   list.querySelectorAll('[data-leave-name]').forEach((button) => button.addEventListener('click', () => quickLeave(button.dataset.leaveName, button.dataset.leaveGuild)));
 }
 async function refreshSessions() {
@@ -367,7 +369,7 @@ async function startCycle() {
   const guildId = $('#automationGuild').value;
   if (!accounts.length) { toast('اختر الحسابات المستهدفة للمهمة', 'error'); return; }
   if (!guildId) { toast('اختر السيرفر الذي سيطبق الحالات', 'error'); return; }
-  const selected = [...$('#automationStates').selectedOptions].map((option) => option.value);
+  const selected = selectedAutomationStates();
   if (selected.length < 2) { toast('اختر حالتين على الأقل', 'error'); return; }
   const stateMap = { unmute: { selfMute: false, selfDeaf: false, selfVideo: false, selfStream: false }, mute: { selfMute: true, selfDeaf: false, selfVideo: false, selfStream: false }, deaf: { selfMute: true, selfDeaf: true, selfVideo: false, selfStream: false }, cam: { selfMute: false, selfDeaf: false, selfVideo: true, selfStream: false }, stream: { selfMute: false, selfDeaf: false, selfVideo: false, selfStream: true } };
   const intervalMs = Math.max(1, Number($('#automationMinutes').value || 5)) * 60000;
@@ -395,8 +397,8 @@ function stopCurrentStream({ updateDiscord = true } = {}) {
   $('#stageOverlay').classList.remove('is-visible');
   $('#stopMediaButton').disabled = true;
   $('#cameraButton').classList.remove('is-active'); $('#screenButton').classList.remove('is-active');
-  $('#cameraState').textContent = 'متوقف'; $('#screenState').textContent = 'متوقف';
-  $('#mediaStatus').classList.remove('is-live'); $('#mediaStatus').innerHTML = '<span></span> متوقف';
+  $('#cameraState').textContent = 'Off'; $('#screenState').textContent = 'Off';
+  $('#mediaStatus').classList.remove('is-live'); $('#mediaStatus').innerHTML = '<span></span> Offline';
   if (updateDiscord && previousKind && state.selectedTarget && state.selectedAccount) {
     post('/api/voice/state', { accounts: selectedAccounts(), guildId: state.selectedTarget.guildId, selfVideo: false, selfStream: false }).catch(() => {});
   }
@@ -405,8 +407,8 @@ function bindMediaEnded(stream) { stream.getVideoTracks().forEach((track) => tra
 function showMediaStream(stream, kind) {
   stopCurrentStream({ updateDiscord: false });
   state.mediaStream = stream; state.mediaKind = kind; state.mediaStartedAt = Date.now();
-  const video = $('#cameraPreview'); video.srcObject = stream; video.style.transform = kind === 'camera' ? 'scaleX(-1)' : 'none'; video.classList.add('is-visible'); $('#stagePlaceholder').style.display = 'none'; $('#stageOverlay').classList.add('is-visible'); $('#stageSource').textContent = kind === 'camera' ? 'كاميرا محلية' : 'مشاركة شاشة'; $('#stopMediaButton').disabled = false;
-  $('#cameraButton').classList.toggle('is-active', kind === 'camera'); $('#screenButton').classList.toggle('is-active', kind === 'screen'); $('#cameraState').textContent = kind === 'camera' ? 'يعمل الآن' : 'متوقف'; $('#screenState').textContent = kind === 'screen' ? 'يعمل الآن' : 'متوقف'; $('#mediaStatus').classList.add('is-live'); $('#mediaStatus').innerHTML = '<span></span> مباشر';
+  const video = $('#cameraPreview'); video.srcObject = stream; video.style.transform = kind === 'camera' ? 'scaleX(-1)' : 'none'; video.classList.add('is-visible'); $('#stagePlaceholder').style.display = 'none'; $('#stageOverlay').classList.add('is-visible'); $('#stageSource').textContent = kind === 'camera' ? 'Camera' : 'Screen share'; $('#stopMediaButton').disabled = false;
+  $('#cameraButton').classList.toggle('is-active', kind === 'camera'); $('#screenButton').classList.toggle('is-active', kind === 'screen'); $('#cameraState').textContent = kind === 'camera' ? 'Live' : 'Off'; $('#screenState').textContent = kind === 'screen' ? 'Live' : 'Off'; $('#mediaStatus').classList.add('is-live'); $('#mediaStatus').innerHTML = '<span></span> Live';
   state.mediaTimer = setInterval(() => { $('#stageTimer').textContent = formatDuration(Math.floor((Date.now() - state.mediaStartedAt) / 1000)); }, 1000);
   bindMediaEnded(stream); video.play().catch(() => {});
   addActivity(kind === 'camera' ? 'الكاميرا تعمل' : 'مشاركة الشاشة تعمل', 'المعاينة المحلية جاهزة', 'success'); toast(kind === 'camera' ? 'تم تشغيل الكاميرا' : 'تم تشغيل مشاركة الشاشة', 'success');
@@ -451,7 +453,7 @@ function initLanguage() {
 function initNavigation() { document.querySelectorAll('[data-section]').forEach((button) => button.addEventListener('click', () => { const section = button.dataset.section; document.querySelectorAll('.side-nav-item').forEach((item) => item.classList.toggle('is-active', item === button)); const breadcrumb = document.querySelector('.breadcrumb strong'); if (breadcrumb) breadcrumb.textContent = section[0].toUpperCase() + section.slice(1); document.querySelectorAll('[data-panel]').forEach((panel) => { const panels = panel.dataset.panel.split(/\s+/); panel.hidden = !panels.includes(section); }); })); document.querySelector('[data-section="dashboard"]')?.click(); }
 function init() {
   initTheme(); initLanguage(); initNavigation();
-  $('#connectButton').addEventListener('click', connect); $('#bulkConnectButton').addEventListener('click', bulkConnect); $('#disconnectButton').addEventListener('click', disconnect); $('#refreshButton').addEventListener('click', refreshChannels); $('#accountSelect').addEventListener('change', async (event) => { state.selectedAccount = event.target.value; await loadGuilds(); await loadAutomationCatalog(); }); $('#automationGuild').addEventListener('change', renderAutomationChannels); $('#automationChannel').addEventListener('change', renderTargetAccounts); $('#bulkJoinButton').addEventListener('click', bulkJoinSelected); $('#channelSelect').addEventListener('change', handleChannelChange); $('#joinButton').addEventListener('click', join); $('#joinAllButton').addEventListener('click', joinAll); $('#leaveButton').addEventListener('click', leave); $('#cameraButton').addEventListener('click', toggleCamera); $('#screenButton').addEventListener('click', toggleScreen); $('#startRotationButton').addEventListener('click', startRotation); $('#startCycleButton').addEventListener('click', startCycle); $('#stopMediaButton').addEventListener('click', () => stopCurrentStream()); document.querySelectorAll('.state-button').forEach((button) => button.addEventListener('click', () => applyState(button.dataset.state)));
+  $('#connectButton').addEventListener('click', connect); $('#bulkConnectButton').addEventListener('click', bulkConnect); $('#disconnectButton').addEventListener('click', disconnect); $('#refreshButton').addEventListener('click', refreshChannels); $('#accountSelect').addEventListener('change', async (event) => { state.selectedAccount = event.target.value; await loadGuilds(); await loadAutomationCatalog(); }); $('#automationGuild').addEventListener('change', renderAutomationChannels); $('#automationChannel').addEventListener('change', renderTargetAccounts); $('#bulkJoinButton').addEventListener('click', bulkJoinSelected); $('#channelSelect').addEventListener('change', handleChannelChange); $('#joinButton').addEventListener('click', join); $('#joinAllButton').addEventListener('click', joinAll); $('#leaveButton').addEventListener('click', leave); $('#cameraButton').addEventListener('click', toggleCamera); $('#screenButton').addEventListener('click', toggleScreen); $('#startRotationButton').addEventListener('click', startRotation); $('#startCycleButton').addEventListener('click', startCycle); $('#stopMediaButton').addEventListener('click', () => stopCurrentStream()); document.querySelectorAll('.state-button').forEach((button) => button.addEventListener('click', () => applyState(button.dataset.state))); document.querySelectorAll('#statePicker input').forEach((input) => input.addEventListener('change', () => input.closest('.state-option')?.classList.toggle('is-selected', input.checked)));
   $('#operationClose').addEventListener('click', () => { $('#operationModal').hidden = true; $('.operation-loader')?.classList.remove('is-done', 'is-error'); }); window.addEventListener('beforeunload', () => stopCurrentStream({ updateDiscord: false }));
   loadClients().catch(() => {}); refreshSessions(); setInterval(refreshSessions, 8000);
 }

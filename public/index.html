@@ -29,7 +29,7 @@
       </nav>
       <div class="sidebar-footer">
         <div class="mini-orb"></div>
-        <div><span>مساحة شخصية</span><small>تحكم هادئ وواضح</small></div>
+        <div><span>Workspace</span><small>Voice operations</small></div>
       </div>
     </aside>
 
@@ -46,9 +46,9 @@
       <div class="content-wrap">
         <section class="hero-block">
           <div>
-            <div class="eyebrow"><span class="eyebrow-line"></span> PERSONAL CONTROL CENTER</div>
-            <h1>Voice control, <em>made simple.</em></h1>
-            <p>Manage accounts, voice rooms, automation, and media from one focused workspace.</p>
+            <div class="eyebrow"><span class="eyebrow-line"></span> VOICE CONTROL CENTER</div>
+            <h1>Voice Control</h1>
+            <p>Manage connected accounts, voice rooms, automation, and media.</p>
           </div>
           <div class="hero-signal" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
         </section>
@@ -66,41 +66,41 @@
               </div>
               <div class="setup-actions"><button id="connectButton" class="primary-button" type="button"><span class="button-icon">↗</span><span>اتصال آمن</span></button><button id="disconnectButton" class="ghost-button" type="button">فصل الحساب</button></div>
               <div id="connectFeedback" class="inline-feedback" role="status" aria-live="polite"></div>
-              <div class="bulk-import"><div class="bulk-copy"><span>استيراد جماعي</span><small>كل سطر: اسم اختياري | التوكن</small></div><textarea id="bulkTokensInput" rows="2" placeholder="main | token...&#10;alt | token..."></textarea><button id="bulkConnectButton" class="ghost-button" type="button">إضافة الحسابات</button><div id="bulkFeedback" class="inline-feedback" role="status" aria-live="polite"></div></div>
+              <div class="bulk-import"><div class="bulk-copy"><span>Bulk import</span><small>One account per line: name | token</small></div><textarea id="bulkTokensInput" rows="2" placeholder="main | token...&#10;alt | token..."></textarea><button id="bulkConnectButton" class="ghost-button" type="button">Add accounts</button><div id="bulkFeedback" class="inline-feedback" role="status" aria-live="polite"></div></div>
             </article>
 
             <article class="card channel-card" data-panel="voice">
               <div class="card-heading compact"><div><span class="card-kicker">VOICE / DESTINATION</span><h2>Choose a voice room</h2></div><span id="channelStatus" class="live-label"><span></span> غير محدد</span></div>
               <div class="selection-row">
-                <label class="select-field"><span>الحساب</span><select id="accountSelect"><option value="">اتصل بحساب أولًا</option></select></label>
-                <label class="select-field wide"><span>الخادم والغرفة</span><select id="channelSelect"><option value="">اختر قناة صوتية</option></select></label>
+                <label class="select-field"><span>Account</span><select id="accountSelect"><option value="">اتصل بحساب أولًا</option></select></label>
+                <label class="select-field wide"><span>Server & room</span><select id="channelSelect"><option value="">اختر قناة صوتية</option></select></label>
                 <button id="refreshButton" class="refresh-button" type="button" title="تحديث القنوات" aria-label="تحديث القنوات">↻</button>
               </div>
               <div id="channelSummary" class="channel-summary empty"><span class="summary-icon">⌁</span><div><strong>لم يتم اختيار وجهة بعد</strong><small>بعد الاتصال، ستظهر الخوادم والقنوات المتاحة هنا.</small></div></div>
               <div class="voice-actions">
-                <button id="joinButton" class="action-button action-join" type="button"><span>＋</span> دخول للغرفة</button>
-                <button id="joinAllButton" class="action-button action-secondary" type="button">دخول الجميع</button>
-                <button id="leaveButton" class="action-button action-danger" type="button">خروج</button>
+                <button id="joinButton" class="action-button action-join" type="button"><span>＋</span> Join room</button>
+                <button id="joinAllButton" class="action-button action-secondary" type="button">Join all</button>
+                <button id="leaveButton" class="action-button action-danger" type="button">Leave</button>
               </div>
             </article>
 
             <article class="card automation-card" data-panel="automation">
               <div class="card-heading compact"><div><span class="card-kicker">AUTOMATION / TASKS</span><h2>Recurring tasks</h2></div><span class="soft-badge accent">تعمل بالخلفية</span></div>
-              <div class="automation-step"><span class="step-number">1</span><div><strong>السيرفر</strong><small>القائمة تعرض السيرفرات التي يراها أي حساب متصل</small></div></div>
+              <div class="automation-step"><span class="step-number">1</span><div><strong>Server</strong><small>Servers visible to any connected account</small></div></div>
               <select id="automationGuild" class="automation-guild"><option value="">اختر السيرفر</option></select>
-              <div class="automation-step"><span class="step-number">2</span><div><strong>الروم الصوتي</strong><small>اختر رومًا واحدًا للعملية الحالية</small></div></div>
+              <div class="automation-step"><span class="step-number">2</span><div><strong>Voice room</strong><small>Choose the room for this operation</small></div></div>
               <select id="automationChannel" class="automation-guild"><option value="">اختر الروم</option></select>
-              <div class="automation-step"><span class="step-number">3</span><div><strong>الحسابات</strong><small>تظهر هنا الحسابات الموجودة والقابلة للدخول إلى الروم</small></div></div>
+              <div class="automation-step"><span class="step-number">3</span><div><strong>Accounts</strong><small>Connected accounts that can access this room</small></div></div>
               <div id="automationAccounts" class="automation-channels account-targets"><div class="task-empty">اختر سيرفرًا ورومًا لعرض الحسابات</div></div>
-              <button id="bulkJoinButton" class="action-button action-join automation-join" type="button">دخول الحسابات المحددة إلى الروم</button>
-              <div class="automation-step"><span class="step-number">4</span><div><strong>رومات التنقل</strong><small>للتنقل، حدد رومتين أو أكثر؛ أما الدخول الجماعي فيستخدم الروم المختار بالأعلى</small></div></div>
+              <button id="bulkJoinButton" class="action-button action-join automation-join" type="button">Join selected accounts</button>
+              <div class="automation-step"><span class="step-number">4</span><div><strong>Rotation rooms</strong><small>Select two or more rooms for rotation</small></div></div>
               <div id="rotationChannels" class="automation-channels"><div class="task-empty">اختر سيرفرًا لعرض رومات التنقل</div></div>
               <div class="automation-grid">
-                <label class="field"><span>كل كم دقيقة؟</span><input id="automationMinutes" type="number" min="1" max="1440" value="5" /></label>
-                <label class="select-field"><span>الحالات</span><select id="automationStates" multiple><option value="unmute" selected>صوت مفتوح</option><option value="mute" selected>كتم الصوت</option><option value="deaf">عزل كامل</option><option value="cam">فيديو</option><option value="stream">مشاركة الشاشة</option></select></label>
+                <label class="field"><span>Interval (minutes)</span><input id="automationMinutes" type="number" min="1" max="1440" value="5" /></label>
+                <div class="state-picker-field"><span class="field-label">States</span><div id="statePicker" class="state-picker"><label class="state-option is-selected"><input type="checkbox" value="unmute" checked /><span class="state-option-icon">♫</span><span><strong>Unmute</strong><small>Voice on</small></span></label><label class="state-option is-selected"><input type="checkbox" value="mute" checked /><span class="state-option-icon">◼</span><span><strong>Mute</strong><small>Microphone off</small></span></label><label class="state-option"><input type="checkbox" value="deaf" /><span class="state-option-icon">◌</span><span><strong>Deafen</strong><small>Audio off</small></span></label><label class="state-option"><input type="checkbox" value="cam" /><span class="state-option-icon">▣</span><span><strong>Video</strong><small>Camera on</small></span></label><label class="state-option"><input type="checkbox" value="stream" /><span class="state-option-icon">▤</span><span><strong>Stream</strong><small>Screen share</small></span></label></div></div>
               </div>
-              <label class="random-toggle"><input id="randomRotation" type="checkbox" checked /><span>تنقل عشوائي داخل الرومات المحددة</span></label>
-              <div class="automation-actions"><button id="startRotationButton" class="action-button action-secondary" type="button">بدء التنقل بين الرومات</button><button id="startCycleButton" class="action-button action-secondary" type="button">بدء تدوير الحالات</button></div>
+              <label class="random-toggle"><input id="randomRotation" type="checkbox" checked /><span>Random order inside selected rooms</span></label>
+              <div class="automation-actions"><button id="startRotationButton" class="action-button action-secondary" type="button">Start rotation</button><button id="startCycleButton" class="action-button action-secondary" type="button">Start state cycle</button></div>
               <div id="tasksList" class="tasks-list"><div class="task-empty">لا توجد مهام قيد التشغيل</div></div>
             </article>
 
@@ -113,20 +113,20 @@
 
           <div class="column-side">
             <article id="mediaCard" class="card media-card" data-panel="media">
-              <div class="card-heading compact"><div><span class="card-kicker">MEDIA / PREVIEW</span><h2>Camera & screen</h2></div><span id="mediaStatus" class="media-status"><span></span> متوقف</span></div>
+              <div class="card-heading compact"><div><span class="card-kicker">MEDIA / PREVIEW</span><h2>Camera & Screen</h2></div><span id="mediaStatus" class="media-status"><span></span> Offline</span></div>
               <div class="media-stage" id="mediaStage">
                 <video id="cameraPreview" class="preview-video" autoplay muted playsinline></video>
-                <div id="stagePlaceholder" class="stage-placeholder"><div class="stage-glow"></div><div class="stage-icon">✦</div><strong>مساحتك المرئية</strong><small>فعّل الكاميرا أو مشاركة الشاشة<br />لرؤية المعاينة قبل الإرسال.</small></div>
+                <div id="stagePlaceholder" class="stage-placeholder"><div class="stage-glow"></div><div class="stage-icon">✦</div><strong>Media preview</strong><small>Start Camera or Screen share<br />to preview it here.</small></div>
                 <div id="stageOverlay" class="stage-overlay"><span id="stageSource">—</span><span id="stageTimer">00:00</span></div>
               </div>
-              <div class="media-controls"><button id="cameraButton" class="media-control" type="button"><span class="control-icon">●</span><span>كاميرا</span><small id="cameraState">متوقف</small></button><button id="screenButton" class="media-control" type="button"><span class="control-icon">▣</span><span>مشاركة الشاشة</span><small id="screenState">متوقف</small></button></div>
-              <div class="media-notice"><span>i</span><p>المعاينة تعمل محليًا داخل المتصفح. لا يتم تفعيل أي مصدر إلا بعد موافقتك.</p></div>
-              <button id="stopMediaButton" class="stop-media-button" type="button" disabled>إيقاف المصدر الحالي</button>
+              <div class="media-controls"><button id="cameraButton" class="media-control" type="button"><span class="control-icon">●</span><span>Camera</span><small id="cameraState">Off</small></button><button id="screenButton" class="media-control" type="button"><span class="control-icon">▣</span><span>Screen share</span><small id="screenState">Off</small></button></div>
+              <div class="media-notice"><span>i</span><p>Preview runs locally in your browser. A source starts only after permission.</p></div>
+              <button id="stopMediaButton" class="stop-media-button" type="button" disabled>Stop source</button>
             </article>
 
             <article class="card quick-card" data-panel="voice">
               <div class="card-heading compact"><div><span class="card-kicker">VOICE / QUICK STATE</span><h2>Quick controls</h2></div><span class="shortcut-hint">⌘ K</span></div>
-              <div class="state-grid"><button class="state-button" data-state="mute" type="button"><span class="state-icon">♩</span><span>كتم الصوت</span><small>صامت</small></button><button class="state-button" data-state="deaf" type="button"><span class="state-icon">◌</span><span>صمم</span><small>عزل كامل</small></button><button class="state-button" data-state="unmute" type="button"><span class="state-icon">♫</span><span>صوت مفتوح</span><small>متاح</small></button><button class="state-button" data-state="cam" type="button"><span class="state-icon">▣</span><span>حالة فيديو</span><small>كاميرا</small></button></div>
+              <div class="state-grid"><button class="state-button" data-state="mute" type="button"><span class="state-icon">♩</span><span>Mute</span><small>Microphone off</small></button><button class="state-button" data-state="deaf" type="button"><span class="state-icon">◌</span><span>Deafen</span><small>Audio off</small></button><button class="state-button" data-state="unmute" type="button"><span class="state-icon">♫</span><span>Unmute</span><small>Voice on</small></button><button class="state-button" data-state="cam" type="button"><span class="state-icon">▣</span><span>Video</span><small>Camera on</small></button><button class="state-button" data-state="stream" type="button"><span class="state-icon">▤</span><span>Stream</span><small>Screen share</small></button></div>
               <div id="stateFeedback" class="inline-feedback" role="status" aria-live="polite"></div>
             </article>
 

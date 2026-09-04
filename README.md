@@ -72,3 +72,8 @@ Automating Discord user accounts can violate Discord's Terms of Service and may 
 The interface is intentionally organized into six English product sections: `Dashboard`, `Accounts`, `Voice`, `Automation`, `Media`, and `Activity`. Only one section is shown at a time, so connection forms, voice controls, automation settings, media preview, and logs do not compete for attention on the same screen. The breadcrumb updates with the active section.
 
 All write operations use one consistent processing dialog. It shows the operation name, a loading state while the request is running, the selected account avatar and nickname when available, and an individual `Success` or failure message after completion. The dialog remains available until the user closes it, while background refreshes stay silent so they do not interrupt the workflow.
+
+
+## Clear status controls and large account lists
+
+Technical voice states use consistent English labels throughout the interface: `Mute`, `Unmute`, `Deafen`, `Video`, and `Stream`. The Automation state selector is a large visual panel rather than a compact multi-select, with a separate card for each state and a short explanation. The Accounts and live profile lists use bounded scrolling so a large number of connected accounts remains usable without stretching the page indefinitely.
