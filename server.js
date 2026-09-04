@@ -185,6 +185,27 @@ function createBlackMediaSource() {
   sourceProcess.stderr.on('data', (chunk) => logMediaEvent('warn', 'stream.source_warning', { error: String(chunk).trim().slice(0, 300) }));
   return { stream: sourceProcess.stdout, sourceProcess };
 }
+function waitForDiscordStreamEvents(client, guildId, channelId, timeoutMs = 8000) {
+  const expectedKey = `guild:${guildId}:${channelId}:${String(client.user?.id || '')}`;
+  return new Promise((resolve, reject) => {
+    let created = false;
+    let serverUpdated = false;
+    const finish = (error) => {
+      clearTimeout(timer);
+      client.off?.('raw', onRaw);
+      if (error) reject(error); else resolve();
+    };
+    const onRaw = (packet) => {
+      if (!packet || !['STREAM_CREATE', 'STREAM_SERVER_UPDATE'].includes(packet.t)) return;
+      if (String(packet.d?.stream_key || '') !== expectedKey) return;
+      if (packet.t === 'STREAM_CREATE') created = true;
+      if (packet.t === 'STREAM_SERVER_UPDATE' && packet.d?.endpoint && packet.d?.token) serverUpdated = true;
+      if (created && serverUpdated) finish();
+    };
+    const timer = setTimeout(() => finish(new Error(`Discord did not confirm stream signaling (create=${created}, server_update=${serverUpdated})`)), timeoutMs);
+    client.on?.('raw', onRaw);
+  });
+}
 function withTimeout(promise, timeoutMs, message) {
   let timer;
   return Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), timeoutMs); })]).finally(() => clearTimeout(timer));
@@ -199,8 +220,10 @@ async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live')
   if (!connection || connection.channel?.id !== session.channelId) return { ok: false, error: 'The account has no active voice connection' };
   const source = createBlackMediaSource();
   let streamConnection;
+  const signaling = waitForDiscordStreamEvents(client, guildId, session.channelId, 8000);
   try {
     streamConnection = await withTimeout(connection.createStreamConnection(), 8000, 'Discord media connection timed out after 8 seconds');
+    await signaling;
     const dispatcher = streamConnection.playVideo(source.stream, { fps: 15, presetH26x: 'superfast', bitrate: 300, inputFFmpegArgs: ['-re'], outputFFmpegArgs: ['-g', '30'] });
     const active = { connection, streamConnection, dispatcher, sourceProcess: source.sourceProcess, guildId, channelId: session.channelId, mediaKind };
     syntheticStreams.set(name, active);
@@ -210,6 +233,7 @@ async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live')
     if (!confirmed.ok) throw new Error(confirmed.error || 'Discord did not confirm Go Live state');
     return { ok: true };
   } catch (error) {
+    await signaling.catch(() => {});
     syntheticStreams.delete(name);
     try { source.sourceProcess.kill('SIGTERM'); } catch {}
     try { streamConnection?.disconnect?.(); } catch {}
