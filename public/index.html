@@ -83,11 +83,15 @@
 
             <article class="card automation-card">
               <div class="card-heading compact"><div><span class="card-kicker">04 / الأتمتة</span><h2>المهام الدورية</h2></div><span class="soft-badge accent">تعمل بالخلفية</span></div>
-              <div class="automation-step"><span class="step-number">1</span><div><strong>الحسابات المستهدفة</strong><small>اختر حسابًا أو أكثر لهذه المهمة</small></div></div>
-              <select id="automationAccounts" class="multi-select" multiple size="3"><option value="">لا توجد حسابات متصلة</option></select>
-              <div class="automation-step"><span class="step-number">2</span><div><strong>السيرفر والرومات</strong><small>حدد السيرفر ثم الرومات التي تريد التنقل بينها فقط</small></div></div>
+              <div class="automation-step"><span class="step-number">1</span><div><strong>السيرفر</strong><small>القائمة تعرض السيرفرات التي يراها أي حساب متصل</small></div></div>
               <select id="automationGuild" class="automation-guild"><option value="">اختر السيرفر</option></select>
-              <div id="automationChannels" class="automation-channels"><div class="task-empty">اختر سيرفرًا لعرض الرومات</div></div>
+              <div class="automation-step"><span class="step-number">2</span><div><strong>الروم الصوتي</strong><small>اختر رومًا واحدًا للعملية الحالية</small></div></div>
+              <select id="automationChannel" class="automation-guild"><option value="">اختر الروم</option></select>
+              <div class="automation-step"><span class="step-number">3</span><div><strong>الحسابات</strong><small>تظهر هنا الحسابات الموجودة والقابلة للدخول إلى الروم</small></div></div>
+              <div id="automationAccounts" class="automation-channels account-targets"><div class="task-empty">اختر سيرفرًا ورومًا لعرض الحسابات</div></div>
+              <button id="bulkJoinButton" class="action-button action-join automation-join" type="button">دخول الحسابات المحددة إلى الروم</button>
+              <div class="automation-step"><span class="step-number">4</span><div><strong>رومات التنقل</strong><small>للتنقل، حدد رومتين أو أكثر؛ أما الدخول الجماعي فيستخدم الروم المختار بالأعلى</small></div></div>
+              <div id="rotationChannels" class="automation-channels"><div class="task-empty">اختر سيرفرًا لعرض رومات التنقل</div></div>
               <div class="automation-grid">
                 <label class="field"><span>كل كم دقيقة؟</span><input id="automationMinutes" type="number" min="1" max="1440" value="5" /></label>
                 <label class="select-field"><span>الحالات</span><select id="automationStates" multiple><option value="unmute" selected>صوت مفتوح</option><option value="mute" selected>كتم الصوت</option><option value="deaf">عزل كامل</option><option value="cam">فيديو</option><option value="stream">مشاركة الشاشة</option></select></label>

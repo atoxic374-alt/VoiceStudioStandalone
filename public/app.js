@@ -76,32 +76,40 @@ async function loadClients(preferred = '') {
   await loadAutomationCatalog();
 }
 async function loadAutomationCatalog() {
-  const accountSelect = $('#automationAccounts');
   const guildSelect = $('#automationGuild');
-  if (!accountSelect || !guildSelect) return;
+  if (!guildSelect) return;
   try {
     const data = await api('/api/voice/guilds');
     state.allGroups = data.guilds || [];
-    const selectedBefore = new Set([...accountSelect.selectedOptions].map((option) => option.value));
-    accountSelect.innerHTML = state.clients.length ? state.clients.map((client) => `<option value="${escapeHTML(client.name)}">${escapeHTML(client.nickname || client.displayName || client.name)}</option>`).join('') : '<option value="">لا توجد حسابات متصلة</option>';
-    [...accountSelect.options].forEach((option) => { option.selected = state.clients.length ? (!selectedBefore.size || selectedBefore.has(option.value)) : false; });
     const guilds = [...new Map(state.allGroups.map((group) => [group.guildId, group])).values()];
     guildSelect.innerHTML = guilds.length ? `<option value="">اختر السيرفر</option>${guilds.map((group) => `<option value="${escapeHTML(group.guildId)}">${escapeHTML(group.guildName)}</option>`).join('')}` : '<option value="">لا توجد سيرفرات متاحة</option>';
     renderAutomationChannels();
   } catch (error) { console.warn('[voice] automation catalog failed', error); }
 }
-function selectedAutomationAccounts() { return [...$('#automationAccounts').selectedOptions].map((option) => option.value).filter(Boolean); }
+function selectedAutomationAccounts() { return [...document.querySelectorAll('#automationAccounts input[type="checkbox"]:checked')].map((input) => input.value); }
+function selectedRotationChannels() { return [...document.querySelectorAll('#rotationChannels input[type="checkbox"]:checked')].map((input) => input.value); }
+function selectedAutomationChannel() { return $('#automationChannel')?.value || ''; }
 function renderAutomationChannels() {
-  const wrapper = $('#automationChannels');
   const guildId = $('#automationGuild')?.value;
-  const accounts = selectedAutomationAccounts();
-  const groups = state.allGroups.filter((group) => group.guildId === guildId && (!accounts.length || accounts.includes(group.account)));
+  const channelSelect = $('#automationChannel');
+  const rotationWrapper = $('#rotationChannels');
+  const groups = state.allGroups.filter((group) => group.guildId === guildId);
   const channels = [...new Map(groups.flatMap((group) => group.voiceChannels || []).map((channel) => [channel.id, channel])).values()];
-  if (!guildId) { wrapper.innerHTML = '<div class="task-empty">اختر سيرفرًا لعرض الرومات</div>'; return; }
-  if (!channels.length) { wrapper.innerHTML = '<div class="task-empty">لا توجد رومات متاحة للحسابات المحددة</div>'; return; }
-  wrapper.innerHTML = channels.map((channel) => `<label class="channel-check"><input type="checkbox" value="${escapeHTML(channel.id)}" /><span><strong>${escapeHTML(channel.name)}</strong><small>${channel.members || 0} متصل · ${channel.bitrate || 64} kbps</small></span></label>`).join('');
+  if (!guildId) { channelSelect.innerHTML = '<option value="">اختر السيرفر أولًا</option>'; rotationWrapper.innerHTML = '<div class="task-empty">اختر سيرفرًا لعرض رومات التنقل</div>'; renderTargetAccounts(); return; }
+  channelSelect.innerHTML = channels.length ? `<option value="">اختر الروم</option>${channels.map((channel) => `<option value="${escapeHTML(channel.id)}">${escapeHTML(channel.name)} · ${channel.members || 0} متصل</option>`).join('')}` : '<option value="">لا توجد رومات متاحة</option>';
+  rotationWrapper.innerHTML = channels.length ? channels.map((channel) => `<label class="channel-check"><input type="checkbox" value="${escapeHTML(channel.id)}" /><span><strong>${escapeHTML(channel.name)}</strong><small>${channel.members || 0} متصل · ${channel.bitrate || 64} kbps</small></span></label>`).join('') : '<div class="task-empty">لا توجد رومات متاحة</div>';
+  renderTargetAccounts();
 }
-function selectedAutomationChannels() { return [...document.querySelectorAll('#automationChannels input[type="checkbox"]:checked')].map((input) => input.value); }
+async function renderTargetAccounts() {
+  const wrapper = $('#automationAccounts');
+  const guildId = $('#automationGuild')?.value;
+  const channelId = selectedAutomationChannel();
+  if (!guildId || !channelId) { wrapper.innerHTML = '<div class="task-empty">اختر سيرفرًا ورومًا لعرض الحسابات</div>'; return; }
+  try {
+    const data = await api(`/api/voice/target-accounts?guildId=${encodeURIComponent(guildId)}&channelId=${encodeURIComponent(channelId)}`);
+    wrapper.innerHTML = data.accounts.length ? data.accounts.map((account) => `<label class="account-target ${account.available ? '' : 'is-disabled'}"><input type="checkbox" value="${escapeHTML(account.name)}" ${account.available ? '' : 'disabled'} /><span class="target-avatar">${account.avatar ? `<img src="${escapeHTML(account.avatar)}" alt="" />` : escapeHTML((account.nickname || '?')[0])}</span><span class="target-copy"><strong>${escapeHTML(account.nickname)}</strong><small>ID: ${escapeHTML(account.id || '—')} · ${account.available ? (account.current ? `حاليًا في ${escapeHTML(account.current.channelName)} · ${account.current.selfMute ? 'مكتوم' : 'صوت مفتوح'}${account.current.selfDeaf ? ' · معزول' : ''}${account.current.selfVideo ? ' · فيديو' : ''}${account.current.selfStream ? ' · مشاركة' : ''}` : 'جاهز للدخول') : escapeHTML(account.reason)}</small></span><span class="target-status">${account.available ? 'متاح' : 'مستبعد'}</span></label>`).join('') : '<div class="task-empty">لا توجد حسابات متصلة</div>';
+  } catch (error) { wrapper.innerHTML = `<div class="task-empty">تعذر تحميل الحسابات: ${escapeHTML(error.message)}</div>`; }
+}
 async function loadGuilds() {
   state.groups = [];
   state.selectedTarget = null;
@@ -322,11 +330,25 @@ function renderTasks(tasks) {
   list.innerHTML = tasks.map((task) => `<div class="task-row"><div><strong>${escapeHTML(task.title)}</strong><small>${task.accounts?.length || 0} حساب · كل ${Math.round((task.intervalMs || 0) / 60000)} دقيقة</small></div><button type="button" class="task-stop" data-task-type="${task.type}" data-task-id="${escapeHTML(task.id)}">إيقاف</button></div>`).join('');
   list.querySelectorAll('.task-stop').forEach((button) => button.addEventListener('click', () => stopTask(button.dataset.taskType, button.dataset.taskId)));
 }
+async function bulkJoinSelected() {
+  const accounts = selectedAutomationAccounts();
+  const guildId = $('#automationGuild').value;
+  const channelId = selectedAutomationChannel();
+  if (!accounts.length) { toast('حدد حسابًا واحدًا على الأقل', 'error'); return; }
+  if (!guildId || !channelId) { toast('اختر السيرفر والروم أولًا', 'error'); return; }
+  try {
+    const result = await post('/api/voice/join', { accounts, guildId, channelId });
+    const failed = result.results.filter((item) => !item.ok);
+    toast(`${result.summary.ok} نجح · ${result.summary.failed} فشل`, failed.length ? 'error' : 'success');
+    addActivity('دخول جماعي', `${result.summary.ok} حساب إلى الروم`, failed.length ? 'error' : 'success');
+    await refreshSessions(); await renderTargetAccounts();
+  } catch (error) { toast(error.message, 'error'); }
+}
 async function startRotation() {
   if (!state.clients.length) { toast('اتصل بحساب واحد على الأقل أولًا', 'error'); return; }
   const accounts = selectedAutomationAccounts();
   const guildId = $('#automationGuild').value;
-  const channelIds = selectedAutomationChannels();
+  const channelIds = selectedRotationChannels();
   if (accounts.length < 1) { toast('اختر حسابًا واحدًا على الأقل للمهمة', 'error'); return; }
   if (!guildId) { toast('اختر السيرفر الذي ستعمل عليه المهمة', 'error'); return; }
   if (channelIds.length < 2) { toast('حدد رومتين على الأقل للتنقل بينهما', 'error'); return; }
@@ -336,7 +358,7 @@ async function startRotation() {
   catch (error) { toast(error.message, 'error'); }
 }
 async function startCycle() {
-  if (!requireAccount()) return;
+  if (!state.clients.length) { toast('اتصل بحساب واحد على الأقل أولًا', 'error'); return; }
   const accounts = selectedAutomationAccounts();
   const guildId = $('#automationGuild').value;
   if (!accounts.length) { toast('اختر الحسابات المستهدفة للمهمة', 'error'); return; }
@@ -425,7 +447,7 @@ function initLanguage() {
 function initNavigation() { document.querySelectorAll('[data-scroll]').forEach((button) => button.addEventListener('click', () => document.getElementById(button.dataset.scroll)?.scrollIntoView({ behavior: 'smooth', block: 'center' }))); }
 function init() {
   initTheme(); initLanguage(); initNavigation();
-  $('#connectButton').addEventListener('click', connect); $('#bulkConnectButton').addEventListener('click', bulkConnect); $('#disconnectButton').addEventListener('click', disconnect); $('#refreshButton').addEventListener('click', refreshChannels); $('#accountSelect').addEventListener('change', async (event) => { state.selectedAccount = event.target.value; await loadGuilds(); await loadAutomationCatalog(); }); $('#automationAccounts').addEventListener('change', renderAutomationChannels); $('#automationGuild').addEventListener('change', renderAutomationChannels); $('#channelSelect').addEventListener('change', handleChannelChange); $('#joinButton').addEventListener('click', join); $('#joinAllButton').addEventListener('click', joinAll); $('#leaveButton').addEventListener('click', leave); $('#cameraButton').addEventListener('click', toggleCamera); $('#screenButton').addEventListener('click', toggleScreen); $('#startRotationButton').addEventListener('click', startRotation); $('#startCycleButton').addEventListener('click', startCycle); $('#stopMediaButton').addEventListener('click', () => stopCurrentStream()); document.querySelectorAll('.state-button').forEach((button) => button.addEventListener('click', () => applyState(button.dataset.state)));
+  $('#connectButton').addEventListener('click', connect); $('#bulkConnectButton').addEventListener('click', bulkConnect); $('#disconnectButton').addEventListener('click', disconnect); $('#refreshButton').addEventListener('click', refreshChannels); $('#accountSelect').addEventListener('change', async (event) => { state.selectedAccount = event.target.value; await loadGuilds(); await loadAutomationCatalog(); }); $('#automationGuild').addEventListener('change', renderAutomationChannels); $('#automationChannel').addEventListener('change', renderTargetAccounts); $('#bulkJoinButton').addEventListener('click', bulkJoinSelected); $('#channelSelect').addEventListener('change', handleChannelChange); $('#joinButton').addEventListener('click', join); $('#joinAllButton').addEventListener('click', joinAll); $('#leaveButton').addEventListener('click', leave); $('#cameraButton').addEventListener('click', toggleCamera); $('#screenButton').addEventListener('click', toggleScreen); $('#startRotationButton').addEventListener('click', startRotation); $('#startCycleButton').addEventListener('click', startCycle); $('#stopMediaButton').addEventListener('click', () => stopCurrentStream()); document.querySelectorAll('.state-button').forEach((button) => button.addEventListener('click', () => applyState(button.dataset.state)));
   window.addEventListener('beforeunload', () => stopCurrentStream({ updateDiscord: false }));
   loadClients().catch(() => {}); refreshSessions(); setInterval(refreshSessions, 8000);
 }

@@ -285,6 +285,25 @@ app.get('/api/voice/guilds', (req, res) => {
   return ok(res, { guilds });
 });
 app.get('/api/voice/sessions', (_req, res) => ok(res, { sessions: [...voiceSessions.values()] }));
+app.get('/api/voice/target-accounts', (req, res) => {
+  const guildId = String(req.query?.guildId || '').trim();
+  const channelId = String(req.query?.channelId || '').trim();
+  if (!guildId || !channelId) return fail(res, new Error('guildId and channelId are required'), 400);
+  const accounts = [...clients.entries()].map(([name, entry]) => {
+    const user = entry.client.user;
+    const guild = entry.client.guilds?.cache?.get?.(guildId);
+    const channel = guild?.channels?.cache?.get?.(channelId);
+    const member = guild?.members?.cache?.get?.(user?.id);
+    const session = voiceSessions.get(sessionKey(name, guildId));
+    let reason = null;
+    let available = true;
+    if (!guild) { available = false; reason = 'الحساب ليس عضوًا في هذا السيرفر'; }
+    else if (!channel || !isVoiceChannel(channel)) { available = false; reason = 'الروم غير موجود لهذا الحساب'; }
+    else if (!canJoin(channel, guild.members?.me || user?.id)) { available = false; reason = 'لا يملك صلاحية دخول الروم أو الروم ممتلئ'; }
+    return { name, username: user?.tag || user?.username || name, nickname: member?.displayName || user?.globalName || user?.username || name, id: user?.id || null, avatar: user?.displayAvatarURL?.({ size: 64 }) || null, available, reason, current: session ? { channelId: session.channelId, channelName: guild?.channels?.cache?.get?.(session.channelId)?.name || session.channelId, selfMute: !!session.selfMute, selfDeaf: !!session.selfDeaf, selfVideo: !!session.selfVideo, selfStream: !!session.selfStream } : null };
+  });
+  return ok(res, { guildId, channelId, accounts });
+});
 app.get('/api/voice/rotations', (_req, res) => ok(res, { rotations: [...rotations.values()].map(({ timer, ...item }) => item) }));
 app.get('/api/voice/state-cycles', (_req, res) => ok(res, { cycles: [...stateCycles.values()].map(({ timer, ...item }) => item) }));
 
