@@ -250,7 +250,9 @@ async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live')
     syntheticStreams.set(name, active);
     dispatcher.on?.('error', (error) => logMediaEvent('error', 'stream.runtime_failed', { account: name, guildId, channelId: session.channelId, error: error?.message || String(error) }));
     dispatcher.once?.('finish', () => { if (syntheticStreams.get(name) === active) stopSyntheticStream(name); });
-    const confirmed = await sendVoiceOpConfirmed(client, guildId, session.channelId, mediaKind === 'camera' ? { selfDeaf: false, selfVideo: true, selfStream: false } : { selfDeaf: false, selfStream: true }, 3000);
+    const confirmed = await sendVoiceOpConfirmed(client, guildId, session.channelId, mediaKind === 'camera'
+      ? { selfMute: !!session.selfMute, selfDeaf: false, selfVideo: true, selfStream: false }
+      : { selfMute: !!session.selfMute, selfDeaf: false, selfVideo: false, selfStream: true }, 3000);
     if (!confirmed.ok) throw new Error(confirmed.error || 'Discord did not confirm Go Live state');
     return { ok: true };
   } catch (error) {
@@ -266,59 +268,9 @@ async function startSyntheticStream(name, guildId, mediaKind = 'go-live') {
   const session = { ...(voiceSessions.get(sessionKey(name, guildId)) || {}), ...(readGatewayVoiceState(client, guildId) || {}) };
   if (!client || !session?.channelId) return { ok: false, error: 'Account is not in a voice channel' };
   if (syntheticStreams.has(name)) return { ok: true, alreadyActive: true };
-  const channel = client.guilds?.cache?.get?.(guildId)?.channels?.cache?.get?.(session.channelId);
-  if (!channel) return { ok: false, error: 'Voice channel is not available for streaming' };
-  const startedAt = Date.now();
-  let lastError;
-  for (let attempt = 1; attempt <= 2; attempt += 1) {
-    let streamer;
-    let controller;
-    let source;
-    try {
-      const { Streamer, playStream } = await loadVideoStreamModule();
-      streamer = new Streamer(client);
-      streamer.signalVideo = (enabled) => streamer.sendOpcode(4, {
-        guild_id: guildId,
-        channel_id: session.channelId,
-        self_mute: !!session.selfMute,
-        self_deaf: false,
-        self_video: !!enabled,
-      });
-      logMediaEvent('info', 'media.join.start', { account: name, guildId, channelId: session.channelId, mediaKind, attempt });
-      await withTimeout(streamer.joinVoice(guildId, session.channelId), 10000, 'Dedicated media voice connection timed out after 10 seconds');
-      controller = new AbortController();
-      source = createBlackMediaSource();
-      const active = { streamer, controller, sourceProcess: source.sourceProcess, guildId, channelId: session.channelId, mediaKind, startedAt };
-      syntheticStreams.set(name, active);
-      const task = playStream(source.stream, streamer, { type: mediaKind, format: 'nut', width: 640, height: 360, frameRate: 15 }, controller.signal);
-      active.task = task;
-      task.then(() => { active.completedAt = Date.now(); if (syntheticStreams.get(name)?.task === task) stopSyntheticStream(name); })
-        .catch((error) => logMediaEvent('error', 'media.runtime_failed', { account: name, mediaKind, error: error?.message || String(error) }));
-      await withTimeout(new Promise((resolve) => {
-        const check = () => {
-          const voiceReady = streamer.voiceConnection?.webRtcConn?.ready === true;
-          const mediaReady = mediaKind === 'camera' || streamer.voiceConnection?.streamConnection?.webRtcConn?.ready === true;
-          if (voiceReady && mediaReady) return resolve();
-          setTimeout(check, 150);
-        };
-        check();
-      }), 6000, `${mediaKind === 'camera' ? 'Camera' : 'Screen share'} WebRTC media transport was not ready`);
-      if (active.completedAt || syntheticStreams.get(name) !== active) throw new Error('Media transport stopped before activation');
-      logMediaEvent('info', 'media.ready', { account: name, guildId, channelId: session.channelId, mediaKind, durationMs: Date.now() - startedAt, attempt });
-      return { ok: true };
-    } catch (error) {
-      lastError = error;
-      try { controller?.abort?.(); } catch {}
-      try { source?.sourceProcess?.kill?.('SIGTERM'); } catch {}
-      try { streamer?.stopStream?.(); } catch {}
-      try { streamer?.leaveVoice?.(); } catch {}
-      if (syntheticStreams.get(name)?.streamer === streamer) syntheticStreams.delete(name);
-      logMediaEvent('error', 'media.attempt_failed', { account: name, guildId, channelId: session.channelId, mediaKind, attempt, error: error?.message || String(error) });
-      if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 250));
-    }
-  }
-  stopSyntheticStream(name);
-  return { ok: false, error: lastError?.message || `Unable to start ${mediaKind}` };
+  // Reuse the active voice connection. A second joinVoice() causes Discord to
+  // leave/rejoin the room and races the rotation/state-cycle timers.
+  return startBuiltInGoLive(name, guildId, session, mediaKind);
 }
 async function withAccountLock(name, operation) {
   const key = String(name);
@@ -546,7 +498,10 @@ async function moveAccount(name, guildId, channelId, opts = {}) {
     if (!client) return { name, ok: false, error: 'Account is not connected' };
     const target = validateTarget(client, guildId, channelId);
     if (!target.ok) return { name, ok: false, error: target.error };
-    const current = readGatewayVoiceState(client, guildId) || voiceSessions.get(sessionKey(name, guildId));
+    const saved = voiceSessions.get(sessionKey(name, guildId));
+    const observed = readGatewayVoiceState(client, guildId);
+    const current = { ...(saved || {}), ...(observed || {}) };
+    for (const key of ['selfMute', 'selfDeaf', 'selfVideo', 'selfStream']) if (typeof observed?.[key] !== 'boolean' && typeof saved?.[key] === 'boolean') current[key] = saved[key];
     if (current?.channelId === channelId) return { name, ok: true, alreadyIn: true, channelId };
     const desired = normalizeVoiceState({ ...(current || {}), ...opts });
     if (syntheticStreams.has(name)) stopSyntheticStream(name);
