@@ -604,19 +604,22 @@ async function toggleCamera() {
 }
 async function toggleScreen() {
   if (state.mediaBusy) return;
-  if (!state.selectedTarget || !state.selectedAccount) { toast('ادخل الحساب إلى غرفة صوتية أولًا', 'error'); return; }
+  if (!state.selectedAccount) { toast('ادخل الحساب إلى غرفة صوتية أولًا', 'error'); return; }
   const current = state.clients.find((client) => client.name === state.selectedAccount)?.voice;
+  const target = state.selectedTarget || (current?.guildId && current?.channelId ? { guildId: current.guildId, channelId: current.channelId, channelName: current.channelName || current.channelId } : null);
+  if (!target) { toast('ادخل الحساب إلى غرفة صوتية أولًا', 'error'); return; }
+  state.selectedTarget = target;
   const enabled = !current?.selfStream;
   state.mediaBusy = true;
   try {
-    const result = await api('/api/voice/state', { method: 'POST', body: JSON.stringify({ accounts: selectedAccounts(), guildId: state.selectedTarget.guildId, selfVideo: false, selfStream: enabled }) });
+    const result = await post('/api/voice/state', { accounts: selectedAccounts(), guildId: target.guildId, selfVideo: false, selfStream: enabled });
     if (!result.summary?.ok) throw new Error(result.results?.find((item) => !item.ok)?.error || 'تعذر تشغيل البث الاصطناعي');
     const button = document.querySelector('.state-button[data-state="stream"]');
     button?.classList.toggle('is-active', enabled);
     button?.querySelector('small') && (button.querySelector('small').textContent = enabled ? 'Synthetic stream on' : 'Screen share off');
     if (!enabled && state.mediaKind === 'screen') stopCurrentStream({ updateDiscord: false });
     await refreshSessions();
-    addActivity(enabled ? 'بدأ بث اصطناعي' : 'أوقف البث الاصطناعي', `${state.clients.find((client) => client.name === state.selectedAccount)?.nickname || state.selectedAccount} · ${state.selectedTarget.channelName}`, 'success', state.selectedAccount);
+    addActivity(enabled ? 'بدأ بث اصطناعي' : 'أوقف البث الاصطناعي', `${state.clients.find((client) => client.name === state.selectedAccount)?.nickname || state.selectedAccount} · ${target.channelName}`, 'success', state.selectedAccount);
     toast(enabled ? 'تم تشغيل البث الاصطناعي' : 'تم إيقاف البث الاصطناعي', 'success');
   } catch (error) { toast(error.message, 'error'); } finally { state.mediaBusy = false; updateQuickStateButtons(); }
 }
