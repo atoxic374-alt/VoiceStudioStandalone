@@ -172,7 +172,8 @@ async function startSyntheticStream(name, guildId) {
   const channel = guild?.channels?.cache?.get?.(session.channelId);
   if (!channel) return { ok: false, error: 'Voice channel is not available for streaming' };
   try {
-    const connection = await client.voice.joinChannel(channel, { selfMute: !!session.selfMute, selfDeaf: false, selfVideo: true, videoCodec: 'H264' });
+    const existing = client.voice.connection;
+    const connection = existing?.channel?.id === session.channelId ? existing : await client.voice.joinChannel(channel, { selfMute: !!session.selfMute, selfDeaf: false, selfVideo: true, videoCodec: 'H264' });
     const streamConnection = await connection.createStreamConnection();
     const dispatcher = streamConnection.playVideo(ensureSyntheticVideo(), { fps: 15, preset: 'ultrafast', bitrate: 500 });
     syntheticStreams.set(name, { connection, streamConnection, dispatcher, guildId, channelId: session.channelId });
