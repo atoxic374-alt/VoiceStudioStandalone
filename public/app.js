@@ -14,7 +14,7 @@ const state = {
   rotationRoomSelection: new Set(),
   busy: new Set(),
   overviewFilter: '', overviewSort: 'account',
-  lastOperation: null, authenticated: false,
+  lastOperation: null, authenticated: false, mediaBusy: false,
   refreshPromise: null, liveEvents: null, liveRefreshTimer: null,
 };
 
@@ -397,10 +397,12 @@ async function joinAll() {
   finally { setBusy('joinAll', false); }
 }
 async function leave() {
-  if (!requireAccount() || !state.selectedTarget || state.busy.has('leave')) { if (requireAccount() && !state.selectedTarget) toast('اختر قناة مرتبطة بالجلسة قبل الخروج', 'error'); return; }
+  const voice = state.clients.find((client) => client.name === state.selectedAccount)?.voice;
+  const guildId = state.selectedTarget?.guildId || voice?.guildId;
+  if (!requireAccount() || !guildId || state.busy.has('leave')) { if (requireAccount() && !guildId) toast('اختر حسابًا داخل روم صوتي قبل الخروج', 'error'); return; }
   setBusy('leave', true);
   try {
-    const result = await post('/api/voice/leave', { accounts: selectedAccounts(), guildId: state.selectedTarget.guildId });
+    const result = await post('/api/voice/leave', { accounts: selectedAccounts(), guildId });
     if (!result.summary?.ok) throw new Error(result.results?.find((item) => !item.ok)?.error || 'تعذر الخروج');
     toast('تم الخروج من الغرفة', 'success'); addActivity('خرج من الغرفة', `${state.clients.find((client) => client.name === state.selectedAccount)?.nickname || state.selectedAccount} · ${state.selectedTarget.channelName}`, 'success', state.selectedAccount); await refreshSessions();
   } catch (error) { toast(error.message, 'error'); }
@@ -573,13 +575,15 @@ function bindMediaEnded(stream) { stream.getVideoTracks().forEach((track) => tra
 function showMediaStream(stream, kind) {
   stopCurrentStream({ updateDiscord: false });
   state.mediaStream = stream; state.mediaKind = kind; state.mediaStartedAt = Date.now();
-  const video = $('#cameraPreview'); video.srcObject = stream; video.style.transform = kind === 'camera' ? 'scaleX(-1)' : 'none'; video.classList.add('is-visible'); $('#stagePlaceholder').style.display = 'none'; $('#stageOverlay').classList.add('is-visible'); $('#stageSource').textContent = kind === 'camera' ? 'Camera' : 'Screen share'; $('#stopMediaButton').disabled = false;
-  $('#cameraButton').classList.toggle('is-active', kind === 'camera'); $('#screenButton').classList.toggle('is-active', kind === 'screen'); $('#cameraState').textContent = kind === 'camera' ? 'Live' : 'Off'; $('#screenState').textContent = kind === 'screen' ? 'Live' : 'Off'; $('#mediaStatus').classList.add('is-live'); $('#mediaStatus').innerHTML = '<span></span> Live';
-  state.mediaTimer = setInterval(() => { $('#stageTimer').textContent = formatDuration(Math.floor((Date.now() - state.mediaStartedAt) / 1000)); }, 1000);
-  bindMediaEnded(stream); video.play().catch(() => {});
+  const video = $('#cameraPreview'); if (video) { video.srcObject = stream; video.style.transform = kind === 'camera' ? 'scaleX(-1)' : 'none'; video.classList.add('is-visible'); video.play().catch(() => {}); }
+  if ($('#stagePlaceholder')) $('#stagePlaceholder').style.display = 'none'; $('#stageOverlay')?.classList.add('is-visible'); if ($('#stageSource')) $('#stageSource').textContent = kind === 'camera' ? 'Camera' : 'Screen share'; if ($('#stopMediaButton')) $('#stopMediaButton').disabled = false;
+  $('#cameraButton')?.classList.toggle('is-active', kind === 'camera'); $('#screenButton')?.classList.toggle('is-active', kind === 'screen'); if ($('#cameraState')) $('#cameraState').textContent = kind === 'camera' ? 'Live' : 'Off'; if ($('#screenState')) $('#screenState').textContent = kind === 'screen' ? 'Live' : 'Off'; $('#mediaStatus')?.classList.add('is-live'); if ($('#mediaStatus')) $('#mediaStatus').innerHTML = '<span></span> Live';
+  state.mediaTimer = setInterval(() => { if ($('#stageTimer')) $('#stageTimer').textContent = formatDuration(Math.floor((Date.now() - state.mediaStartedAt) / 1000)); }, 1000);
+  bindMediaEnded(stream);
   addActivity(kind === 'camera' ? 'الكاميرا تعمل' : 'مشاركة الشاشة تعمل', 'المعاينة المحلية جاهزة', 'success'); toast(kind === 'camera' ? 'تم تشغيل الكاميرا' : 'تم تشغيل مشاركة الشاشة', 'success');
 }
 async function toggleCamera() {
+  if (state.mediaBusy) return;
   const current = state.clients.find((client) => client.name === state.selectedAccount)?.voice;
   if (current?.selfVideo) {
     stopCurrentStream({ updateDiscord: false });
@@ -588,6 +592,7 @@ async function toggleCamera() {
     return;
   }
   if (state.mediaKind === 'camera') { stopCurrentStream(); return; }
+  state.mediaBusy = true;
   try {
     const canvas = document.createElement('canvas'); canvas.width = 1280; canvas.height = 720;
     const ctx = canvas.getContext('2d'); ctx.fillStyle = '#080b18'; ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -595,12 +600,14 @@ async function toggleCamera() {
     showMediaStream(stream, 'camera');
     $('#mediaNotice').textContent = 'Safe camera preview: a blank frame is used; no camera permission is requested.';
     await syncMediaVoiceState({ selfVideo: true, selfStream: false }, 'Camera');
-  } catch (error) { toast(`تعذر تشغيل المعاينة: ${error.message}`, 'error'); addActivity('فشل تشغيل الكاميرا', error.message, 'error'); }
+  } catch (error) { toast(`تعذر تشغيل المعاينة: ${error.message}`, 'error'); addActivity('فشل تشغيل الكاميرا', error.message, 'error'); } finally { state.mediaBusy = false; updateQuickStateButtons(); }
 }
 async function toggleScreen() {
+  if (state.mediaBusy) return;
   if (!state.selectedTarget || !state.selectedAccount) { toast('ادخل الحساب إلى غرفة صوتية أولًا', 'error'); return; }
   const current = state.clients.find((client) => client.name === state.selectedAccount)?.voice;
   const enabled = !current?.selfStream;
+  state.mediaBusy = true;
   try {
     const result = await api('/api/voice/state', { method: 'POST', body: JSON.stringify({ accounts: selectedAccounts(), guildId: state.selectedTarget.guildId, selfVideo: false, selfStream: enabled }) });
     if (!result.summary?.ok) throw new Error(result.results?.find((item) => !item.ok)?.error || 'تعذر تشغيل البث الاصطناعي');
@@ -611,7 +618,7 @@ async function toggleScreen() {
     await refreshSessions();
     addActivity(enabled ? 'بدأ بث اصطناعي' : 'أوقف البث الاصطناعي', `${state.clients.find((client) => client.name === state.selectedAccount)?.nickname || state.selectedAccount} · ${state.selectedTarget.channelName}`, 'success', state.selectedAccount);
     toast(enabled ? 'تم تشغيل البث الاصطناعي' : 'تم إيقاف البث الاصطناعي', 'success');
-  } catch (error) { toast(error.message, 'error'); }
+  } catch (error) { toast(error.message, 'error'); } finally { state.mediaBusy = false; updateQuickStateButtons(); }
 }
 
 function renderFullActivity(page = 0) { const filter = $('#activityAccountFilter')?.value || ''; const items = JSON.parse(localStorage.getItem('voice-activity') || '[]').filter((item) => !filter || item.account === filter); const size = 20; const pages = Math.max(1, Math.ceil(items.length / size)); state.activityPage = Math.max(0, Math.min(page, pages - 1)); const visible = items.slice(state.activityPage * size, (state.activityPage + 1) * size); $('#fullActivityList').innerHTML = visible.length ? visible.map((item) => `<div class="activity-row"><span class="activity-dot ${escapeHTML(item.tone || '')}"></span><div><strong>${escapeHTML(item.title)}</strong><small>${escapeHTML(item.detail)}</small></div><time>${escapeHTML(new Date(item.time).toLocaleString())}</time></div>`).join('') : '<div class="task-empty">No activity yet</div>'; $('#activityPageLabel').textContent = `${state.activityPage + 1} / ${pages}`; $('#activityPrevButton').disabled = state.activityPage === 0; $('#activityNextButton').disabled = state.activityPage >= pages - 1; }
