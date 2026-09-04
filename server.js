@@ -209,6 +209,8 @@ async function startSyntheticStream(name, guildId) {
         return { ok: true };
       } catch (error) {
         lastError = error;
+        try { connection?.streamConnection?.disconnect?.(); } catch {}
+        try { sendVoiceOp(client, guildId, session.channelId, { selfMute: !!session.selfMute, selfDeaf: !!session.selfDeaf, selfVideo: false, selfStream: false }); } catch {}
         logMediaEvent('error', 'stream.attempt_failed', { account: name, guildId, channelId: session.channelId, attempt, durationMs: Date.now() - startedAt, error: error?.message || String(error) });
         if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 250));
       }
@@ -303,14 +305,14 @@ function sendVoiceOpConfirmed(client, guildId, channelId, opts = {}, timeoutMs =
     };
     const onWsState = (packet) => {
       const data = packet?.d || packet;
-      if (stateMatches(data)) finish({ ok: true });
+      if (stateMatches(data)) finish({ ok: true, confirmed: true });
     };
     const onJsState = (_oldState, newState) => {
       const id = newState?.member?.id || newState?.id || newState?.userId;
       if (String(id) !== String(userId)) return;
       const guild = newState?.guild?.id || newState?.guildId;
       const channel = newState?.channelId ?? newState?.channel_id;
-      if (matches(guild, channel)) finish({ ok: true });
+      if (matches(guild, channel)) finish({ ok: true, confirmed: true });
     };
 
     try { client.ws?.on?.('VOICE_STATE_UPDATE', onWsState); } catch {}
