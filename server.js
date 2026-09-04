@@ -3,6 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const { execFileSync } = require('child_process');
+const FFMPEG_PATH = require('ffmpeg-static');
 const { EventEmitter } = require('events');
 const { Client } = require('discord.js-selfbot-v13');
 const helmet = require('helmet');
@@ -150,7 +151,7 @@ for (const session of readPersistedSessions()) {
 function ensureSyntheticVideo() {
   if (fs.existsSync(SYNTHETIC_VIDEO_FILE)) return SYNTHETIC_VIDEO_FILE;
   try {
-    execFileSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi', '-i', 'color=c=black:s=640x360:r=15', '-t', '60', '-an', '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', SYNTHETIC_VIDEO_FILE], { stdio: 'ignore' });
+    execFileSync(FFMPEG_PATH || 'ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi', '-i', 'color=c=black:s=640x360:r=15', '-t', '60', '-an', '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', SYNTHETIC_VIDEO_FILE], { stdio: 'ignore' });
     return SYNTHETIC_VIDEO_FILE;
   } catch (error) {
     throw new Error(`Unable to create synthetic stream source: ${error.message}`);
@@ -679,7 +680,7 @@ app.post('/api/voice/state', async (req, res) => {
     if (next.selfStream) result = await startSyntheticStream(name, guildId);
     else {
       if (current.selfStream) stopSyntheticStream(name);
-      result = await sendVoiceOpConfirmed(client, guildId, current.channelId, next, 5000);
+      result = await sendVoiceOpConfirmed(client, guildId, current.channelId, next, 9000);
     }
     if (result.ok) { const actual = readGatewayVoiceState(client, guildId); Object.assign(current, actual || {}, next, { selfStream: !!next.selfStream, selfVideo: !!next.selfVideo, updatedAt: Date.now() }); persistSessions(); }
     return { name, ok: result.ok, error: result.ok ? null : result.error };

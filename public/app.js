@@ -4,6 +4,7 @@ const state = {
   groups: [],
   allGroups: [],
   selectedAccount: '',
+  selectedGuildId: '',
   selectedTarget: null,
   mediaStream: null,
   mediaKind: null,
@@ -238,14 +239,18 @@ async function renderTargetAccounts() {
 }
 async function loadGuilds() {
   state.groups = [];
+  state.selectedGuildId = '';
   state.selectedTarget = null;
+  $('#serverSelect') && ($('#serverSelect').innerHTML = '<option value="">اختر السيرفر</option>');
   renderChannels();
   if (!state.selectedAccount) return;
   try {
     const data = await api(`/api/voice/guilds?account=${encodeURIComponent(state.selectedAccount)}`);
     state.groups = data.guilds || [];
-    renderChannels();
     const voice = state.clients.find((client) => client.name === state.selectedAccount)?.voice;
+    state.selectedGuildId = voice?.guildId && state.groups.some((group) => group.guildId === voice.guildId) ? voice.guildId : (state.groups[0]?.guildId || '');
+    renderServers();
+    renderChannels();
     if (voice) {
       const value = `${voice.guildId}::${voice.channelId}`;
       if ([...$('#channelSelect').options].some((option) => option.value === value)) {
@@ -257,14 +262,22 @@ async function loadGuilds() {
     feedback('#connectFeedback', error.message, 'error');
   }
 }
+function renderServers() {
+  const select = $('#serverSelect'); if (!select) return;
+  select.innerHTML = `<option value="">اختر السيرفر</option>${state.groups.map((group) => `<option value="${escapeHTML(group.guildId)}">${escapeHTML(group.guildName)}</option>`).join('')}`;
+  select.value = state.selectedGuildId;
+}
 function renderChannels() {
   const select = $('#channelSelect');
-  if (!state.groups.length) {
+  const group = state.groups.find((item) => item.guildId === state.selectedGuildId);
+  const query = ($('#roomSearch')?.value || '').trim().toLowerCase();
+  if (!group) {
     select.innerHTML = '<option value="">لا توجد قنوات صوتية متاحة</option>';
     updateChannelSummary();
     return;
   }
-  select.innerHTML = `<option value="">اختر قناة صوتية</option>${state.groups.map((group) => `<optgroup label="${escapeHTML(group.guildName)}">${group.voiceChannels.map((channel) => `<option value="${escapeHTML(group.guildId)}::${escapeHTML(channel.id)}">${escapeHTML(channel.name)}${channel.members ? ` · ${channel.members} متصل` : ''}</option>`).join('')}</optgroup>`).join('')}`;
+  const channels = group.voiceChannels.filter((channel) => !query || channel.name.toLowerCase().includes(query));
+  select.innerHTML = `<option value="">اختر قناة صوتية</option>${channels.map((channel) => `<option value="${escapeHTML(group.guildId)}::${escapeHTML(channel.id)}">${escapeHTML(channel.name)}${channel.members ? ` · ${channel.members} متصل` : ''}</option>`).join('')}`;
   updateChannelSummary();
 }
 function handleChannelChange() {
@@ -667,6 +680,7 @@ function initCustomSelects() {
 }
 function init() {
   initTheme(); initLanguage(); initNavigation(); initActivity(); initCustomSelects();
+  $('#serverSelect')?.addEventListener('change', (event) => { state.selectedGuildId = event.target.value; state.selectedTarget = null; renderChannels(); }); $('#roomSearch')?.addEventListener('input', () => { state.selectedTarget = null; renderChannels(); });
   $('#connectButton').addEventListener('click', connect); $('#bulkConnectButton').addEventListener('click', bulkConnect); $('#disconnectButton').addEventListener('click', disconnect); $('#refreshButton').addEventListener('click', refreshChannels); $('#accountSelect').addEventListener('change', async (event) => { state.selectedAccount = event.target.value; await loadGuilds(); await loadAutomationCatalog(); }); $('#automationGuild').addEventListener('change', renderAutomationChannels); $('#automationChannel').addEventListener('change', renderTargetAccounts); $('#rotationRoomFilter').addEventListener('input', (event) => { state.rotationRoomFilter = event.target.value; state.rotationRoomPage = 0; renderRotationRooms(); }); $('#rotationPrevButton').addEventListener('click', () => { state.rotationRoomPage -= 1; renderRotationRooms(); }); $('#rotationNextButton').addEventListener('click', () => { state.rotationRoomPage += 1; renderRotationRooms(); }); $('#bulkJoinButton').addEventListener('click', bulkJoinSelected); $('#channelSelect').addEventListener('change', handleChannelChange); $('#joinButton').addEventListener('click', join); $('#joinAllButton').addEventListener('click', joinAll); $('#leaveButton').addEventListener('click', leave); $('#cameraButton')?.addEventListener('click', toggleCamera); $('#screenButton')?.addEventListener('click', toggleScreen); $('#startRotationButton').addEventListener('click', startRotation); $('#startCycleButton').addEventListener('click', startCycle); $('#stopMediaButton')?.addEventListener('click', () => stopCurrentStream()); $('#applyBulkStateButton')?.addEventListener('click', applyBulkState); $('#overviewFilter')?.addEventListener('input', (event) => { state.overviewFilter = event.target.value; refreshSessions(); }); $('#overviewSort')?.addEventListener('change', (event) => { state.overviewSort = event.target.value; refreshSessions(); }); document.querySelectorAll('.state-button').forEach((button) => button.addEventListener('click', () => applyState(button.dataset.state))); document.querySelectorAll('#statePicker input').forEach((input) => input.addEventListener('change', () => input.closest('.state-option')?.classList.toggle('is-selected', input.checked)));
   $('#operationClose').addEventListener('click', () => { $('#operationModal').hidden = true; $('.operation-loader')?.classList.remove('is-done', 'is-error'); }); $('#leaveAllButton')?.addEventListener('click', openLeaveAll); $('#confirmLeaveButton')?.addEventListener('click', leaveAllSelected); $('#cancelLeaveButton')?.addEventListener('click', () => { $('#leaveModal').hidden = true; }); window.addEventListener('beforeunload', () => stopCurrentStream({ updateDiscord: false }));
   document.addEventListener('change', (event) => { if (event.target.closest('#automationAccounts')) updateQuickStateButtons(); });
