@@ -316,12 +316,13 @@ async function startSyntheticStream(name, guildId, mediaKind = 'go-live') {
       const mediaState = mediaKind === 'camera'
         ? { selfMute: !!session.selfMute, selfDeaf: false, selfVideo: true, selfStream: false }
         : { selfMute: !!session.selfMute, selfDeaf: false, selfVideo: false, selfStream: true };
-      // STREAM_CREATE/STREAM_SERVER_UPDATE plus a ready media transport are the
-      // authoritative confirmation for Go Live. Discord may not echo
-      // self_stream through the normal VOICE_STATE_UPDATE event in time.
+      // For Go Live, the library's STREAM_CREATE/STREAM_SERVER_UPDATE flow and
+      // the ready stream WebRTC connection are the real Discord confirmation.
+      // Do not send a second OP4 with self_stream: Streamer.signalStream() owns
+      // that state, and a competing OP4 can cancel/replace the live stream.
       const confirmed = mediaKind === 'camera'
         ? await sendVoiceOpConfirmed(client, guildId, session.channelId, mediaState, 3000)
-        : sendVoiceOp(client, guildId, session.channelId, mediaState);
+        : sendVoiceOp(client, guildId, session.channelId, { selfMute: !!session.selfMute, selfDeaf: true });
       if (!confirmed.ok) throw new Error(confirmed.error || 'Discord did not accept media state');
       logMediaEvent('info', 'media.ready', { account: name, guildId, channelId: session.channelId, mediaKind, durationMs: Date.now() - startedAt, attempt });
       return { ok: true };
