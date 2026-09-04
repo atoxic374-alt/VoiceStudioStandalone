@@ -118,3 +118,15 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .full-activity-list { max-height: min(65vh, 620px); overflow: auto; }
 .activity-pagination { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 12px; }
 @media (max-width: 760px) { .profile-row { grid-template-columns: 36px minmax(0, 1fr) auto; } .profile-row-voice { grid-column: 2 / -1; } }
+
+.bulk-voice-controls { margin: 0 25px 20px; padding-top: 14px; border-top: 1px solid var(--line); }
+.bulk-control-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(150px, .8fr); gap: 9px; }
+.overview-tools { display: grid; grid-template-columns: minmax(0, 1fr) 180px; gap: 9px; padding: 0 25px 12px; }
+.overview-tools input, .overview-tools select { height: 38px; min-width: 0; border: 1px solid var(--line); border-radius: 10px; padding: 0 11px; background: rgba(5,8,21,.35); color: var(--text); font-size: 10px; }
+.health-summary { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 25px 12px; }
+.health-pill { padding: 4px 8px; border: 1px solid var(--line); border-radius: 99px; color: var(--muted); font-size: 9px; }
+.health-pill.healthy { border-color: rgba(96,230,167,.25); color: var(--green); background: rgba(96,230,167,.06); }
+.health-pill.degraded { border-color: rgba(255,113,139,.25); color: var(--red); background: rgba(255,113,139,.06); }
+.health-healthy { color: var(--green); }.health-degraded { color: var(--red); }.health-unknown { color: var(--muted); }
+.session-avatar img { width: 100%; height: 100%; object-fit: cover; border-radius: inherit; }
+@media (max-width: 690px) { .bulk-control-row, .overview-tools { grid-template-columns: 1fr; } }

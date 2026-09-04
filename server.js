@@ -3,6 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const { execFileSync } = require('child_process');
+const { EventEmitter } = require('events');
 const { Client } = require('discord.js-selfbot-v13');
 const helmet = require('helmet');
 
@@ -22,9 +23,17 @@ const voiceSessions = new Map();
 const rotations = new Map();
 const stateCycles = new Map();
 const syntheticStreams = new Map();
+const liveEvents = new EventEmitter();
 const SYNTHETIC_VIDEO_FILE = path.join(DATA_DIR, 'synthetic-stream.mp4');
 
 function ok(res, payload = {}) { return res.json({ success: true, ...payload }); }
+function emitLive(type, payload = {}) { liveEvents.emit('event', { type, at: Date.now(), ...payload }); }
+function accountHealth(name, entry) {
+  const client = entry?.client;
+  const status = client?.ws?.status;
+  const ready = status === undefined || status === 0;
+  return { name, state: ready ? 'healthy' : 'degraded', gatewayStatus: status ?? null, username: client?.user?.tag || client?.user?.username || name, lastError: entry?.lastError || null, connectedAt: entry?.connectedAt || null, lastSeenAt: entry?.lastSeenAt || null };
+}
 function fail(res, error, status = 200) {
   const message = error?.message || String(error || 'Unknown error');
   return res.status(status).json({ success: false, error: message });
@@ -230,11 +239,13 @@ function upsertSession(name, guildId, channelId, opts = {}) {
     joinedAt: previous?.joinedAt || Date.now(), updatedAt: Date.now(),
   });
   persistSessions();
+  emitLive('session.updated', { session: voiceSessions.get(sessionKey(name, guildId)) });
 }
 function removeSessionsForAccount(name, guildId) {
   if (guildId) voiceSessions.delete(sessionKey(name, guildId));
   else for (const key of voiceSessions.keys()) if (key.startsWith(`${name}__`)) voiceSessions.delete(key);
   persistSessions();
+  emitLive('session.removed', { name, guildId });
 }
 async function moveAccount(name, guildId, channelId, opts = {}) {
   const client = getClient(name);
@@ -259,7 +270,8 @@ async function connectOne(token, name) {
     try { await clients.get(finalName).client.destroy(); } catch {}
     clients.delete(finalName);
   }
-  clients.set(finalName, { client, token: token.trim() });
+  clients.set(finalName, { client, token: token.trim(), connectedAt: Date.now(), lastSeenAt: Date.now(), lastError: null });
+  emitLive('account.connected', { account: accountHealth(finalName, clients.get(finalName)) });
 
   // Restore only the channel state; media capture remains browser-owned and must be
   // explicitly re-enabled by the user after reconnecting.
@@ -279,7 +291,22 @@ async function connectOne(token, name) {
   };
 }
 
-app.get('/api/health', (_req, res) => ok(res, { service: 'voice-studio', connected: clients.size }));
+app.get('/api/health', (_req, res) => ok(res, { service: 'voice-studio', connected: clients.size, accounts: [...clients.entries()].map(([name, entry]) => accountHealth(name, entry)) }));
+const healthTimer = setInterval(() => {
+  for (const [name, entry] of clients.entries()) {
+    entry.lastSeenAt = Date.now();
+    emitLive('health.updated', { account: accountHealth(name, entry) });
+  }
+}, 10000);
+healthTimer.unref?.();
+app.get('/api/events', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream'); res.setHeader('Cache-Control', 'no-cache'); res.setHeader('Connection', 'keep-alive'); res.flushHeaders?.();
+  const send = (event) => res.write(`data: ${JSON.stringify(event)}\n\n`);
+  const heartbeat = setInterval(() => res.write(': heartbeat\n\n'), 15000);
+  liveEvents.on('event', send);
+  req.on('close', () => { clearInterval(heartbeat); liveEvents.off('event', send); });
+});
+app.get('/api/accounts/health', (_req, res) => ok(res, { accounts: [...clients.entries()].map(([name, entry]) => accountHealth(name, entry)) }));
 app.get('/api/discord/clients', (_req, res) => ok(res, {
   clients: [...clients.entries()].map(([name, entry]) => {
     const user = entry.client.user;
@@ -295,6 +322,7 @@ app.get('/api/discord/clients', (_req, res) => ok(res, {
       id: user?.id || null,
       avatar: user?.displayAvatarURL?.({ size: 128 }) || null,
       status: user?.presence?.status || 'online',
+      health: accountHealth(name, entry),
       voice: voice ? { guildId: voice.guildId, guildName: guild?.name || voice.guildId, channelId: voice.channelId, channelName: channel?.name || voice.channelId, selfMute: !!voice.selfMute, selfDeaf: !!voice.selfDeaf, selfVideo: !!voice.selfVideo, selfStream: !!voice.selfStream } : null,
     };
   }),
@@ -330,12 +358,14 @@ app.post('/api/discord/disconnect', async (req, res) => {
   stopSyntheticStream(name);
   try { await entry.client.destroy(); } catch {}
   clients.delete(name);
+  emitLive('account.disconnected', { name });
   return ok(res, { name });
 });
 app.post('/api/discord/disconnect-all', async (_req, res) => {
   for (const name of clients.keys()) stopSyntheticStream(name);
   for (const entry of clients.values()) { try { await entry.client.destroy(); } catch {} }
   clients.clear();
+  emitLive('account.disconnected-all');
   return ok(res);
 });
 
@@ -404,6 +434,7 @@ app.post('/api/voice/join', async (req, res) => {
   if (!accounts.length || !guildId || !channelId) return fail(res, new Error('accounts, guildId and channelId are required'), 400);
   if (typeof selfMute !== 'boolean' || typeof selfDeaf !== 'boolean') return fail(res, new Error('Mute values must be boolean'), 400);
   const results = await Promise.all(accounts.map((name) => moveAccount(name, guildId, channelId, { selfMute, selfDeaf })));
+  emitLive('operation.completed', { operation: 'join', results, summary: summary(results) });
   return ok(res, { results, summary: summary(results) });
 });
 app.post('/api/voice/leave', async (req, res) => {
@@ -418,6 +449,7 @@ app.post('/api/voice/leave', async (req, res) => {
     if (result.ok) removeSessionsForAccount(name, guildId);
     return { name, ok: result.ok, error: result.ok ? null : result.error };
   }));
+  emitLive('operation.completed', { operation: 'leave', results, summary: summary(results) });
   return ok(res, { results, summary: summary(results) });
 });
 app.post('/api/voice/state', async (req, res) => {
@@ -447,6 +479,7 @@ app.post('/api/voice/state', async (req, res) => {
     if (result.ok) { const actual = readGatewayVoiceState(client, guildId); Object.assign(current, next, actual || {}, { selfStream: !!next.selfStream, updatedAt: Date.now() }); persistSessions(); }
     return { name, ok: result.ok, error: result.ok ? null : result.error };
   }));
+  emitLive('operation.completed', { operation: 'state', results, summary: summary(results) });
   return ok(res, { results, summary: summary(results) });
 });
 app.post('/api/voice/join-all', async (req, res) => {
@@ -454,6 +487,7 @@ app.post('/api/voice/join-all', async (req, res) => {
   const accounts = [...clients.keys()];
   if (!guildId || !channelId) return fail(res, new Error('guildId and channelId are required'), 400);
   const results = await Promise.all(accounts.map((name) => moveAccount(name, guildId, channelId, { selfMute, selfDeaf })));
+  emitLive('operation.completed', { operation: 'join-all', results, summary: summary(results) });
   return ok(res, { results, summary: summary(results) });
 });
 app.post('/api/voice/distribute-random', async (req, res) => {
@@ -462,6 +496,7 @@ app.post('/api/voice/distribute-random', async (req, res) => {
   if (!guildId || !Array.isArray(channelIds) || !channelIds.length) return fail(res, new Error('guildId and channelIds are required'), 400);
   const shuffled = [...channelIds].sort(() => Math.random() - 0.5);
   const results = await Promise.all(accounts.map((name, index) => moveAccount(name, guildId, shuffled[index % shuffled.length])));
+  emitLive('operation.completed', { operation: 'distribute-random', results, summary: summary(results) });
   return ok(res, { results, summary: summary(results) });
 });
 

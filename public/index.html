@@ -75,7 +75,7 @@
                 <label class="select-field wide"><span>Server & room</span><select id="channelSelect"><option value="">اختر قناة صوتية</option></select></label>
                 <button id="refreshButton" class="refresh-button" type="button" title="تحديث القنوات" aria-label="تحديث القنوات">↻</button>
               </div>
-              <div id="channelSummary" class="channel-summary empty"><span class="summary-icon">⌁</span><div><strong>لم يتم اختيار وجهة بعد</strong><small>بعد الاتصال، ستظهر الخوادم والقنوات المتاحة هنا.</small></div></div>
+              <div id="channelSummary" class="channel-summary empty"><span class="summary-icon">⌁</span><div><strong>لم يتم اختيار وجهة بعد</strong><small>بعد الاتصال، ستظهر الخوادم والقنوات المتاحة هنا.</small></div></div><div class="bulk-voice-controls"><div class="profiles-heading"><span>تحكم صوتي جماعي</span><small>اختر حسابات الأتمتة ثم طبق الحالة</small></div><div class="bulk-control-row"><select id="bulkStateTemplate" class="automation-guild"><option value="unmute">Unmute</option><option value="mute">Mute</option><option value="deaf">Deafen</option><option value="cam">Video</option><option value="stream">Stream</option></select><button id="applyBulkStateButton" class="action-button action-secondary" type="button">Apply to selected</button></div></div>
               <div class="voice-actions">
                 <button id="joinButton" class="action-button action-join" type="button"><span>＋</span> Join room</button>
                 <button id="joinAllButton" class="action-button action-secondary" type="button">Join all</button>
@@ -107,7 +107,7 @@
 
             <article id="sessionsCard" class="card sessions-card" data-panel="dashboard">
               <div class="card-heading compact"><div><span class="card-kicker">DASHBOARD / LIVE</span><h2>Live overview</h2></div><span id="sessionLiveLabel" class="soft-badge accent">تحديث تلقائي</span></div>
-              <div id="sessionsList" class="sessions-list"><div class="empty-state"><span class="empty-pulse"></span><p>لا توجد جلسات نشطة الآن</p><small>عند الدخول إلى غرفة ستظهر تفاصيلها هنا.</small></div></div>
+              <div class="overview-tools"><input id="overviewFilter" type="search" placeholder="Search account, server or room" autocomplete="off" /><select id="overviewSort"><option value="account">Sort by account</option><option value="server">Sort by server</option><option value="members">Sort by room members</option></select></div><div id="healthSummary" class="health-summary"></div><div id="sessionsList" class="sessions-list"><div class="empty-state"><span class="empty-pulse"></span><p>لا توجد جلسات نشطة الآن</p><small>عند الدخول إلى غرفة ستظهر تفاصيلها هنا.</small></div></div>
               <div class="profiles-heading"><span>ملفات الحسابات</span><small>الاسم، النيك نيم، المعرّف والحالة الحالية</small></div><div id="profilesList" class="profiles-list"><div class="task-empty">لا توجد حسابات متصلة</div></div>
             </article>
           </div>
