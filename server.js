@@ -462,10 +462,14 @@ function sendVoiceOpConfirmed(client, guildId, channelId, opts = {}, timeoutMs =
 
     try { client.ws?.on?.('VOICE_STATE_UPDATE', onWsState); } catch {}
     try { client.on?.('voiceStateUpdate', onJsState); } catch {}
-    timer = setTimeout(() => {
-      if (cachedStateMatches()) finish({ ok: true, confirmed: true, source: 'gateway-cache' });
-      else finish({ ok: false, error: 'Discord did not confirm the voice state in time' });
-    }, timeoutMs);
+    const verifyUntilDeadline = () => {
+      if (settled) return;
+      if (cachedStateMatches()) return finish({ ok: true, confirmed: true, source: 'gateway-cache' });
+      if (Date.now() >= deadline) return finish({ ok: false, error: 'Discord did not confirm the voice state in time' });
+      verifyTimer = setTimeout(verifyUntilDeadline, 250);
+    };
+    const deadline = Date.now() + timeoutMs;
+    timer = setTimeout(verifyUntilDeadline, 250);
 
     const send = () => {
       if (settled) return;
@@ -925,7 +929,7 @@ app.post('/api/voice/state', async (req, res) => {
     let result;
     if (next.selfStream && !syntheticStreams.has(name)) result = await startSyntheticStream(name, guildId, 'go-live');
     else if (next.selfVideo && !syntheticStreams.has(name)) result = await startSyntheticStream(name, guildId, 'camera');
-    else result = await sendVoiceOpConfirmed(client, guildId, current.channelId, next, 3000);
+    else result = await sendVoiceOpConfirmed(client, guildId, current.channelId, next, 6000);
     if (result.ok) {
       if (!next.selfStream && !next.selfVideo && (current.selfStream || current.selfVideo)) stopSyntheticStream(name);
       const actual = readGatewayVoiceState(client, guildId);
@@ -1020,7 +1024,7 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
     if (next.selfDeaf && (next.selfVideo || next.selfStream)) return { name, ok: false, error: 'Invalid deafened media state' };
     const result = (next.selfStream || next.selfVideo)
       ? await startSyntheticStream(name, task.guildId, next.selfStream ? 'go-live' : 'camera')
-      : await sendVoiceOpConfirmed(client, task.guildId, current.channelId, next, 3000);
+      : await sendVoiceOpConfirmed(client, task.guildId, current.channelId, next, 6000);
     if (result.ok) { Object.assign(current, next, { selfStream: !!next.selfStream, updatedAt: Date.now() }); persistSessions(); }
     return { name, ok: result.ok, error: result.ok ? null : result.error };
   }));
@@ -1042,7 +1046,7 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
         if (next.selfStream || next.selfVideo) result = await startSyntheticStream(name, task.guildId, next.selfStream ? 'go-live' : 'camera');
         else {
           if (current.selfStream || current.selfVideo) stopSyntheticStream(name);
-          result = await sendVoiceOpConfirmed(client, task.guildId, current.channelId, next, 3000);
+          result = await sendVoiceOpConfirmed(client, task.guildId, current.channelId, next, 6000);
         }
         if (result.ok) { Object.assign(current, next, { selfStream: !!next.selfStream, updatedAt: Date.now() }); persistSessions(); }
         task.lastResults.push({ name, ok: result.ok, error: result.ok ? null : result.error });
@@ -1109,7 +1113,7 @@ async function restoreAutomationTasks() {
           if (next.selfDeaf && (next.selfVideo || next.selfStream)) return { name, ok: false, error: 'Invalid deafened media state' };
           let result;
           if (next.selfStream || next.selfVideo) result = await startSyntheticStream(name, task.guildId, next.selfStream ? 'go-live' : 'camera');
-          else { if (current.selfStream || current.selfVideo) stopSyntheticStream(name); result = await sendVoiceOpConfirmed(client, task.guildId, current.channelId, next, 3000); }
+          else { if (current.selfStream || current.selfVideo) stopSyntheticStream(name); result = await sendVoiceOpConfirmed(client, task.guildId, current.channelId, next, 6000); }
           if (result.ok) { Object.assign(current, next, { updatedAt: Date.now() }); persistSessions(); }
           return { name, ok: result.ok, error: result.ok ? null : result.error };
         })));
