@@ -75,6 +75,7 @@ const voiceSessions = new Map();
 const rotations = new Map();
 const stateCycles = new Map();
 const syntheticStreams = new Map();
+const mediaStreamers = new Map();
 let videoStreamModulePromise;
 const liveEvents = new EventEmitter();
 liveEvents.setMaxListeners(0);
@@ -178,16 +179,22 @@ function ensureSyntheticVideo() {
     throw new Error(`Unable to create synthetic stream source: ${error.message}`);
   }
 }
-function stopSyntheticStream(name) {
+function stopSyntheticStream(name, { leaveVoice = false } = {}) {
   const active = syntheticStreams.get(name);
-  if (!active) return;
-  try { active.controller?.abort?.(); } catch {}
-  try { active.sourceProcess?.kill?.('SIGTERM'); } catch {}
-  try { active.streamer?.stopStream?.(); } catch {}
-  try { active.streamer?.signalVideo?.(false); } catch {}
-  try { active.dispatcher?.destroy?.(); } catch {}
-  try { active.streamConnection?.disconnect?.(); } catch {}
+  if (active) {
+    try { active.controller?.abort?.(); } catch {}
+    try { active.sourceProcess?.kill?.('SIGTERM'); } catch {}
+    try { active.streamer?.stopStream?.(); } catch {}
+    try { active.streamer?.signalVideo?.(false); } catch {}
+    try { active.dispatcher?.destroy?.(); } catch {}
+    try { active.streamConnection?.disconnect?.(); } catch {}
+  }
   syntheticStreams.delete(name);
+  if (leaveVoice) {
+    const streamer = mediaStreamers.get(name);
+    try { streamer?.leaveVoice?.(); } catch {}
+    mediaStreamers.delete(name);
+  }
 }
 function createBlackMediaSource() {
   const sourceProcess = spawn(FFMPEG_PATH || 'ffmpeg', [
@@ -285,9 +292,15 @@ async function startSyntheticStream(name, guildId, mediaKind = 'go-live') {
     let streamer;
     let controller;
     let source;
+    let createdStreamer = false;
     try {
       const { Streamer, playStream } = await loadVideoStreamModule();
-      streamer = new Streamer(client);
+      streamer = mediaStreamers.get(name);
+      if (!streamer) {
+        streamer = new Streamer(client);
+        mediaStreamers.set(name, streamer);
+        createdStreamer = true;
+      }
       streamer.signalVideo = (enabled) => streamer.sendOpcode(4, {
         guild_id: guildId,
         channel_id: session.channelId,
@@ -295,8 +308,16 @@ async function startSyntheticStream(name, guildId, mediaKind = 'go-live') {
         self_deaf: false,
         self_video: !!enabled,
       });
-      logMediaEvent('info', 'media.join.start', { account: name, guildId, channelId: session.channelId, mediaKind, attempt });
-      await withTimeout(streamer.joinVoice(guildId, session.channelId), 10000, 'Dedicated media voice connection timed out after 10 seconds');
+      const mediaConnection = streamer.voiceConnection;
+      if (mediaConnection && (String(mediaConnection.guildId) !== String(guildId) || String(mediaConnection.channelId) !== String(session.channelId))) {
+        try { streamer.leaveVoice(); } catch {}
+      }
+      if (!streamer.voiceConnection) {
+        logMediaEvent('info', 'media.join.start', { account: name, guildId, channelId: session.channelId, mediaKind, attempt });
+        await withTimeout(streamer.joinVoice(guildId, session.channelId), 10000, 'Dedicated media voice connection timed out after 10 seconds');
+      } else {
+        logMediaEvent('info', 'media.join.reuse', { account: name, guildId, channelId: session.channelId, mediaKind, attempt });
+      }
       controller = new AbortController();
       source = createBlackMediaSource();
       const active = { streamer, controller, sourceProcess: source.sourceProcess, guildId, channelId: session.channelId, mediaKind, startedAt };
@@ -337,6 +358,7 @@ async function startSyntheticStream(name, guildId, mediaKind = 'go-live') {
       try { streamer?.stopStream?.(); } catch {}
       try { streamer?.leaveVoice?.(); } catch {}
       if (syntheticStreams.get(name)?.streamer === streamer) syntheticStreams.delete(name);
+      if (createdStreamer && !streamer?.voiceConnection) mediaStreamers.delete(name);
       logMediaEvent('error', 'media.attempt_failed', { account: name, guildId, channelId: session.channelId, mediaKind, attempt, error: error?.message || String(error) });
       if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 250));
     }
@@ -568,7 +590,7 @@ function reconcileVoiceSessions() {
           upsertSession(name, session.guildId, session.channelId, { selfMute: session.selfMute, selfDeaf: false, selfVideo: active.mediaKind === 'camera', selfStream: active.mediaKind === 'go-live' });
           continue;
         }
-        stopSyntheticStream(name);
+        stopSyntheticStream(name, { leaveVoice: true });
         removeSessionsForAccount(name, session.guildId);
         continue;
       }
@@ -576,7 +598,7 @@ function reconcileVoiceSessions() {
       const observed = { ...actual, selfVideo: active?.mediaKind === 'camera' ? true : actual.selfVideo, selfStream: active?.mediaKind === 'go-live' ? true : actual.selfStream };
       const changed = observed.channelId !== session.channelId || observed.selfMute !== !!session.selfMute || observed.selfDeaf !== !!session.selfDeaf || observed.selfVideo !== !!session.selfVideo || observed.selfStream !== !!session.selfStream;
       if (changed) {
-        if (observed.channelId !== session.channelId) stopSyntheticStream(name);
+        if (observed.channelId !== session.channelId) stopSyntheticStream(name, { leaveVoice: true });
         upsertSession(name, session.guildId, observed.channelId, observed);
       }
     }
@@ -594,7 +616,7 @@ async function moveAccount(name, guildId, channelId, opts = {}) {
     for (const key of ['selfMute', 'selfDeaf', 'selfVideo', 'selfStream']) if (typeof observed?.[key] !== 'boolean' && typeof saved?.[key] === 'boolean') current[key] = saved[key];
     if (current?.channelId === channelId) return { name, ok: true, alreadyIn: true, channelId };
     const desired = normalizeVoiceState({ ...(current || {}), ...opts });
-    if (syntheticStreams.has(name)) stopSyntheticStream(name);
+    if (syntheticStreams.has(name) || mediaStreamers.has(name)) stopSyntheticStream(name, { leaveVoice: true });
     const result = await sendVoiceOpConfirmed(client, guildId, channelId, { ...desired, selfVideo: false, selfStream: false });
     if (result.ok) {
       for (const key of [...voiceSessions.keys()]) if (key.startsWith(`${name}__`) && key !== sessionKey(name, guildId)) voiceSessions.delete(key);
@@ -623,7 +645,7 @@ async function connectOne(token, name) {
   if (!finalName) finalName = String(client.user?.globalName || client.user?.username || `account-${clients.size + 1}`).trim().slice(0, 48);
   if (clients.has(finalName)) {
     stopTasksForAccount(finalName);
-    stopSyntheticStream(finalName);
+    stopSyntheticStream(finalName, { leaveVoice: true });
     try { await clients.get(finalName).client.destroy(); } catch {}
     clients.delete(finalName);
   }
@@ -784,7 +806,7 @@ app.post('/api/discord/disconnect', async (req, res) => {
   const entry = clients.get(name);
   if (!entry) return ok(res);
   stopTasksForAccount(name);
-  stopSyntheticStream(name);
+  stopSyntheticStream(name, { leaveVoice: true });
   try { await entry.client.destroy(); } catch {}
   clients.delete(name);
   persistConnectedAccounts();
@@ -799,7 +821,7 @@ app.post('/api/discord/disconnect-bulk', async (req, res) => {
     const entry = clients.get(name);
     if (!entry) { results.push({ name, ok: false, error: 'Account is not connected' }); continue; }
     stopTasksForAccount(name);
-    stopSyntheticStream(name);
+    stopSyntheticStream(name, { leaveVoice: true });
     removeSessionsForAccount(name);
     try { await entry.client.destroy(); } catch (error) { results.push({ name, ok: false, error: error.message }); continue; }
     clients.delete(name);
@@ -810,7 +832,7 @@ app.post('/api/discord/disconnect-bulk', async (req, res) => {
   return ok(res, { results, summary: summary(results) });
 });
 app.post('/api/discord/disconnect-all', async (_req, res) => {
-  for (const name of clients.keys()) { stopTasksForAccount(name); stopSyntheticStream(name); }
+  for (const name of clients.keys()) { stopTasksForAccount(name); stopSyntheticStream(name, { leaveVoice: true }); }
   for (const entry of clients.values()) { try { await entry.client.destroy(); } catch {} }
   clients.clear();
   persistConnectedAccounts();
@@ -904,7 +926,7 @@ app.post('/api/voice/leave', async (req, res) => {
     const current = readGatewayVoiceState(client, guildId) || voiceSessions.get(sessionKey(name, guildId));
     if (!current?.channelId) { stopTasksForAccount(name); removeSessionsForAccount(name, guildId); return { name, ok: true, alreadyLeft: true }; }
     stopTasksForAccount(name);
-    stopSyntheticStream(name);
+    stopSyntheticStream(name, { leaveVoice: true });
     const result = await sendVoiceOpConfirmed(client, guildId, null, {}, 5000);
     if (result.ok) removeSessionsForAccount(name, guildId);
     return { name, ok: result.ok, error: result.ok ? null : result.error };
