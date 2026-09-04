@@ -86,3 +86,17 @@ Technical voice states use consistent English labels throughout the interface: `
 يطبق الخادم كذلك Security Headers، وContent Security Policy، وحدود حجم الطلب، وRate Limiting، وتحديد محاولات المصادقة، و`Cache-Control: no-store` لاستجابات API، وتنقيح رسائل الأخطاء من أنماط token وpassword وauthorization. ملفات الجلسات وملفات البث الناتجة أثناء التشغيل مستثناة من Git. إذا تعرض مشروع Railway أو جلسة المتصفح أو السجلات أو Variables، يجب تغيير `APP_PASSWORD` وتدوير جميع توكنات Discord فورًا.
 
 قبل النشر، تحقق من وجود `APP_PASSWORD` داخل Railway Variables، ومن عدم ظهور أي توكن في Build Logs أو Deployment Logs، ومن أن `/api/health` يعيد `401` بدون Cookie المصادقة. حافظ على المستودع Private، ولا ترفع `.env` أو صادرات Railway أو مجلد `data/` أو لقطات شاشة تحتوي على توكنات أو Browser Storage منسوخ.
+
+
+## Owner and client access
+
+Set two different Railway Variables in production:
+
+```env
+APP_PASSWORD=long-random-owner-password
+CLIENT_PASSWORD=different-long-random-client-password
+```
+
+`APP_PASSWORD` is the owner credential. `CLIENT_PASSWORD` is a separate client credential. The first successful client login creates a random device cookie and stores only its SHA-256 hash in `data/client-binding.json`; the raw client password and raw device value are never written to disk. Later attempts using `CLIENT_PASSWORD` from a different browser or device are rejected until `CLIENT_PASSWORD` is changed in Railway. Changing the variable changes its fingerprint and resets the binding, allowing one new client device to register. Owner access remains available independently through `APP_PASSWORD`.
+
+Do not use the same value for both variables. Changing either password invalidates the corresponding signed access cookies. The one-device rule cannot protect a browser session after its HttpOnly cookie has been stolen; rotate `CLIENT_PASSWORD` immediately if that is suspected.

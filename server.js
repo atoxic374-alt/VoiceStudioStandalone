@@ -7,6 +7,7 @@ const { EventEmitter } = require('events');
 const { Client } = require('discord.js-selfbot-v13');
 const helmet = require('helmet');
 const AUTH_COOKIE = 'voice_studio_auth';
+const CLIENT_DEVICE_COOKIE = 'voice_studio_client_device';
 const AUTH_TTL_MS = 12 * 60 * 60 * 1000;
 const AUTH_ENABLED = Boolean(process.env.APP_PASSWORD || process.env.NODE_ENV === 'production');
 
@@ -14,6 +15,7 @@ const app = express();
 const PORT = Number(process.env.PORT || 5050);
 const DATA_DIR = path.join(__dirname, 'data');
 const VOICE_STATE_FILE = path.join(DATA_DIR, 'voice-sessions.json');
+const CLIENT_BIND_FILE = path.join(DATA_DIR, 'client-binding.json');
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
 app.set('trust proxy', 1);
@@ -42,15 +44,21 @@ function fail(res, error, status = 200) {
   return res.status(status).json({ success: false, error: message });
 }
 function parseCookies(req) { const result = {}; for (const part of String(req.headers.cookie || '').split(';')) { const separator = part.indexOf('='); if (separator < 1) continue; const key = part.slice(0, separator).trim(); const raw = part.slice(separator + 1).trim(); try { result[key] = decodeURIComponent(raw); } catch {} } return result; }
-function authSignature(value) { return crypto.createHmac('sha256', process.env.APP_PASSWORD || 'disabled').update(value).digest('base64url'); }
+function authSignature(value, secret = process.env.APP_PASSWORD || 'disabled') { return crypto.createHmac('sha256', secret).update(value).digest('base64url'); }
+function hashSecret(value) { return crypto.createHash('sha256').update(String(value)).digest('hex'); }
+function readClientBinding() { try { const value = JSON.parse(fs.readFileSync(CLIENT_BIND_FILE, 'utf8')); return value && typeof value === 'object' ? value : null; } catch { return null; } }
+function writeClientBinding(value) { const temp = `${CLIENT_BIND_FILE}.tmp`; try { fs.writeFileSync(temp, JSON.stringify(value)); fs.renameSync(temp, CLIENT_BIND_FILE); } catch (error) { try { fs.rmSync(temp, { force: true }); } catch {} throw new Error(`Unable to save client binding: ${redact(error.message)}`); } }
+function makeAuthCookie(role, secret) { const stamp = String(Date.now()); return `${role}.${stamp}.${authSignature(stamp, secret)}`; }
+function cookieMatches(raw, role, secret) { const [cookieRole, stamp, signature] = String(raw || '').split('.'); if (cookieRole !== role || !stamp || !signature || !/^\d+$/.test(stamp) || Date.now() - Number(stamp) > AUTH_TTL_MS) return false; const expected = authSignature(stamp, secret); return expected.length === signature.length && crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature)); }
 function hasValidAuth(req) {
-  if (!AUTH_ENABLED) return true;
-  const raw = parseCookies(req)[AUTH_COOKIE];
-  if (!raw) return false;
-  const [stamp, signature] = raw.split('.');
-  if (!stamp || !signature || Date.now() - Number(stamp) > AUTH_TTL_MS) return false;
-  const expected = authSignature(stamp);
-  return expected.length === signature.length && crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
+  if (!AUTH_ENABLED) { req.authRole = 'owner'; return true; }
+  const cookies = parseCookies(req); const raw = cookies[AUTH_COOKIE];
+  if (process.env.APP_PASSWORD && cookieMatches(raw, 'owner', process.env.APP_PASSWORD)) { req.authRole = 'owner'; return true; }
+  if (process.env.CLIENT_PASSWORD && cookieMatches(raw, 'client', process.env.CLIENT_PASSWORD)) {
+    const binding = readClientBinding(); const device = cookies[CLIENT_DEVICE_COOKIE];
+    if (binding && binding.passwordFingerprint === hashSecret(process.env.CLIENT_PASSWORD) && device && binding.deviceHash === hashSecret(device)) { req.authRole = 'client'; return true; }
+  }
+  return false;
 }
 function requireAuth(req, res, next) {
   if (hasValidAuth(req)) return next();
@@ -354,22 +362,43 @@ async function connectOne(token, name) {
 }
 
 app.post('/api/auth', (req, res) => {
-  if (!AUTH_ENABLED) return ok(res, { authenticated: true, required: false });
+  if (!AUTH_ENABLED) return ok(res, { authenticated: true, required: false, role: 'owner' });
   const supplied = String(req.body?.password || '');
   const ip = req.ip || req.socket.remoteAddress || 'unknown'; const attempt = authAttempts.get(ip) || { start: Date.now(), count: 0 };
   if (Date.now() - attempt.start > 15 * 60 * 1000) { attempt.start = Date.now(); attempt.count = 0; }
   attempt.count += 1; authAttempts.set(ip, attempt);
   if (authAttempts.size > 10000) { for (const [attemptIp, value] of authAttempts) if (Date.now() - value.start > 30 * 60 * 1000) authAttempts.delete(attemptIp); }
   if (attempt.count > 10) return fail(res, new Error('Too many authentication attempts; try again later'), 429);
-  const expectedPassword = Buffer.from(process.env.APP_PASSWORD || ''); const suppliedPassword = Buffer.from(supplied);
-  const passwordMatches = expectedPassword.length === suppliedPassword.length && crypto.timingSafeEqual(expectedPassword, suppliedPassword);
-  if (!process.env.APP_PASSWORD || !supplied || supplied.length > 256 || !passwordMatches) return fail(res, new Error('Invalid access password'), 401);
-  const stamp = String(Date.now());
-  const value = `${stamp}.${authSignature(stamp)}`;
-  const secure = req.secure || req.headers['x-forwarded-proto'] === 'https';
-  res.setHeader('Set-Cookie', `${AUTH_COOKIE}=${encodeURIComponent(value)}; Max-Age=${Math.floor(AUTH_TTL_MS / 1000)}; Path=/; HttpOnly; SameSite=Strict${secure ? '; Secure' : ''}`);
-  return ok(res, { authenticated: true, required: true });
+  if (!supplied || supplied.length > 256) return fail(res, new Error('Invalid access password'), 401);
+  const ownerPassword = Buffer.from(process.env.APP_PASSWORD || ''); const suppliedPassword = Buffer.from(supplied);
+  const ownerMatches = ownerPassword.length === suppliedPassword.length && crypto.timingSafeEqual(ownerPassword, suppliedPassword);
+  let role = ownerMatches ? 'owner' : null;
+  if (!role && process.env.CLIENT_PASSWORD) {
+    const clientPassword = Buffer.from(process.env.CLIENT_PASSWORD); const clientMatches = clientPassword.length === suppliedPassword.length && crypto.timingSafeEqual(clientPassword, suppliedPassword);
+    if (clientMatches) role = 'client';
+  }
+  if (!role) return fail(res, new Error('Invalid access password'), 401);
+  let deviceCookie = null;
+  if (role === 'client') {
+    const current = readClientBinding(); const suppliedDevice = parseCookies(req)[CLIENT_DEVICE_COOKIE];
+    const passwordFingerprint = hashSecret(process.env.CLIENT_PASSWORD);
+    if (current && current.passwordFingerprint === passwordFingerprint) {
+      if (!suppliedDevice || current.deviceHash !== hashSecret(suppliedDevice)) return fail(res, new Error('This client password is already bound to another device'), 403);
+      deviceCookie = suppliedDevice;
+    } else {
+      deviceCookie = crypto.randomBytes(32).toString('base64url');
+      try { writeClientBinding({ passwordFingerprint, deviceHash: hashSecret(deviceCookie), boundAt: Date.now() }); } catch (error) { return fail(res, error, 500); }
+    }
+  }
+  const value = makeAuthCookie(role, role === 'owner' ? process.env.APP_PASSWORD : process.env.CLIENT_PASSWORD);
+  const secure = req.secure || req.headers['x-forwarded-proto'] === 'https'; const flags = `Path=/; HttpOnly; SameSite=Strict${secure ? '; Secure' : ''}`;
+  const cookies = [`${AUTH_COOKIE}=${encodeURIComponent(value)}; Max-Age=${Math.floor(AUTH_TTL_MS / 1000)}; ${flags}`];
+  if (deviceCookie) cookies.push(`${CLIENT_DEVICE_COOKIE}=${encodeURIComponent(deviceCookie)}; Max-Age=${Math.floor(AUTH_TTL_MS / 1000)}; ${flags}`);
+  res.setHeader('Set-Cookie', cookies);
+  return ok(res, { authenticated: true, required: true, role });
 });
+app.get('/api/auth/status', (req, res) => ok(res, { authenticated: hasValidAuth(req), role: req.authRole || null, clientBound: Boolean(readClientBinding()) }));
+
 const requestBuckets = new Map();
 const authAttempts = new Map();
 function originGuard(req, res, next) {
