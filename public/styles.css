@@ -198,3 +198,12 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .activity-actions .activity-expand { flex: 1; margin-top: 0; }
 .activity-actions .activity-clear { color: var(--red); border-color: rgba(255,113,139,.35); }
 .activity-actions .activity-clear:hover { background: rgba(255,113,139,.1); border-color: rgba(255,113,139,.65); }
+
+/* Full-width quick controls on desktop; keep the compact single-column mobile layout. */
+@media (min-width: 691px) {
+  .column-side { display: contents; }
+  .quick-card { grid-column: 1 / -1; width: 100%; }
+  .quick-card .state-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; padding-left: 25px; padding-right: 25px; }
+  .quick-card .state-button { min-height: 68px; border-radius: 15px; padding: 12px 14px; }
+}
+.quick-card .state-button { min-width: 0; }
