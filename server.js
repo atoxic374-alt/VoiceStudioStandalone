@@ -928,7 +928,9 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
     if (!current || !client) return { name, ok: false, error: 'Account is not currently in a voice channel' };
     const next = { ...current, ...task.states[0] };
     if (next.selfDeaf && (next.selfVideo || next.selfStream)) return { name, ok: false, error: 'Invalid deafened media state' };
-    const result = next.selfStream ? await startSyntheticStream(name, task.guildId) : await sendVoiceOpConfirmed(client, task.guildId, current.channelId, next, 9000);
+    const result = (next.selfStream || next.selfVideo)
+      ? await startSyntheticStream(name, task.guildId, next.selfStream ? 'go-live' : 'camera')
+      : await sendVoiceOpConfirmed(client, task.guildId, current.channelId, next, 3000);
     if (result.ok) { Object.assign(current, next, { selfStream: !!next.selfStream, updatedAt: Date.now() }); persistSessions(); }
     return { name, ok: result.ok, error: result.ok ? null : result.error };
   }));
@@ -947,10 +949,10 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
         const next = { ...current, ...state };
         if (next.selfDeaf && (next.selfVideo || next.selfStream)) return;
         let result;
-        if (next.selfStream) result = await startSyntheticStream(name, task.guildId);
+        if (next.selfStream || next.selfVideo) result = await startSyntheticStream(name, task.guildId, next.selfStream ? 'go-live' : 'camera');
         else {
-          if (current.selfStream) stopSyntheticStream(name);
-          result = await sendVoiceOpConfirmed(client, task.guildId, current.channelId, next, 5000);
+          if (current.selfStream || current.selfVideo) stopSyntheticStream(name);
+          result = await sendVoiceOpConfirmed(client, task.guildId, current.channelId, next, 3000);
         }
         if (result.ok) { Object.assign(current, next, { selfStream: !!next.selfStream, updatedAt: Date.now() }); persistSessions(); }
         task.lastResults.push({ name, ok: result.ok, error: result.ok ? null : result.error });
