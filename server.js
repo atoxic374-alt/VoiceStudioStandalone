@@ -18,7 +18,14 @@ const PORT = Number(process.env.PORT || 5050);
 const DATA_DIR = path.join(__dirname, 'data');
 const VOICE_STATE_FILE = path.join(DATA_DIR, 'voice-sessions.json');
 const CLIENT_BIND_FILE = path.join(DATA_DIR, 'client-binding.json');
+const MEDIA_LOG_FILE = path.join(DATA_DIR, 'media-events.log');
 fs.mkdirSync(DATA_DIR, { recursive: true });
+
+function logMediaEvent(level, event, details = {}) {
+  const record = { time: new Date().toISOString(), level, event, ...details };
+  try { fs.appendFileSync(MEDIA_LOG_FILE, `${JSON.stringify(record)}\n`, { mode: 0o600 }); } catch (error) { console.warn('[media-log] write failed:', error.message); }
+  if (level === 'error') console.warn(`[media:${event}]`, details.error || details.stage || 'operation failed');
+}
 
 // Account tokens are persisted only as an authenticated AES-256-GCM payload.
 // Set DATA_ENCRYPTION_KEY in production to keep this storage independent from
@@ -177,6 +184,8 @@ async function startSyntheticStream(name, guildId) {
   const channel = guild?.channels?.cache?.get?.(session.channelId);
   if (!channel) return { ok: false, error: 'Voice channel is not available for streaming' };
   let lastError;
+  const startedAt = Date.now();
+  logMediaEvent('info', 'stream.start', { account: name, guildId, channelId: session.channelId });
   try {
     const source = ensureSyntheticVideo();
     for (let attempt = 1; attempt <= 2; attempt += 1) {
@@ -192,14 +201,17 @@ async function startSyntheticStream(name, guildId) {
         syntheticStreams.set(name, { connection, streamConnection, dispatcher, guildId, channelId: session.channelId });
         sendVoiceOp(client, guildId, session.channelId, { selfMute: !!session.selfMute, selfDeaf: false, selfVideo: false, selfStream: true });
         dispatcher.once?.('finish', () => { if (syntheticStreams.get(name)?.dispatcher === dispatcher) stopSyntheticStream(name); });
+        logMediaEvent('info', 'stream.ready', { account: name, guildId, channelId: session.channelId, durationMs: Date.now() - startedAt, attempt });
         return { ok: true };
       } catch (error) {
         lastError = error;
+        logMediaEvent('error', 'stream.attempt_failed', { account: name, guildId, channelId: session.channelId, attempt, durationMs: Date.now() - startedAt, error: error?.message || String(error) });
         if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 250));
       }
     }
   } catch (error) { lastError = error; }
   stopSyntheticStream(name);
+  logMediaEvent('error', 'stream.failed', { account: name, guildId, channelId: session.channelId, durationMs: Date.now() - startedAt, error: lastError?.message || 'Unable to start synthetic stream' });
   return { ok: false, error: lastError?.message || 'Unable to start synthetic stream' };
 }
 async function withAccountLock(name, operation) {
@@ -598,7 +610,7 @@ app.get('/api/voice/guilds', (req, res) => {
   }
   return ok(res, { guilds });
 });
-app.get('/api/voice/sessions', (_req, res) => {
+app.get('/api/voice/sessions', (req, res) => {
   const sessions = [];
   const sessionsByName = new Map();
   for (const session of voiceSessions.values()) { if (!sessionsByName.has(session.name)) sessionsByName.set(session.name, []); sessionsByName.get(session.name).push(session); }
@@ -613,6 +625,12 @@ app.get('/api/voice/sessions', (_req, res) => {
     }
   }
   return ok(res, { sessions });
+});
+app.get('/api/voice/media-logs', (_req, res) => {
+  try {
+    const lines = fs.existsSync(MEDIA_LOG_FILE) ? fs.readFileSync(MEDIA_LOG_FILE, 'utf8').trim().split('\n').filter(Boolean).slice(-200).map((line) => JSON.parse(line)) : [];
+    return ok(res, { logs: lines });
+  } catch (error) { return fail(res, new Error(`Unable to read media logs: ${error.message}`), 500); }
 });
 app.get('/api/voice/target-accounts', (req, res) => {
   const guildId = String(req.query?.guildId || '').trim();
@@ -670,6 +688,8 @@ app.post('/api/voice/state', async (req, res) => {
   for (const value of [selfMute, selfDeaf, selfVideo, selfStream]) if (value !== undefined && typeof value !== 'boolean') return fail(res, new Error('Voice state values must be boolean'), 400);
   if (selfDeaf === true && (selfVideo === true || selfStream === true)) return fail(res, new Error('Video or screen share cannot be enabled while deafened'), 400);
   const results = await mapWithConcurrency(accounts, 8, (name) => withAccountLock(name, async () => {
+    const operationStartedAt = Date.now();
+    const mediaKind = selfStream !== undefined ? 'stream' : selfVideo !== undefined ? 'camera' : 'voice-state';
     const client = getClient(name);
     const current = voiceSessions.get(sessionKey(name, guildId));
     if (!client) return { name, ok: false, error: 'Account is not connected' };
@@ -688,7 +708,9 @@ app.post('/api/voice/state', async (req, res) => {
       result = await sendVoiceOpConfirmed(client, guildId, current.channelId, next, 9000);
     }
     if (result.ok) { const actual = readGatewayVoiceState(client, guildId); Object.assign(current, actual || {}, next, { selfStream: !!next.selfStream, selfVideo: !!next.selfVideo, updatedAt: Date.now() }); persistSessions(); }
-    return { name, ok: result.ok, error: result.ok ? null : result.error };
+    const output = { name, ok: result.ok, error: result.ok ? null : result.error };
+    logMediaEvent(result.ok ? 'info' : 'error', `${mediaKind}.${result.ok ? 'confirmed' : 'failed'}`, { account: name, guildId, channelId: current.channelId, durationMs: Date.now() - operationStartedAt, error: output.error || undefined });
+    return output;
   }));
   emitLive('operation.completed', { operation: 'state', results, summary: summary(results) });
   return ok(res, { results, summary: summary(results) });
