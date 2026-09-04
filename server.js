@@ -24,6 +24,8 @@ const rotations = new Map();
 const stateCycles = new Map();
 const syntheticStreams = new Map();
 const liveEvents = new EventEmitter();
+liveEvents.setMaxListeners(0);
+const accountLocks = new Map();
 const SYNTHETIC_VIDEO_FILE = path.join(DATA_DIR, 'synthetic-stream.mp4');
 
 function ok(res, payload = {}) { return res.json({ success: true, ...payload }); }
@@ -31,8 +33,9 @@ function emitLive(type, payload = {}) { liveEvents.emit('event', { type, at: Dat
 function accountHealth(name, entry) {
   const client = entry?.client;
   const status = client?.ws?.status;
-  const ready = status === undefined || status === 0;
-  return { name, state: ready ? 'healthy' : 'degraded', gatewayStatus: status ?? null, username: client?.user?.tag || client?.user?.username || name, lastError: entry?.lastError || null, connectedAt: entry?.connectedAt || null, lastSeenAt: entry?.lastSeenAt || null };
+  const ready = status === 0;
+  const state = ready ? 'healthy' : status == null ? 'unknown' : 'degraded';
+  return { name, state, gatewayStatus: status ?? null, username: client?.user?.tag || client?.user?.username || name, lastError: entry?.lastError || null, connectedAt: entry?.connectedAt || null, lastSeenAt: entry?.lastSeenAt || null };
 }
 function fail(res, error, status = 200) {
   const message = error?.message || String(error || 'Unknown error');
@@ -41,11 +44,17 @@ function fail(res, error, status = 200) {
 function sessionKey(name, guildId) { return `${name}__${guildId}`; }
 function cleanAccounts(accounts) {
   const values = Array.isArray(accounts) ? accounts : [accounts];
-  return [...new Set(values.map((value) => String(value || '').trim()).filter(Boolean))];
+  return [...new Set(values.map((value) => String(value || '').trim()).filter(Boolean))].slice(0, 500);
 }
 function cleanChannelIds(channelIds) {
   if (!Array.isArray(channelIds)) return [];
-  return [...new Set(channelIds.map((value) => String(value || '').trim()).filter(Boolean))];
+  return [...new Set(channelIds.map((value) => String(value || '').trim()).filter(Boolean))].slice(0, 500);
+}
+async function mapWithConcurrency(items, limit, worker) {
+  const results = new Array(items.length); let cursor = 0;
+  const run = async () => { while (true) { const index = cursor++; if (index >= items.length) return; results[index] = await worker(items[index], index); } };
+  await Promise.all(Array.from({ length: Math.min(Math.max(1, limit), items.length) }, run));
+  return results;
 }
 function summary(results) {
   const okCount = results.filter((item) => item.ok).length;
@@ -108,6 +117,26 @@ async function startSyntheticStream(name, guildId) {
   } catch (error) {
     stopSyntheticStream(name);
     return { ok: false, error: error?.message || 'Unable to start synthetic stream' };
+  }
+}
+async function withAccountLock(name, operation) {
+  const key = String(name);
+  const previous = accountLocks.get(key) || Promise.resolve();
+  let release;
+  const current = new Promise((resolve) => { release = resolve; });
+  accountLocks.set(key, current);
+  await previous.catch(() => {});
+  try { return await operation(); }
+  finally { release(); if (accountLocks.get(key) === current) accountLocks.delete(key); }
+}
+function stopTasksForAccount(name) {
+  for (const [id, task] of rotations.entries()) {
+    task.accounts = task.accounts.filter((item) => item !== name);
+    if (!task.accounts.length) { clearInterval(task.timer); rotations.delete(id); emitLive('task.stopped', { id, reason: 'no accounts remaining' }); }
+  }
+  for (const [id, task] of stateCycles.entries()) {
+    task.accounts = task.accounts.filter((item) => item !== name);
+    if (!task.accounts.length) { clearInterval(task.timer); stateCycles.delete(id); emitLive('task.stopped', { id, reason: 'no accounts remaining' }); }
   }
 }
 function getClient(name) {
@@ -217,8 +246,8 @@ function validateTarget(client, guildId, channelId) {
   return { ok: true, guild, channel };
 }
 function readGatewayVoiceState(client, guildId) {
-  const state = client?.voiceStates?.cache?.get?.(client.user?.id)
-    || client?.guilds?.cache?.get?.(guildId)?.voiceStates?.cache?.get?.(client.user?.id);
+  const state = client?.guilds?.cache?.get?.(guildId)?.voiceStates?.cache?.get?.(client.user?.id)
+    || client?.voiceStates?.cache?.get?.(client.user?.id);
   if (!state || String(state.guild?.id || state.guildId || guildId) !== String(guildId)) return null;
   return {
     channelId: state.channelId ?? state.channel_id ?? null,
@@ -248,16 +277,19 @@ function removeSessionsForAccount(name, guildId) {
   emitLive('session.removed', { name, guildId });
 }
 async function moveAccount(name, guildId, channelId, opts = {}) {
-  const client = getClient(name);
-  if (!client) return { name, ok: false, error: 'Account is not connected' };
-  const target = validateTarget(client, guildId, channelId);
-  if (!target.ok) return { name, ok: false, error: target.error };
-  const result = await sendVoiceOpConfirmed(client, guildId, channelId, opts);
-  if (result.ok) {
-    const actual = readGatewayVoiceState(client, guildId);
-    upsertSession(name, guildId, channelId, { ...opts, ...(actual || {}) });
-  }
-  return { name, ok: result.ok, error: result.ok ? null : result.error, channelId };
+  return withAccountLock(name, async () => {
+    const client = getClient(name);
+    if (!client) return { name, ok: false, error: 'Account is not connected' };
+    const target = validateTarget(client, guildId, channelId);
+    if (!target.ok) return { name, ok: false, error: target.error };
+    const result = await sendVoiceOpConfirmed(client, guildId, channelId, opts);
+    if (result.ok) {
+      for (const key of [...voiceSessions.keys()]) if (key.startsWith(`${name}__`) && key !== sessionKey(name, guildId)) voiceSessions.delete(key);
+      const actual = readGatewayVoiceState(client, guildId);
+      upsertSession(name, guildId, channelId, { ...opts, ...(actual || {}) });
+    }
+    return { name, ok: result.ok, error: result.ok ? null : result.error, channelId };
+  });
 }
 
 async function connectOne(token, name) {
@@ -267,11 +299,18 @@ async function connectOne(token, name) {
   await client.login(token.trim());
   if (!finalName) finalName = String(client.user?.globalName || client.user?.username || `account-${clients.size + 1}`).trim().slice(0, 48);
   if (clients.has(finalName)) {
+    stopTasksForAccount(finalName);
+    stopSyntheticStream(finalName);
     try { await clients.get(finalName).client.destroy(); } catch {}
     clients.delete(finalName);
   }
-  clients.set(finalName, { client, token: token.trim(), connectedAt: Date.now(), lastSeenAt: Date.now(), lastError: null });
-  emitLive('account.connected', { account: accountHealth(finalName, clients.get(finalName)) });
+  const entry = { client, token: token.trim(), connectedAt: Date.now(), lastSeenAt: Date.now(), lastError: null };
+  clients.set(finalName, entry);
+  const markError = (error) => { entry.lastError = error?.message || String(error || 'Unknown Discord client error'); entry.lastSeenAt = Date.now(); emitLive('account.health.changed', { account: accountHealth(finalName, entry) }); };
+  client.on?.('error', markError);
+  client.on?.('ready', () => { entry.lastError = null; entry.lastSeenAt = Date.now(); emitLive('account.health.changed', { account: accountHealth(finalName, entry) }); });
+  client.on?.('disconnect', () => { entry.lastSeenAt = Date.now(); emitLive('account.health.changed', { account: accountHealth(finalName, entry) }); });
+  emitLive('account.connected', { account: accountHealth(finalName, entry) });
 
   // Restore only the channel state; media capture remains browser-owned and must be
   // explicitly re-enabled by the user after reconnecting.
@@ -294,7 +333,6 @@ async function connectOne(token, name) {
 app.get('/api/health', (_req, res) => ok(res, { service: 'voice-studio', connected: clients.size, accounts: [...clients.entries()].map(([name, entry]) => accountHealth(name, entry)) }));
 const healthTimer = setInterval(() => {
   for (const [name, entry] of clients.entries()) {
-    entry.lastSeenAt = Date.now();
     emitLive('health.updated', { account: accountHealth(name, entry) });
   }
 }, 10000);
@@ -307,10 +345,11 @@ app.get('/api/events', (req, res) => {
   req.on('close', () => { clearInterval(heartbeat); liveEvents.off('event', send); });
 });
 app.get('/api/accounts/health', (_req, res) => ok(res, { accounts: [...clients.entries()].map(([name, entry]) => accountHealth(name, entry)) }));
-app.get('/api/discord/clients', (_req, res) => ok(res, {
-  clients: [...clients.entries()].map(([name, entry]) => {
+app.get('/api/discord/clients', (_req, res) => {
+  const sessionByName = new Map([...voiceSessions.values()].map((session) => [session.name, session]));
+  return ok(res, { clients: [...clients.entries()].map(([name, entry]) => {
     const user = entry.client.user;
-    const voice = [...voiceSessions.values()].find((session) => session.name === name) || null;
+    const voice = sessionByName.get(name) || null;
     const guild = voice ? entry.client.guilds?.cache?.get?.(voice.guildId) : null;
     const member = guild?.members?.cache?.get?.(user?.id);
     const channel = voice ? guild?.channels?.cache?.get?.(voice.channelId) : null;
@@ -325,8 +364,8 @@ app.get('/api/discord/clients', (_req, res) => ok(res, {
       health: accountHealth(name, entry),
       voice: voice ? { guildId: voice.guildId, guildName: guild?.name || voice.guildId, channelId: voice.channelId, channelName: channel?.name || voice.channelId, selfMute: !!voice.selfMute, selfDeaf: !!voice.selfDeaf, selfVideo: !!voice.selfVideo, selfStream: !!voice.selfStream } : null,
     };
-  }),
-}));
+  }) });
+});
 app.post('/api/discord/connect', async (req, res) => {
   try { return ok(res, await connectOne(req.body?.token, req.body?.name)); }
   catch (error) { return fail(res, error, 400); }
@@ -355,6 +394,7 @@ app.post('/api/discord/disconnect', async (req, res) => {
   const name = String(req.body?.name || [...clients.keys()][0] || '');
   const entry = clients.get(name);
   if (!entry) return ok(res);
+  stopTasksForAccount(name);
   stopSyntheticStream(name);
   try { await entry.client.destroy(); } catch {}
   clients.delete(name);
@@ -362,7 +402,7 @@ app.post('/api/discord/disconnect', async (req, res) => {
   return ok(res, { name });
 });
 app.post('/api/discord/disconnect-all', async (_req, res) => {
-  for (const name of clients.keys()) stopSyntheticStream(name);
+  for (const name of clients.keys()) { stopTasksForAccount(name); stopSyntheticStream(name); }
   for (const entry of clients.values()) { try { await entry.client.destroy(); } catch {} }
   clients.clear();
   emitLive('account.disconnected-all');
@@ -394,8 +434,10 @@ app.get('/api/voice/guilds', (req, res) => {
 });
 app.get('/api/voice/sessions', (_req, res) => {
   const sessions = [];
+  const sessionsByName = new Map();
+  for (const session of voiceSessions.values()) { if (!sessionsByName.has(session.name)) sessionsByName.set(session.name, []); sessionsByName.get(session.name).push(session); }
   for (const [name, entry] of clients.entries()) {
-    for (const session of [...voiceSessions.values()].filter((item) => item.name === name)) {
+    for (const session of (sessionsByName.get(name) || [])) {
       const actual = readGatewayVoiceState(entry.client, session.guildId);
       if (actual && !actual.channelId) { removeSessionsForAccount(name, session.guildId); continue; }
       const guild = entry.client.guilds?.cache?.get?.(session.guildId);
@@ -433,7 +475,7 @@ app.post('/api/voice/join', async (req, res) => {
   const { guildId, channelId, selfMute = false, selfDeaf = false } = req.body || {};
   if (!accounts.length || !guildId || !channelId) return fail(res, new Error('accounts, guildId and channelId are required'), 400);
   if (typeof selfMute !== 'boolean' || typeof selfDeaf !== 'boolean') return fail(res, new Error('Mute values must be boolean'), 400);
-  const results = await Promise.all(accounts.map((name) => moveAccount(name, guildId, channelId, { selfMute, selfDeaf })));
+  const results = await mapWithConcurrency(accounts, 8, (name) => moveAccount(name, guildId, channelId, { selfMute, selfDeaf }));
   emitLive('operation.completed', { operation: 'join', results, summary: summary(results) });
   return ok(res, { results, summary: summary(results) });
 });
@@ -441,9 +483,10 @@ app.post('/api/voice/leave', async (req, res) => {
   const accounts = cleanAccounts(req.body?.accounts);
   const guildId = String(req.body?.guildId || '');
   if (!accounts.length || !guildId) return fail(res, new Error('accounts and guildId are required'), 400);
-  const results = await Promise.all(accounts.map(async (name) => {
+  const results = await mapWithConcurrency(accounts, 8, (name) => withAccountLock(name, async () => {
     const client = getClient(name);
     if (!client) return { name, ok: false, error: 'Account is not connected' };
+    stopTasksForAccount(name);
     stopSyntheticStream(name);
     const result = await sendVoiceOpConfirmed(client, guildId, null, {}, 5000);
     if (result.ok) removeSessionsForAccount(name, guildId);
@@ -458,7 +501,7 @@ app.post('/api/voice/state', async (req, res) => {
   if (!accounts.length || !guildId) return fail(res, new Error('accounts and guildId are required'), 400);
   for (const value of [selfMute, selfDeaf, selfVideo, selfStream]) if (value !== undefined && typeof value !== 'boolean') return fail(res, new Error('Voice state values must be boolean'), 400);
   if (selfDeaf === true && (selfVideo === true || selfStream === true)) return fail(res, new Error('Video or screen share cannot be enabled while deafened'), 400);
-  const results = await Promise.all(accounts.map(async (name) => {
+  const results = await mapWithConcurrency(accounts, 8, (name) => withAccountLock(name, async () => {
     const client = getClient(name);
     const current = voiceSessions.get(sessionKey(name, guildId));
     if (!client) return { name, ok: false, error: 'Account is not connected' };
@@ -486,7 +529,7 @@ app.post('/api/voice/join-all', async (req, res) => {
   const { guildId, channelId, selfMute = false, selfDeaf = false } = req.body || {};
   const accounts = [...clients.keys()];
   if (!guildId || !channelId) return fail(res, new Error('guildId and channelId are required'), 400);
-  const results = await Promise.all(accounts.map((name) => moveAccount(name, guildId, channelId, { selfMute, selfDeaf })));
+  const results = await mapWithConcurrency(accounts, 8, (name) => moveAccount(name, guildId, channelId, { selfMute, selfDeaf }));
   emitLive('operation.completed', { operation: 'join-all', results, summary: summary(results) });
   return ok(res, { results, summary: summary(results) });
 });
@@ -495,7 +538,7 @@ app.post('/api/voice/distribute-random', async (req, res) => {
   const { guildId, channelIds } = req.body || {};
   if (!guildId || !Array.isArray(channelIds) || !channelIds.length) return fail(res, new Error('guildId and channelIds are required'), 400);
   const shuffled = [...channelIds].sort(() => Math.random() - 0.5);
-  const results = await Promise.all(accounts.map((name, index) => moveAccount(name, guildId, shuffled[index % shuffled.length])));
+  const results = await mapWithConcurrency(accounts, 8, (name, index) => moveAccount(name, guildId, shuffled[index % shuffled.length]));
   emitLive('operation.completed', { operation: 'distribute-random', results, summary: summary(results) });
   return ok(res, { results, summary: summary(results) });
 });
@@ -561,7 +604,7 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
     const state = task.states[task.currentIdx];
     try {
       task.lastResults = [];
-      await Promise.all(task.accounts.map(async (name) => {
+      await Promise.all(task.accounts.map((name) => withAccountLock(name, async () => {
         const current = voiceSessions.get(sessionKey(name, task.guildId));
         if (!current) return;
         const client = getClient(name);
@@ -576,7 +619,7 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
         }
         if (result.ok) { Object.assign(current, next, { selfStream: !!next.selfStream, updatedAt: Date.now() }); persistSessions(); }
         task.lastResults.push({ name, ok: result.ok, error: result.ok ? null : result.error });
-      }));
+      })));
       task.nextAt = Date.now() + task.intervalMs;
     } finally { task.running = false; }
   }, delay);

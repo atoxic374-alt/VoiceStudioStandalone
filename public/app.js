@@ -15,6 +15,7 @@ const state = {
   busy: new Set(),
   overviewFilter: '', overviewSort: 'account',
   lastOperation: null,
+  refreshPromise: null, liveEvents: null, liveRefreshTimer: null,
 };
 
 const api = async (url, options = {}) => {
@@ -247,7 +248,7 @@ function renderProfiles(clients = []) {
     const voice = client.voice;
     const avatar = client.avatar ? `<img src="${escapeHTML(client.avatar)}" alt="" />` : escapeHTML((client.nickname || client.name || '?')[0].toUpperCase());
     const voiceText = voice ? `${escapeHTML(voice.guildName || voice.guildId)} · ${escapeHTML(voice.channelName || voice.channelId)}` : 'Not in a room';
-    const flags = voice ? `${voice.selfMute ? 'Mute' : 'Unmute'}${voice.selfDeaf ? ' · Deafen' : ''}${voice.selfVideo ? ' · Video' : ''}${voice.selfStream ? ' · Stream' : ''}` : 'Offline'; const health = client.health || {}; const healthText = health.state === 'healthy' ? 'Healthy' : `Degraded${health.lastError ? ` · ${health.lastError}` : ''}`;
+    const flags = voice ? `${voice.selfMute ? 'Mute' : 'Unmute'}${voice.selfDeaf ? ' · Deafen' : ''}${voice.selfVideo ? ' · Video' : ''}${voice.selfStream ? ' · Stream' : ''}` : 'Offline'; const health = client.health || {}; const healthText = health.state === 'healthy' ? 'Healthy' : health.state === 'degraded' ? `Degraded${health.lastError ? ` · ${health.lastError}` : ''}` : 'Unknown';
     return `<div class="profile-row"><span class="profile-row-avatar">${avatar}</span><div class="profile-row-main"><strong>${escapeHTML(client.nickname || client.displayName || client.name)}</strong><small>@${escapeHTML(client.username || client.name)} · ID: ${escapeHTML(client.id || '—')} · <span class="health-${escapeHTML(health.state || 'unknown')}">${escapeHTML(healthText)}</span></small></div><div class="profile-row-voice"><span class="profile-online"></span><strong>${voiceText}</strong><small>${flags}</small></div><button class="profile-leave" type="button" data-profile-leave="${escapeHTML(client.name)}" data-profile-guild="${escapeHTML(voice?.guildId || '')}" ${voice ? '' : 'disabled'}>Leave</button></div>`;
   }).join('');
   list.querySelectorAll('[data-profile-leave]').forEach((button) => button.addEventListener('click', () => quickLeave(button.dataset.profileLeave, button.dataset.profileGuild)));
@@ -348,7 +349,7 @@ function renderSessions(sessions = []) {
   const visibleSessions = sessions.filter((session) => !query || [session.name, session.guildName, session.channelName].some((value) => String(value || '').toLocaleLowerCase().includes(query))).sort((a,b) => { if (state.overviewSort === 'server') return String(a.guildName || '').localeCompare(String(b.guildName || '')); if (state.overviewSort === 'members') return Number(b.memberCount || 0) - Number(a.memberCount || 0); return String(a.name || '').localeCompare(String(b.name || '')); });
   $('#navSessionCount').textContent = String(sessions.length);
   const list = $('#sessionsList');
-  const healthy = state.clients.filter((client) => client.health?.state === 'healthy').length; const degraded = state.clients.length - healthy; $('#healthSummary').innerHTML = `<span class="health-pill healthy">${healthy} healthy</span><span class="health-pill degraded">${degraded} degraded</span><span class="health-pill">${state.clients.length} total</span>`;
+  const healthy = state.clients.filter((client) => client.health?.state === 'healthy').length; const degraded = state.clients.filter((client) => client.health?.state === 'degraded').length; const unknown = state.clients.length - healthy - degraded; $('#healthSummary').innerHTML = `<span class="health-pill healthy">${healthy} healthy</span><span class="health-pill degraded">${degraded} degraded</span><span class="health-pill">${unknown} unknown</span><span class="health-pill">${state.clients.length} total</span>`;
   if (!visibleSessions.length) {
     list.innerHTML = '<div class="empty-state"><span class="empty-pulse"></span><p>لا توجد جلسات نشطة الآن</p><small>عند الدخول إلى غرفة ستظهر تفاصيلها هنا.</small></div>';
     return;
@@ -357,14 +358,19 @@ function renderSessions(sessions = []) {
   list.querySelectorAll('[data-leave-name]').forEach((button) => button.addEventListener('click', () => quickLeave(button.dataset.leaveName, button.dataset.leaveGuild)));
 }
 async function refreshSessions() {
-  try {
-    const data = await api('/api/voice/sessions');
-    renderSessions(data.sessions || []);
-    const clients = await api('/api/discord/clients');
-    state.clients = clients.clients || state.clients;
-    renderProfiles(state.clients);
-    await loadTasks();
-  } catch (error) { console.warn('[voice] sessions refresh failed', error); }
+  if (state.refreshPromise) return state.refreshPromise;
+  state.refreshPromise = (async () => {
+    try {
+      const clients = await api('/api/discord/clients');
+      state.clients = clients.clients || state.clients;
+      renderProfiles(state.clients);
+      const data = await api('/api/voice/sessions');
+      renderSessions(data.sessions || []);
+      await loadTasks();
+    } catch (error) { console.warn('[voice] sessions refresh failed', error); }
+    finally { state.refreshPromise = null; }
+  })();
+  return state.refreshPromise;
 }
 async function loadTasks() {
   try {
@@ -505,7 +511,8 @@ function renderFullActivity(page = 0) { const filter = $('#activityAccountFilter
 function initActivity() { $('#activityExpandButton')?.addEventListener('click', () => { const filter = $('#activityAccountFilter'); filter.innerHTML = '<option value="">All accounts</option>' + state.clients.map((client) => `<option value="${escapeHTML(client.name)}">${escapeHTML(client.nickname || client.name)}</option>`).join(''); $('#activityModal').hidden = false; renderFullActivity(0); }); $('#activityAccountFilter')?.addEventListener('change', () => renderFullActivity(0)); $('#activityCloseButton')?.addEventListener('click', () => { $('#activityModal').hidden = true; }); $('#activityPrevButton')?.addEventListener('click', () => renderFullActivity(state.activityPage - 1)); $('#activityNextButton')?.addEventListener('click', () => renderFullActivity(state.activityPage + 1)); }
 function openLeaveAll() { const active = state.clients.filter((client) => client.voice); const list = $('#leaveAccountList'); list.innerHTML = active.length ? active.map((client) => `<label class="account-target"><input type="checkbox" value="${escapeHTML(client.name)}" data-leave-guild="${escapeHTML(client.voice.guildId)}" checked /><span class="target-avatar">${client.avatar ? `<img src="${escapeHTML(client.avatar)}" alt="" />` : escapeHTML((client.nickname || '?')[0])}</span><span class="target-copy"><strong>${escapeHTML(client.nickname || client.name)}</strong><small>${escapeHTML(client.voice.guildName || client.voice.guildId)} · ${escapeHTML(client.voice.channelName || client.voice.channelId)}</small></span></label>`).join('') : '<div class="task-empty">No connected account is currently in voice</div>'; $('#leaveModal').hidden = false; }
 async function leaveAllSelected() { const selected = [...document.querySelectorAll('#leaveAccountList input:checked')].map((input) => ({ name: input.value, guildId: input.dataset.leaveGuild })); if (!selected.length) { toast('اختر حسابًا واحدًا على الأقل', 'error'); return; } const groups = new Map(); selected.forEach((item) => { if (!groups.has(item.guildId)) groups.set(item.guildId, []); groups.get(item.guildId).push(item.name); }); $('#leaveModal').hidden = true; try { for (const [guildId, accounts] of groups) await post('/api/voice/leave', { accounts, guildId });   addActivity('خروج جماعي', `${selected.length} حساب`, 'success'); toast(`تم إخراج ${selected.length} حساب`, 'success'); await refreshSessions(); } catch (error) { toast(error.message, 'error'); } }
-function connectLiveEvents() { if (!window.EventSource) return; const events = new EventSource('/api/events'); events.onmessage = (message) => { try { const event = JSON.parse(message.data); if (event.type === 'operation.completed' && event.summary?.failed) toast(`${event.operation}: ${event.summary.failed} failed`, 'error'); if (event.type?.startsWith('account.')) loadClients().catch(() => {}); else refreshSessions().catch(() => {}); } catch {} }; events.onerror = () => { events.close(); setTimeout(connectLiveEvents, 5000); }; }
+function scheduleLiveRefresh() { clearTimeout(state.liveRefreshTimer); state.liveRefreshTimer = setTimeout(() => refreshSessions().catch(() => {}), 180); }
+function connectLiveEvents() { if (!window.EventSource || state.liveEvents) return; const events = new EventSource('/api/events'); state.liveEvents = events; events.onmessage = (message) => { try { const event = JSON.parse(message.data); if (event.type === 'operation.completed' && event.summary?.failed) toast(`${event.operation}: ${event.summary.failed} failed`, 'error'); scheduleLiveRefresh(); } catch {} }; events.onerror = () => { events.close(); state.liveEvents = null; setTimeout(connectLiveEvents, 5000); }; }
 function initTheme() {
   const saved = localStorage.getItem('voice-theme');
   if (saved === 'light') document.body.classList.add('light-theme');

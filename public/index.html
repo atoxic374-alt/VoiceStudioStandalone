@@ -24,7 +24,6 @@
         <button class="side-nav-item" type="button" data-section="accounts"><span class="nav-glyph">◎</span><span>Accounts</span><span id="navAccountCount" class="nav-count">0</span></button>
         <button class="side-nav-item" type="button" data-section="voice"><span class="nav-glyph">♫</span><span>Voice</span></button>
         <button class="side-nav-item" type="button" data-section="automation"><span class="nav-glyph">↻</span><span>Automation</span></button>
-        <button class="side-nav-item" type="button" data-section="voice"><span class="nav-glyph">◉</span><span>Media</span></button>
         <button class="side-nav-item" type="button" data-section="activity"><span class="nav-glyph">≋</span><span>Activity</span><span id="navSessionCount" class="nav-count">0</span></button>
       </nav>
       <div class="sidebar-footer">
@@ -48,7 +47,7 @@
           <div>
             <div class="eyebrow"><span class="eyebrow-line"></span> VOICE CONTROL CENTER</div>
             <h1>Voice Control</h1>
-            <p>Manage connected accounts, voice rooms, automation, and media.</p>
+            <p>Manage connected accounts, voice rooms, and automation.</p>
           </div>
           <div class="hero-signal" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
         </section>
@@ -129,6 +128,7 @@
   <div id="operationModal" class="operation-modal" hidden><div class="operation-dialog" role="dialog" aria-modal="true" aria-labelledby="operationTitle"><div class="operation-head"><div class="operation-loader"></div><div><strong id="operationTitle">Processing</strong><small id="operationSubtitle">Please wait…</small></div></div><div id="operationAccounts" class="operation-accounts"></div><div id="operationResult" class="operation-result"></div><button id="operationClose" class="ghost-button" type="button" hidden>Close</button></div></div>
   <div id="toastRegion" class="toast-region" aria-live="polite" aria-atomic="true"></div>
   <script type="module" src="/app.js"></script>
-<div id="leaveModal" class="operation-modal" hidden><div class="operation-dialog" role="dialog" aria-modal="true"><div class="operation-head"><div><strong>Leave connected accounts</strong><small>Select only accounts currently in a voice room</small></div></div><div id="leaveAccountList" class="profiles-list leave-account-list"></div><div class="setup-actions"><button id="confirmLeaveButton" class="action-button action-danger" type="button">Leave selected</button><button id="cancelLeaveButton" class="ghost-button" type="button">Cancel</button></div></div></div>\n<div id="activityModal" class="operation-modal" hidden><div class="operation-dialog activity-dialog" role="dialog" aria-modal="true"><div class="operation-head"><div><strong>Full activity log</strong><small>All recorded actions, newest first</small></div></div><select id="activityAccountFilter" class="automation-guild"><option value="">All accounts</option></select><div id="fullActivityList" class="activity-list full-activity-list"></div><div class="activity-pagination"><button id="activityPrevButton" class="ghost-button" type="button">Previous</button><span id="activityPageLabel"></span><button id="activityNextButton" class="ghost-button" type="button">Next</button></div><button id="activityCloseButton" class="ghost-button" type="button">Close</button></div></div>
+<div id="leaveModal" class="operation-modal" hidden><div class="operation-dialog" role="dialog" aria-modal="true"><div class="operation-head"><div><strong>Leave connected accounts</strong><small>Select only accounts currently in a voice room</small></div></div><div id="leaveAccountList" class="profiles-list leave-account-list"></div><div class="setup-actions"><button id="confirmLeaveButton" class="action-button action-danger" type="button">Leave selected</button><button id="cancelLeaveButton" class="ghost-button" type="button">Cancel</button></div></div></div>
+<div id="activityModal" class="operation-modal" hidden><div class="operation-dialog activity-dialog" role="dialog" aria-modal="true"><div class="operation-head"><div><strong>Full activity log</strong><small>All recorded actions, newest first</small></div></div><select id="activityAccountFilter" class="automation-guild"><option value="">All accounts</option></select><div id="fullActivityList" class="activity-list full-activity-list"></div><div class="activity-pagination"><button id="activityPrevButton" class="ghost-button" type="button">Previous</button><span id="activityPageLabel"></span><button id="activityNextButton" class="ghost-button" type="button">Next</button></div><button id="activityCloseButton" class="ghost-button" type="button">Close</button></div></div>
 </body>
 </html>
