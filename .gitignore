@@ -4,6 +4,7 @@ node_modules/
 !.env.example
 *.log
 data/*.json
+data/*.enc
 data/*.tmp
 data/*.mp4
 data/*.webm

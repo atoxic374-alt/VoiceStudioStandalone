@@ -10,6 +10,7 @@ const AUTH_COOKIE = 'voice_studio_auth';
 const CLIENT_DEVICE_COOKIE = 'voice_studio_client_device';
 const AUTH_TTL_MS = 12 * 60 * 60 * 1000;
 const AUTH_ENABLED = Boolean(process.env.APP_PASSWORD || process.env.NODE_ENV === 'production');
+const ACCOUNT_FILE = path.join(__dirname, 'data', 'accounts.enc');
 
 const app = express();
 const PORT = Number(process.env.PORT || 5050);
@@ -17,6 +18,38 @@ const DATA_DIR = path.join(__dirname, 'data');
 const VOICE_STATE_FILE = path.join(DATA_DIR, 'voice-sessions.json');
 const CLIENT_BIND_FILE = path.join(DATA_DIR, 'client-binding.json');
 fs.mkdirSync(DATA_DIR, { recursive: true });
+
+// Account tokens are persisted only as an authenticated AES-256-GCM payload.
+// Set DATA_ENCRYPTION_KEY in production to keep this storage independent from
+// the login password; APP_PASSWORD is retained as a backwards-compatible fallback.
+function persistenceKey() { return crypto.createHash('sha256').update(String(process.env.DATA_ENCRYPTION_KEY || process.env.APP_PASSWORD || 'voice-studio-local-storage')).digest(); }
+function saveAccounts(records) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', persistenceKey(), iv);
+  const encrypted = Buffer.concat([cipher.update(JSON.stringify(records), 'utf8'), cipher.final()]);
+  const payload = JSON.stringify({ version: 1, iv: iv.toString('base64url'), tag: cipher.getAuthTag().toString('base64url'), data: encrypted.toString('base64url') });
+  const temp = `${ACCOUNT_FILE}.tmp`;
+  fs.writeFileSync(temp, payload, { mode: 0o600 });
+  fs.renameSync(temp, ACCOUNT_FILE);
+  try { fs.chmodSync(ACCOUNT_FILE, 0o600); } catch {}
+}
+function loadAccounts() {
+  try {
+    const payload = JSON.parse(fs.readFileSync(ACCOUNT_FILE, 'utf8'));
+    const decipher = crypto.createDecipheriv('aes-256-gcm', persistenceKey(), Buffer.from(payload.iv, 'base64url'));
+    decipher.setAuthTag(Buffer.from(payload.tag, 'base64url'));
+    const plain = Buffer.concat([decipher.update(Buffer.from(payload.data, 'base64url')), decipher.final()]);
+    const records = JSON.parse(plain.toString('utf8'));
+    return Array.isArray(records) ? records.filter((item) => item?.name && item?.token) : [];
+  } catch (error) {
+    if (fs.existsSync(ACCOUNT_FILE)) console.warn('[accounts] saved accounts could not be restored:', error.message);
+    return [];
+  }
+}
+function persistConnectedAccounts() {
+  try { saveAccounts([...clients.entries()].map(([name, entry]) => ({ name, token: entry.token, savedAt: entry.savedAt || Date.now() })).filter((item) => item.token)); }
+  catch (error) { console.warn('[accounts] unable to persist encrypted account file:', error.message); }
+}
 
 app.set('trust proxy', 1);
 app.use(helmet({
@@ -335,8 +368,9 @@ async function connectOne(token, name) {
     try { await clients.get(finalName).client.destroy(); } catch {}
     clients.delete(finalName);
   }
-  const entry = { client, connectedAt: Date.now(), lastSeenAt: Date.now(), lastError: null };
+  const entry = { client, token: token.trim(), savedAt: Date.now(), connectedAt: Date.now(), lastSeenAt: Date.now(), lastError: null };
   clients.set(finalName, entry);
+  persistConnectedAccounts();
   const markError = (error) => { entry.lastError = redact(error?.message || String(error || 'Unknown Discord client error')); entry.lastSeenAt = Date.now(); emitLive('account.health.changed', { account: accountHealth(finalName, entry) }); };
   client.on?.('error', markError);
   client.on?.('ready', () => { entry.lastError = null; entry.lastSeenAt = Date.now(); emitLive('account.health.changed', { account: accountHealth(finalName, entry) }); });
@@ -488,6 +522,7 @@ app.post('/api/discord/disconnect', async (req, res) => {
   stopSyntheticStream(name);
   try { await entry.client.destroy(); } catch {}
   clients.delete(name);
+  persistConnectedAccounts();
   emitLive('account.disconnected', { name });
   return ok(res, { name });
 });
@@ -495,6 +530,7 @@ app.post('/api/discord/disconnect-all', async (_req, res) => {
   for (const name of clients.keys()) { stopTasksForAccount(name); stopSyntheticStream(name); }
   for (const entry of clients.values()) { try { await entry.client.destroy(); } catch {} }
   clients.clear();
+  persistConnectedAccounts();
   emitLive('account.disconnected-all');
   return ok(res);
 });
@@ -723,10 +759,18 @@ app.post('/api/voice/state-cycle/stop', (req, res) => {
   clearInterval(task.timer); stateCycles.delete(id); return ok(res);
 });
 
+async function restoreSavedAccounts() {
+  const saved = loadAccounts();
+  if (!saved.length) return;
+  console.log(`[accounts] restoring ${saved.length} saved account${saved.length === 1 ? '' : 's'}`);
+  for (const account of saved) {
+    try { await connectOne(account.token, account.name); }
+    catch (error) { console.warn(`[accounts] unable to restore ${account.name}:`, redact(error.message)); }
+  }
+}
 app.get('/{*splat}', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
-
 if (require.main === module) {
-  app.listen(PORT, '0.0.0.0', () => console.log(`Voice Studio listening on http://localhost:${PORT}`));
+  app.listen(PORT, '0.0.0.0', () => { console.log(`Voice Studio listening on http://localhost:${PORT}`); restoreSavedAccounts().catch((error) => console.warn('[accounts] restore failed:', error.message)); });
 }
 
-module.exports = { app, clients, voiceSessions, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo };
+module.exports = { app, clients, voiceSessions, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, saveAccounts, loadAccounts };

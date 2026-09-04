@@ -4,7 +4,7 @@ Voice Studio is a single-purpose dashboard extracted from the original Discord A
 
 ## What changed
 
-The extracted app has its own Express server, browser UI, in-memory account pool, persisted voice-session metadata, and focused test suite. The interface was rebuilt as a personal control room with a glass-card layout, subtle animated signal bars, animated media stage, responsive mobile layout, dark/light theme support, and Arabic/English direction switching. The browser media flow now uses the real `getUserMedia` and `getDisplayMedia` APIs, binds the stream to a muted inline video preview, handles the browser's native track-ended event, and always stops tracks during source changes and page unload.
+The extracted app has its own Express server, browser UI, encrypted persistent account store, persisted voice-session metadata, and focused test suite. The interface was rebuilt as a personal control room with a glass-card layout, subtle animated signal bars, animated media stage, responsive mobile layout, dark/light theme support, and Arabic/English direction switching. The browser media flow now uses the real `getUserMedia` and `getDisplayMedia` APIs, binds the stream to a muted inline video preview, handles the browser's native track-ended event, and always stops tracks during source changes and page unload.
 
 The gateway confirmation path was also hardened. The timer is created before any early failure can call cleanup, so a missing shard or a non-ready gateway returns immediately instead of leaving a request stuck. State changes are validated so a deafened account cannot be marked as broadcasting video or screen share.
 
@@ -15,7 +15,7 @@ npm install
 npm start
 ```
 
-Open [http://localhost:5050](http://localhost:5050). The app keeps the Discord token in memory only and does not write it to disk. Use HTTPS or `localhost` when deploying the browser UI so browser media permissions are available.
+Open [http://localhost:5050](http://localhost:5050). Connected Discord tokens are stored encrypted in `data/accounts.enc` and restored automatically after restart; voice sessions are persisted in `data/voice-sessions.json`. Set `DATA_ENCRYPTION_KEY` to a stable random value in production; otherwise `APP_PASSWORD` is used as the encryption key. Use HTTPS or `localhost` when deploying the browser UI so browser media permissions are available.
 
 ## Test and check
 
@@ -81,7 +81,7 @@ Technical voice states use consistent English labels throughout the interface: `
 
 ## Railway security requirements
 
-عند النشر على Railway يجب ضبط `NODE_ENV=production` وإنشاء `APP_PASSWORD` قوية وعشوائية داخل Railway Variables. في وضع الإنتاج تعمل الواجهة بنظام مغلق افتراضيًا؛ أي طلب API بدون Cookie صالحة يعيد `401`. توكنات Discord تدخل فقط عبر واجهة HTTPS المصادق عليها، ولا يعيدها أي endpoint ولا يحفظها التطبيق في ملف أو قاعدة بيانات. يجب الإبقاء على HTTPS وعدم وضع Node خلف proxy عام يلغي المصادقة.
+عند النشر على Railway يجب ضبط `NODE_ENV=production` وإنشاء `APP_PASSWORD` قوية وعشوائية داخل Railway Variables، وكذلك `DATA_ENCRYPTION_KEY` ثابتة وعشوائية. في وضع الإنتاج تعمل الواجهة بنظام مغلق افتراضيًا؛ أي طلب API بدون Cookie صالحة يعيد `401`. توكنات Discord تدخل فقط عبر واجهة HTTPS المصادق عليها، وتحفظ مشفرة في ملف بيانات محلي مستبعد من Git ولا يعيدها أي endpoint. يجب الإبقاء على HTTPS وعدم وضع Node خلف proxy عام يلغي المصادقة.
 
 يطبق الخادم كذلك Security Headers، وContent Security Policy، وحدود حجم الطلب، وRate Limiting، وتحديد محاولات المصادقة، و`Cache-Control: no-store` لاستجابات API، وتنقيح رسائل الأخطاء من أنماط token وpassword وauthorization. ملفات الجلسات وملفات البث الناتجة أثناء التشغيل مستثناة من Git. إذا تعرض مشروع Railway أو جلسة المتصفح أو السجلات أو Variables، يجب تغيير `APP_PASSWORD` وتدوير جميع توكنات Discord فورًا.
 
