@@ -598,7 +598,7 @@ async function toggleCamera() {
     const ctx = canvas.getContext('2d'); ctx.fillStyle = '#080b18'; ctx.fillRect(0, 0, canvas.width, canvas.height);
     const stream = canvas.captureStream(15);
     showMediaStream(stream, 'camera');
-    $('#mediaNotice').textContent = 'Safe camera preview: a blank frame is used; no camera permission is requested.';
+    if ($('#mediaNotice')) $('#mediaNotice').textContent = 'Safe camera preview: a blank frame is used; no camera permission is requested.';
     await syncMediaVoiceState({ selfVideo: true, selfStream: false }, 'Camera');
   } catch (error) { toast(`تعذر تشغيل المعاينة: ${error.message}`, 'error'); addActivity('فشل تشغيل الكاميرا', error.message, 'error'); } finally { state.mediaBusy = false; updateQuickStateButtons(); }
 }
