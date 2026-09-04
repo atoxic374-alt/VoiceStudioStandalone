@@ -716,7 +716,11 @@ app.post('/api/voice/state', async (req, res) => {
     const operationStartedAt = Date.now();
     const mediaKind = selfStream !== undefined ? 'stream' : selfVideo !== undefined ? 'camera' : 'voice-state';
     const client = getClient(name);
-    const current = readGatewayVoiceState(client, guildId) || voiceSessions.get(sessionKey(name, guildId));
+    const observed = readGatewayVoiceState(client, guildId);
+    const current = {
+      ...(observed || voiceSessions.get(sessionKey(name, guildId)) || {}),
+      selfStream: syntheticStreams.has(name) || !!observed?.selfStream,
+    };
     if (!client) return { name, ok: false, error: 'Account is not connected' };
     if (!current?.channelId) return { name, ok: false, error: 'Account is not in a voice channel' };
     const next = {
@@ -726,13 +730,16 @@ app.post('/api/voice/state', async (req, res) => {
       selfStream: selfStream !== undefined ? selfStream : !!current.selfStream,
     };
     if (next.selfDeaf && (next.selfVideo || next.selfStream)) return { name, ok: false, error: 'Video or screen share cannot be enabled while deafened' };
+    if (next.selfVideo) return { name, ok: false, error: 'Camera transport is not available in this self-bot build; screen share uses the supported media connection.' };
     let result;
-    if (next.selfStream) result = await startSyntheticStream(name, guildId);
-    else {
-      if (current.selfStream) stopSyntheticStream(name);
-      result = await sendVoiceOpConfirmed(client, guildId, current.channelId, next, 9000);
+    if (next.selfStream && !syntheticStreams.has(name)) result = await startSyntheticStream(name, guildId);
+    else result = await sendVoiceOpConfirmed(client, guildId, current.channelId, next, 9000);
+    if (result.ok) {
+      if (!next.selfStream && current.selfStream) stopSyntheticStream(name);
+      const actual = readGatewayVoiceState(client, guildId);
+      Object.assign(current, actual || {}, next, { selfStream: !!next.selfStream, selfVideo: !!next.selfVideo, updatedAt: Date.now() });
+      persistSessions();
     }
-    if (result.ok) { const actual = readGatewayVoiceState(client, guildId); Object.assign(current, actual || {}, next, { selfStream: !!next.selfStream, selfVideo: !!next.selfVideo, updatedAt: Date.now() }); persistSessions(); }
     const output = { name, ok: result.ok, error: result.ok ? null : result.error };
     logMediaEvent(result.ok ? 'info' : 'error', `${mediaKind}.${result.ok ? 'confirmed' : 'failed'}`, { account: name, guildId, channelId: current.channelId, durationMs: Date.now() - operationStartedAt, error: output.error || undefined });
     return output;
