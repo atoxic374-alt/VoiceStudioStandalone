@@ -324,7 +324,9 @@ async function startSyntheticStream(name, guildId, mediaKind = 'go-live') {
       // that state, and a competing OP4 can cancel/replace the live stream.
       const confirmed = mediaKind === 'camera'
         ? await sendVoiceOpConfirmed(client, guildId, session.channelId, mediaState, 3000)
-        : sendVoiceOp(client, guildId, session.channelId, { selfMute: !!session.selfMute, selfDeaf: true });
+        // Go Live's stream transport owns the stream flag. Sending a second OP4
+        // here used to force selfDeaf=true and could override the selected state.
+        : { ok: true, confirmed: true, source: 'stream-transport' };
       if (!confirmed.ok) throw new Error(confirmed.error || 'Discord did not accept media state');
       logMediaEvent('info', 'media.ready', { account: name, guildId, channelId: session.channelId, mediaKind, durationMs: Date.now() - startedAt, attempt });
       return { ok: true };
