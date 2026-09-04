@@ -196,12 +196,13 @@ async function startSyntheticStream(name, guildId) {
         const streamConnection = await withTimeout(connection.createStreamConnection(), 8000, 'Stream connection timed out');
         let dispatcher;
         let playError;
-        for (const options of [{ fps: 15, preset: 'ultrafast', bitrate: 500 }, { fps: 10, preset: 'superfast', bitrate: 300 }]) {
+        for (const options of [{ fps: 15, presetH26x: 'superfast', bitrate: 500, inputFFmpegArgs: ['-stream_loop', '-1'], outputFFmpegArgs: ['-g', '30'] }, { fps: 10, presetH26x: 'veryfast', bitrate: 300, inputFFmpegArgs: ['-stream_loop', '-1'], outputFFmpegArgs: ['-g', '20'] }]) {
           try { dispatcher = streamConnection.playVideo(source, options); break; } catch (error) { playError = error; }
         }
         if (!dispatcher) { try { streamConnection.disconnect?.(); } catch {} throw playError || new Error('Unable to create video dispatcher'); }
         syntheticStreams.set(name, { connection, streamConnection, dispatcher, guildId, channelId: session.channelId });
         sendVoiceOp(client, guildId, session.channelId, { selfMute: !!session.selfMute, selfDeaf: false, selfVideo: false, selfStream: true });
+        dispatcher.on?.('error', (error) => logMediaEvent('error', 'stream.runtime_failed', { account: name, guildId, channelId: session.channelId, error: error?.message || String(error) }));
         dispatcher.once?.('finish', () => { if (syntheticStreams.get(name)?.dispatcher === dispatcher) stopSyntheticStream(name); });
         logMediaEvent('info', 'stream.ready', { account: name, guildId, channelId: session.channelId, durationMs: Date.now() - startedAt, attempt });
         return { ok: true };

@@ -50,7 +50,7 @@ The automation panel starts and stops channel rotation and voice-state cycling. 
 
 The camera and screen-share buttons are functional local capture controls. They request permission, show the selected source in the preview, expose a live status and timer, and clean up when the user stops the source or the browser ends the track. In a headless environment with no camera, the app shows the browser's explicit `Requested device not found` error instead of pretending the camera is live.
 
-The original backend sends Discord Gateway voice-state flags (`self_video` and `self_stream`) but does not implement Discord's RTP/WebRTC media transport. This standalone version therefore does **not** claim to publish the browser's pixels or camera frames into a Discord voice channel. It provides a reliable local preview and synchronizes the state flag when a voice session is selected. Actual Discord media publishing requires an approved Discord client/media transport rather than a self-bot gateway flag.
+The backend uses the experimental media path exposed by `discord.js-selfbot-v13`: it prepares a short synthetic H.264 source with `ffmpeg-static`, opens `createStreamConnection()`, and feeds it through `playVideo()`. This is an actual media attempt rather than a state-only flag, but it is not an officially supported Discord client and may fail when Discord changes its Go Live/WebRTC or DAVE/E2EE requirements. Failures are logged in `data/media-events.log`; the primary voice connection is preserved where the library permits it.
 
 ## Project layout
 
