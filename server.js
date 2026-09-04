@@ -706,7 +706,7 @@ app.get('/api/discord/clients', (_req, res) => {
       avatar: user?.displayAvatarURL?.({ size: 128 }) || null,
       status: user?.presence?.status || 'online',
       health: accountHealth(name, entry),
-      voice: voice ? { guildId: voice.guildId, guildName: guild?.name || voice.guildId, channelId: voice.channelId, channelName: channel?.name || voice.channelId, selfMute: !!voice.selfMute, selfDeaf: !!voice.selfDeaf, selfVideo: !!voice.selfVideo, selfStream: !!voice.selfStream } : null,
+      voice: voice ? { guildId: voice.guildId, guildName: guild?.name || voice.guildId, guildIcon: guild?.iconURL?.({ size: 64 }) || null, channelId: voice.channelId, channelName: channel?.name || voice.channelId, selfMute: !!voice.selfMute, selfDeaf: !!voice.selfDeaf, selfVideo: !!voice.selfVideo, selfStream: !!voice.selfStream } : null,
     };
   }) });
 });
