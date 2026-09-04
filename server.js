@@ -540,11 +540,17 @@ function reconcileVoiceSessions() {
     for (const session of [...voiceSessions.values()].filter((item) => item.name === name)) {
       const actual = readGatewayVoiceState(entry.client, session.guildId);
       if (!actual || !actual.channelId) {
+        const active = syntheticStreams.get(name);
+        if (active && active.guildId === session.guildId && active.channelId === session.channelId) {
+          upsertSession(name, session.guildId, session.channelId, { selfMute: session.selfMute, selfDeaf: false, selfVideo: active.mediaKind === 'camera', selfStream: active.mediaKind === 'go-live' });
+          continue;
+        }
         stopSyntheticStream(name);
         removeSessionsForAccount(name, session.guildId);
         continue;
       }
-      const observed = { ...actual, selfStream: syntheticStreams.has(name) ? true : actual.selfStream };
+      const active = syntheticStreams.get(name);
+      const observed = { ...actual, selfVideo: active?.mediaKind === 'camera' ? true : actual.selfVideo, selfStream: active?.mediaKind === 'go-live' ? true : actual.selfStream };
       const changed = observed.channelId !== session.channelId || observed.selfMute !== !!session.selfMute || observed.selfDeaf !== !!session.selfDeaf || observed.selfVideo !== !!session.selfVideo || observed.selfStream !== !!session.selfStream;
       if (changed) {
         if (observed.channelId !== session.channelId) stopSyntheticStream(name);
