@@ -181,11 +181,10 @@ async function startSyntheticStream(name, guildId) {
     const source = ensureSyntheticVideo();
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       let connection;
-      let createdConnection = false;
       try {
         const existing = client.voice.connection;
-        createdConnection = existing?.channel?.id !== session.channelId;
-        connection = createdConnection ? await withTimeout(client.voice.joinChannel(channel, { selfMute: !!session.selfMute, selfDeaf: false, selfVideo: true, videoCodec: 'H264' }), 9000, 'Voice connection timed out while starting stream') : existing;
+        if (existing?.channel?.id !== session.channelId) throw new Error('Active voice connection is required before starting stream');
+        connection = existing;
         const streamConnection = await withTimeout(connection.createStreamConnection(), 4000, 'Stream connection timed out');
         const dispatcher = streamConnection.playVideo(source, { fps: 15, preset: 'ultrafast', bitrate: 500 });
         syntheticStreams.set(name, { connection, streamConnection, dispatcher, guildId, channelId: session.channelId });
@@ -193,7 +192,6 @@ async function startSyntheticStream(name, guildId) {
         return { ok: true };
       } catch (error) {
         lastError = error;
-        if (createdConnection) { try { client.voice.connection?.disconnect?.(); } catch {} }
         if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 250));
       }
     }
@@ -382,6 +380,8 @@ async function moveAccount(name, guildId, channelId, opts = {}) {
     if (!client) return { name, ok: false, error: 'Account is not connected' };
     const target = validateTarget(client, guildId, channelId);
     if (!target.ok) return { name, ok: false, error: target.error };
+    const current = readGatewayVoiceState(client, guildId) || voiceSessions.get(sessionKey(name, guildId));
+    if (current?.channelId === channelId) return { name, ok: true, alreadyIn: true, channelId };
     if (syntheticStreams.has(name)) stopSyntheticStream(name);
     const result = await sendVoiceOpConfirmed(client, guildId, channelId, { ...opts, selfVideo: false, selfStream: false });
     if (result.ok) {
@@ -649,6 +649,8 @@ app.post('/api/voice/leave', async (req, res) => {
   const results = await mapWithConcurrency(accounts, 8, (name) => withAccountLock(name, async () => {
     const client = getClient(name);
     if (!client) return { name, ok: false, error: 'Account is not connected' };
+    const current = readGatewayVoiceState(client, guildId) || voiceSessions.get(sessionKey(name, guildId));
+    if (!current?.channelId) { stopTasksForAccount(name); removeSessionsForAccount(name, guildId); return { name, ok: true, alreadyLeft: true }; }
     stopTasksForAccount(name);
     stopSyntheticStream(name);
     const result = await sendVoiceOpConfirmed(client, guildId, null, {}, 5000);
