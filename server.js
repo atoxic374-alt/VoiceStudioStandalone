@@ -101,11 +101,14 @@ function sendVoiceOpConfirmed(client, guildId, channelId, opts = {}, timeoutMs =
 
     let settled = false;
     let timer = null;
+    let retryTimer = null;
     const cleanup = () => {
       try { client.ws?.off?.('VOICE_STATE_UPDATE', onWsState); } catch {}
       try { client.off?.('voiceStateUpdate', onJsState); } catch {}
       if (timer) clearTimeout(timer);
+      if (retryTimer) clearTimeout(retryTimer);
       timer = null;
+      retryTimer = null;
     };
     const finish = (result) => {
       if (settled) return;
@@ -140,6 +143,7 @@ function sendVoiceOpConfirmed(client, guildId, channelId, opts = {}, timeoutMs =
 
     const sent = sendVoiceOp(client, guildId, channelId, opts);
     if (!sent.ok) finish(sent);
+    else retryTimer = setTimeout(() => { if (!settled) sendVoiceOp(client, guildId, channelId, opts); }, Math.min(750, Math.floor(timeoutMs / 3)));
   });
 }
 
@@ -164,15 +168,33 @@ function validateTarget(client, guildId, channelId) {
   if (!alreadyIn && limit > 0 && current >= limit) return { ok: false, error: 'Voice channel is full' };
   return { ok: true, guild, channel };
 }
+function readGatewayVoiceState(client, guildId) {
+  const state = client?.voiceStates?.cache?.get?.(client.user?.id)
+    || client?.guilds?.cache?.get?.(guildId)?.voiceStates?.cache?.get?.(client.user?.id);
+  if (!state || String(state.guild?.id || state.guildId || guildId) !== String(guildId)) return null;
+  return {
+    channelId: state.channelId ?? state.channel_id ?? null,
+    selfMute: !!(state.selfMute ?? state.self_mute),
+    selfDeaf: !!(state.selfDeaf ?? state.self_deaf),
+    selfVideo: !!(state.selfVideo ?? state.self_video),
+    selfStream: !!(state.streaming ?? state.selfStream ?? state.self_stream),
+  };
+}
 function upsertSession(name, guildId, channelId, opts = {}) {
+  const previous = voiceSessions.get(sessionKey(name, guildId));
   voiceSessions.set(sessionKey(name, guildId), {
     name, guildId, channelId,
-    selfMute: !!opts.selfMute,
-    selfDeaf: !!opts.selfDeaf,
-    selfVideo: !!opts.selfVideo,
-    selfStream: !!opts.selfStream,
-    joinedAt: Date.now(),
+    selfMute: opts.selfMute !== undefined ? !!opts.selfMute : !!previous?.selfMute,
+    selfDeaf: opts.selfDeaf !== undefined ? !!opts.selfDeaf : !!previous?.selfDeaf,
+    selfVideo: opts.selfVideo !== undefined ? !!opts.selfVideo : !!previous?.selfVideo,
+    selfStream: opts.selfStream !== undefined ? !!opts.selfStream : !!previous?.selfStream,
+    joinedAt: previous?.joinedAt || Date.now(), updatedAt: Date.now(),
   });
+  persistSessions();
+}
+function removeSessionsForAccount(name, guildId) {
+  if (guildId) voiceSessions.delete(sessionKey(name, guildId));
+  else for (const key of voiceSessions.keys()) if (key.startsWith(`${name}__`)) voiceSessions.delete(key);
   persistSessions();
 }
 async function moveAccount(name, guildId, channelId, opts = {}) {
@@ -181,19 +203,23 @@ async function moveAccount(name, guildId, channelId, opts = {}) {
   const target = validateTarget(client, guildId, channelId);
   if (!target.ok) return { name, ok: false, error: target.error };
   const result = await sendVoiceOpConfirmed(client, guildId, channelId, opts);
-  if (result.ok) upsertSession(name, guildId, channelId, opts);
+  if (result.ok) {
+    const actual = readGatewayVoiceState(client, guildId);
+    upsertSession(name, guildId, channelId, { ...opts, ...(actual || {}) });
+  }
   return { name, ok: result.ok, error: result.ok ? null : result.error, channelId };
 }
 
 async function connectOne(token, name) {
   if (typeof token !== 'string' || !token.trim()) throw new Error('A Discord token is required');
-  const finalName = String(name || `account-${clients.size + 1}`).trim().slice(0, 48);
+  let finalName = String(name || '').trim().slice(0, 48);
+  const client = new Client({ checkUpdate: false, fetchAllMembers: false });
+  await client.login(token.trim());
+  if (!finalName) finalName = String(client.user?.globalName || client.user?.username || `account-${clients.size + 1}`).trim().slice(0, 48);
   if (clients.has(finalName)) {
     try { await clients.get(finalName).client.destroy(); } catch {}
     clients.delete(finalName);
   }
-  const client = new Client({ checkUpdate: false, fetchAllMembers: false });
-  await client.login(token.trim());
   clients.set(finalName, { client, token: token.trim() });
 
   // Restore only the channel state; media capture remains browser-owned and must be
@@ -295,7 +321,20 @@ app.get('/api/voice/guilds', (req, res) => {
   }
   return ok(res, { guilds });
 });
-app.get('/api/voice/sessions', (_req, res) => ok(res, { sessions: [...voiceSessions.values()] }));
+app.get('/api/voice/sessions', (_req, res) => {
+  const sessions = [];
+  for (const [name, entry] of clients.entries()) {
+    for (const session of [...voiceSessions.values()].filter((item) => item.name === name)) {
+      const actual = readGatewayVoiceState(entry.client, session.guildId);
+      if (actual && !actual.channelId) { removeSessionsForAccount(name, session.guildId); continue; }
+      const guild = entry.client.guilds?.cache?.get?.(session.guildId);
+      const channel = guild?.channels?.cache?.get?.(actual?.channelId || session.channelId);
+      const merged = { ...session, ...(actual || {}), channelId: actual?.channelId || session.channelId, guildName: guild?.name || session.guildId, channelName: channel?.name || actual?.channelId || session.channelId, guildIcon: guild?.iconURL?.({ size: 64 }) || null, memberCount: channel?.members?.size || 0 };
+      sessions.push(merged);
+    }
+  }
+  return ok(res, { sessions });
+});
 app.get('/api/voice/target-accounts', (req, res) => {
   const guildId = String(req.query?.guildId || '').trim();
   const channelId = String(req.query?.channelId || '').trim();
@@ -333,8 +372,8 @@ app.post('/api/voice/leave', async (req, res) => {
   const results = await Promise.all(accounts.map(async (name) => {
     const client = getClient(name);
     if (!client) return { name, ok: false, error: 'Account is not connected' };
-    const result = await sendVoiceOpConfirmed(client, guildId, null, {}, 3000);
-    if (result.ok) { voiceSessions.delete(sessionKey(name, guildId)); persistSessions(); }
+    const result = await sendVoiceOpConfirmed(client, guildId, null, {}, 5000);
+    if (result.ok) removeSessionsForAccount(name, guildId);
     return { name, ok: result.ok, error: result.ok ? null : result.error };
   }));
   return ok(res, { results, summary: summary(results) });
@@ -357,8 +396,8 @@ app.post('/api/voice/state', async (req, res) => {
       selfStream: selfStream !== undefined ? selfStream : !!current.selfStream,
     };
     if (next.selfDeaf && (next.selfVideo || next.selfStream)) return { name, ok: false, error: 'Video or screen share cannot be enabled while deafened' };
-    const result = await sendVoiceOpConfirmed(client, guildId, current.channelId, next, 3000);
-    if (result.ok) { Object.assign(current, next); persistSessions(); }
+    const result = await sendVoiceOpConfirmed(client, guildId, current.channelId, next, 5000);
+    if (result.ok) { const actual = readGatewayVoiceState(client, guildId); Object.assign(current, next, actual || {}, { updatedAt: Date.now() }); persistSessions(); }
     return { name, ok: result.ok, error: result.ok ? null : result.error };
   }));
   return ok(res, { results, summary: summary(results) });
@@ -383,7 +422,7 @@ app.post('/api/voice/rotation/start', async (req, res) => {
   const accounts = cleanAccounts(req.body?.accounts);
   const { guildId, guildName, intervalMs, randomOrder = false } = req.body || {};
   const channelIds = cleanChannelIds(req.body?.channelIds);
-  const delay = Math.max(5000, Number(intervalMs || 60000));
+  const delay = Math.max(1000, Number(intervalMs || 60000));
   if (!accounts.length || !guildId || !Array.isArray(channelIds) || channelIds.length < 2) return fail(res, new Error('At least two channels and one account are required'), 400);
   const initial = await Promise.all(accounts.map((name) => moveAccount(name, guildId, channelIds[0])));
   const readyAccounts = initial.filter((result) => result.ok).map((result) => result.name);
@@ -391,13 +430,14 @@ app.post('/api/voice/rotation/start', async (req, res) => {
   const id = crypto.randomUUID();
   const task = { id, accounts: readyAccounts, guildId, guildName: guildName || guildId, channels: channelIds, intervalMs: delay, randomOrder: !!randomOrder, currentIdx: 0, nextAt: Date.now() + delay };
   task.running = false;
+  task.lastResults = initial;
   task.timer = setInterval(async () => {
     if (task.running) return;
     task.running = true;
     task.currentIdx = (task.currentIdx + 1) % task.channels.length;
     const ids = task.randomOrder ? [...task.channels].sort(() => Math.random() - 0.5) : task.channels;
     try {
-      await Promise.all(task.accounts.map((name, index) => moveAccount(name, task.guildId, ids[(task.currentIdx + index) % ids.length])));
+      task.lastResults = await Promise.all(task.accounts.map((name, index) => moveAccount(name, task.guildId, ids[(task.currentIdx + index) % ids.length])));
       task.nextAt = Date.now() + task.intervalMs;
     } finally { task.running = false; }
   }, delay);
@@ -410,10 +450,10 @@ app.post('/api/voice/rotation/stop', (req, res) => {
   if (!task) return fail(res, new Error('Rotation not found'), 404);
   clearInterval(task.timer); rotations.delete(id); return ok(res);
 });
-app.post('/api/voice/state-cycle/start', (req, res) => {
+app.post('/api/voice/state-cycle/start', async (req, res) => {
   const accounts = cleanAccounts(req.body?.accounts);
   const { guildId, states, intervalMs } = req.body || {};
-  const delay = Math.max(5000, Number(intervalMs || 60000));
+  const delay = Math.max(1000, Number(intervalMs || 60000));
   if (!accounts.length || !guildId || !Array.isArray(states) || states.length < 2) return fail(res, new Error('At least two states and one account are required'), 400);
   const validStates = states.every((item) => item && typeof item === 'object'
     && ['selfMute', 'selfDeaf', 'selfVideo', 'selfStream'].every((key) => item[key] === undefined || typeof item[key] === 'boolean')
@@ -422,12 +462,23 @@ app.post('/api/voice/state-cycle/start', (req, res) => {
   const id = crypto.randomUUID();
   const task = { id, accounts, guildId, states, intervalMs: delay, currentIdx: 0, nextAt: Date.now() + delay };
   task.running = false;
+  task.lastResults = await Promise.all(task.accounts.map(async (name) => {
+    const current = voiceSessions.get(sessionKey(name, task.guildId));
+    const client = getClient(name);
+    if (!current || !client) return { name, ok: false, error: 'Account is not currently in a voice channel' };
+    const next = { ...current, ...task.states[0] };
+    if (next.selfDeaf && (next.selfVideo || next.selfStream)) return { name, ok: false, error: 'Invalid deafened media state' };
+    const result = await sendVoiceOpConfirmed(client, task.guildId, current.channelId, next, 5000);
+    if (result.ok) { Object.assign(current, next, { updatedAt: Date.now() }); persistSessions(); }
+    return { name, ok: result.ok, error: result.ok ? null : result.error };
+  }));
   task.timer = setInterval(async () => {
     if (task.running) return;
     task.running = true;
     task.currentIdx = (task.currentIdx + 1) % task.states.length;
     const state = task.states[task.currentIdx];
     try {
+      task.lastResults = [];
       await Promise.all(task.accounts.map(async (name) => {
         const current = voiceSessions.get(sessionKey(name, task.guildId));
         if (!current) return;

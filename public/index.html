@@ -61,12 +61,11 @@
                 <span id="accountBadge" class="soft-badge">لا توجد حسابات</span>
               </div>
               <div class="form-grid">
-                <label class="field"><span>اسم الحساب</span><input id="accountName" type="text" placeholder="مثال: حسابي الأساسي" autocomplete="off" /></label>
                 <label class="field"><span>Discord Token</span><input id="tokenInput" type="password" placeholder="أدخل التوكن محليًا" autocomplete="off" /></label>
               </div>
               <div class="setup-actions"><button id="connectButton" class="primary-button" type="button"><span class="button-icon">↗</span><span>اتصال آمن</span></button><button id="disconnectButton" class="ghost-button" type="button">فصل الحساب</button></div>
               <div id="connectFeedback" class="inline-feedback" role="status" aria-live="polite"></div>
-              <div class="bulk-import"><div class="bulk-copy"><span>Bulk import</span><small>One account per line: name | token</small></div><textarea id="bulkTokensInput" rows="2" placeholder="main | token...&#10;alt | token..."></textarea><button id="bulkConnectButton" class="ghost-button" type="button">Add accounts</button><div id="bulkFeedback" class="inline-feedback" role="status" aria-live="polite"></div></div>
+              <div class="bulk-import"><div class="bulk-copy"><span>Bulk import</span><small>One token per line</small></div><textarea id="bulkTokensInput" rows="2" placeholder="token...&#10;token..."></textarea><button id="bulkConnectButton" class="ghost-button" type="button">Add accounts</button><div id="bulkFeedback" class="inline-feedback" role="status" aria-live="polite"></div></div>
             </article>
 
             <article class="card channel-card" data-panel="voice">
@@ -80,7 +79,7 @@
               <div class="voice-actions">
                 <button id="joinButton" class="action-button action-join" type="button"><span>＋</span> Join room</button>
                 <button id="joinAllButton" class="action-button action-secondary" type="button">Join all</button>
-                <button id="leaveButton" class="action-button action-danger" type="button">Leave</button>
+                <button id="leaveButton" class="action-button action-danger" type="button">Leave</button><button id="leaveAllButton" class="action-button action-danger" type="button">Leave all</button>
               </div>
             </article>
 
@@ -106,7 +105,7 @@
               <div id="tasksList" class="tasks-list"><div class="task-empty">لا توجد مهام قيد التشغيل</div></div>
             </article>
 
-            <article id="sessionsCard" class="card sessions-card" data-panel="dashboard activity">
+            <article id="sessionsCard" class="card sessions-card" data-panel="dashboard">
               <div class="card-heading compact"><div><span class="card-kicker">DASHBOARD / LIVE</span><h2>Live overview</h2></div><span id="sessionLiveLabel" class="soft-badge accent">تحديث تلقائي</span></div>
               <div id="sessionsList" class="sessions-list"><div class="empty-state"><span class="empty-pulse"></span><p>لا توجد جلسات نشطة الآن</p><small>عند الدخول إلى غرفة ستظهر تفاصيلها هنا.</small></div></div>
               <div class="profiles-heading"><span>ملفات الحسابات</span><small>الاسم، النيك نيم، المعرّف والحالة الحالية</small></div><div id="profilesList" class="profiles-list"><div class="task-empty">لا توجد حسابات متصلة</div></div>
@@ -132,7 +131,7 @@
               <div id="stateFeedback" class="inline-feedback" role="status" aria-live="polite"></div>
             </article>
 
-            <article class="card activity-card" data-panel="activity"><div class="card-heading compact"><div><span class="card-kicker">ACTIVITY / LOG</span><h2>Recent activity</h2></div><span class="activity-led"></span></div><div id="activityList" class="activity-list"><div class="activity-row"><span class="activity-dot"></span><div><strong>المساحة جاهزة</strong><small>بانتظار أول اتصال</small></div><time>الآن</time></div></div></article>
+            <article class="card activity-card" data-panel="activity"><div class="card-heading compact"><div><span class="card-kicker">ACTIVITY / LOG</span><h2>Recent activity</h2></div><span class="activity-led"></span></div><div id="activityList" class="activity-list"><div class="activity-row"><span class="activity-dot"></span><div><strong>المساحة جاهزة</strong><small>بانتظار أول اتصال</small></div><time>الآن</time></div></div><button id="activityExpandButton" class="ghost-button activity-expand" type="button">View full activity</button></article>
           </div>
         </section>
         <footer class="app-footer"><span>Voice Studio v1.0</span><span>كل شيء تحت سيطرتك <i>·</i> وبشكل واضح</span></footer>
@@ -142,5 +141,6 @@
   <div id="operationModal" class="operation-modal" hidden><div class="operation-dialog" role="dialog" aria-modal="true" aria-labelledby="operationTitle"><div class="operation-head"><div class="operation-loader"></div><div><strong id="operationTitle">Processing</strong><small id="operationSubtitle">Please wait…</small></div></div><div id="operationAccounts" class="operation-accounts"></div><div id="operationResult" class="operation-result"></div><button id="operationClose" class="ghost-button" type="button" hidden>Close</button></div></div>
   <div id="toastRegion" class="toast-region" aria-live="polite" aria-atomic="true"></div>
   <script type="module" src="/app.js"></script>
+<div id="leaveModal" class="operation-modal" hidden><div class="operation-dialog" role="dialog" aria-modal="true"><div class="operation-head"><div><strong>Leave connected accounts</strong><small>Select only accounts currently in a voice room</small></div></div><div id="leaveAccountList" class="profiles-list leave-account-list"></div><div class="setup-actions"><button id="confirmLeaveButton" class="action-button action-danger" type="button">Leave selected</button><button id="cancelLeaveButton" class="ghost-button" type="button">Cancel</button></div></div></div>\n<div id="activityModal" class="operation-modal" hidden><div class="operation-dialog activity-dialog" role="dialog" aria-modal="true"><div class="operation-head"><div><strong>Full activity log</strong><small>All recorded actions, newest first</small></div></div><select id="activityAccountFilter" class="automation-guild"><option value="">All accounts</option></select><div id="fullActivityList" class="activity-list full-activity-list"></div><div class="activity-pagination"><button id="activityPrevButton" class="ghost-button" type="button">Previous</button><span id="activityPageLabel"></span><button id="activityNextButton" class="ghost-button" type="button">Next</button></div><button id="activityCloseButton" class="ghost-button" type="button">Close</button></div></div>
 </body>
 </html>

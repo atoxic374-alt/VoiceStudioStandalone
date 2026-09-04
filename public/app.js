@@ -25,8 +25,8 @@ const api = async (url, options = {}) => {
   return payload;
 };
 const operationNames = { connect: 'Connect account', 'connect-bulk': 'Connect accounts', join: 'Join voice room', 'join-all': 'Join accounts', leave: 'Leave voice room', state: 'Update voice state', 'rotation/start': 'Start channel rotation', 'rotation/stop': 'Stop channel rotation', 'state-cycle/start': 'Start state cycle', 'state-cycle/stop': 'Stop state cycle' };
-function operationStart(url, body = {}) { const modal = $('#operationModal'); if (!modal) return; const key = Object.keys(operationNames).find((item) => url.includes(item)); $('#operationTitle').textContent = operationNames[key] || 'Processing'; $('#operationSubtitle').textContent = 'Preparing request…'; $('#operationResult').textContent = ''; $('#operationClose').hidden = true; const names = Array.isArray(body.accounts) ? body.accounts.map((item) => typeof item === 'string' ? item : item.name).filter(Boolean) : (body.name ? [body.name] : []); const profiles = names.map((name) => state.clients.find((client) => client.name === name) || { name, nickname: name }).filter(Boolean); $('#operationAccounts').innerHTML = profiles.length ? profiles.map((profile) => `<div class="operation-account"><span>${profile.avatar ? `<img src="${escapeHTML(profile.avatar)}" alt="" />` : escapeHTML((profile.nickname || profile.name || '?')[0])}</span><strong>${escapeHTML(profile.nickname || profile.displayName || profile.name)}</strong><small>Waiting…</small></div>`).join('') : '<div class="operation-empty">Working on the selected accounts…</div>'; modal.hidden = false; }
-function operationFinish(payload) { const modal = $('#operationModal'); if (!modal) return; const results = Array.isArray(payload?.results) ? payload.results : []; $('#operationSubtitle').textContent = 'Completed'; $('#operationResult').textContent = payload?.summary ? `${payload.summary.ok} succeeded · ${payload.summary.failed} failed` : 'Done'; $('#operationAccounts').querySelectorAll('.operation-account').forEach((row, index) => { const result = results[index]; if (result) { row.classList.toggle('is-error', !result.ok); const detail = row.querySelector('small'); if (detail) detail.textContent = result.ok ? 'Success' : (result.error || 'Failed'); } }); $('.operation-loader')?.classList.add('is-done'); $('#operationClose').hidden = false; }
+function operationStart(url, body = {}) { const modal = $('#operationModal'); if (!modal) return; const key = Object.keys(operationNames).find((item) => url.includes(item)); $('#operationTitle').textContent = operationNames[key] || 'Processing'; $('#operationSubtitle').textContent = 'Preparing request…'; $('#operationResult').textContent = ''; $('#operationClose').hidden = true; const names = Array.isArray(body.accounts) ? body.accounts.map((item) => typeof item === 'string' ? item : item.name).filter(Boolean) : (body.name ? [body.name] : []); const profiles = names.map((name) => state.clients.find((client) => client.name === name) || { name, nickname: name }).filter(Boolean); modal.dataset.accountNames = JSON.stringify(names); $('#operationAccounts').innerHTML = profiles.length ? profiles.map((profile) => `<div class="operation-account" data-operation-name="${escapeHTML(profile.name)}"><span>${profile.avatar ? `<img src="${escapeHTML(profile.avatar)}" alt="" />` : escapeHTML((profile.nickname || profile.name || '?')[0])}</span><strong>${escapeHTML(profile.nickname || profile.displayName || profile.name)}</strong><small>Waiting…</small></div>`).join('') : '<div class="operation-empty">Working on the selected accounts…</div>'; modal.hidden = false; }
+function operationFinish(payload) { const modal = $('#operationModal'); if (!modal) return; const results = Array.isArray(payload?.results) ? payload.results : []; const byName = new Map(results.filter((item) => item?.name).map((item) => [String(item.name), item])); $('#operationSubtitle').textContent = 'Completed'; $('#operationResult').textContent = payload?.summary ? `${payload.summary.ok} succeeded · ${payload.summary.failed} failed` : 'Done'; let rows = [...$('#operationAccounts').querySelectorAll('.operation-account')]; if (!rows.length && results.length) { $('#operationAccounts').innerHTML = results.map((result) => `<div class="operation-account" data-operation-name="${escapeHTML(result.name || '')}"><span>${escapeHTML((result.name || '?')[0])}</span><strong>${escapeHTML(result.name || 'Account')}</strong><small></small></div>`).join(''); rows = [...$('#operationAccounts').querySelectorAll('.operation-account')]; } rows.forEach((row, index) => { const result = byName.get(row.dataset.operationName) || results[index]; if (result) { row.classList.remove('is-error','is-success'); row.classList.add(result.ok ? 'is-success' : 'is-error'); const detail = row.querySelector('small'); if (detail) detail.textContent = result.ok ? 'Success' : (result.error || 'Failed'); } }); $('.operation-loader')?.classList.add(payload?.summary?.failed ? 'is-error' : 'is-done'); $('#operationClose').hidden = false; }
 function operationFail(error) { const modal = $('#operationModal'); if (!modal) return; $('#operationSubtitle').textContent = 'Failed'; $('#operationResult').textContent = error.message || 'Request failed'; $('.operation-loader')?.classList.add('is-error'); $('#operationClose').hidden = false; }
 const post = async (url, body) => { operationStart(url, body); try { const result = await api(url, { method: 'POST', body: JSON.stringify(body) }); operationFinish(result); return result; } catch (error) { operationFail(error); throw error; } };
 
@@ -37,14 +37,15 @@ function selectedAccounts() { return state.selectedAccount ? [state.selectedAcco
 function selectedSession() {
   return state.selectedTarget && state.selectedAccount ? { account: state.selectedAccount, ...state.selectedTarget } : null;
 }
-function addActivity(title, detail, tone = '') {
+function addActivity(title, detail, tone = '', account = '') {
   const list = $('#activityList');
   if (!list) return;
   const row = document.createElement('div');
   row.className = 'activity-row';
   row.innerHTML = `<span class="activity-dot ${tone}"></span><div><strong>${escapeHTML(title)}</strong><small>${escapeHTML(detail)}</small></div><time>الآن</time>`;
   list.prepend(row);
-  while (list.children.length > 4) list.lastElementChild.remove();
+  while (list.children.length > 12) list.lastElementChild.remove();
+  const stored = JSON.parse(localStorage.getItem('voice-activity') || '[]'); stored.unshift({ title, detail, tone, account, time: new Date().toISOString() }); localStorage.setItem('voice-activity', JSON.stringify(stored.slice(0, 500)));
 }
 function toast(message, tone = '') {
   const region = $('#toastRegion');
@@ -201,13 +202,12 @@ function requireAccount() {
 async function connect() {
   if (state.busy.has('connect')) return;
   const token = $('#tokenInput').value.trim();
-  const name = $('#accountName').value.trim();
+  const name = '';
   if (!token) { feedback('#connectFeedback', 'أدخل Discord Token للمتابعة.', 'error'); return; }
   setBusy('connect', true); feedback('#connectFeedback', 'جارٍ فتح اتصال Gateway والتحقق منه…');
   try {
     const data = await post('/api/discord/connect', { token, name });
     $('#tokenInput').value = '';
-    $('#accountName').value = data.name || name;
     feedback('#connectFeedback', `تم الاتصال باسم ${data.username || data.name}.`, 'success');
     addActivity('تم الاتصال', data.username || data.name, 'success');
     toast('تم الاتصال بالحساب بنجاح', 'success');
@@ -221,10 +221,7 @@ async function connect() {
 }
 async function bulkConnect() {
   const lines = $('#bulkTokensInput').value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  const accounts = lines.map((line, index) => {
-    const [maybeName, ...rest] = line.split('|').map((part) => part.trim());
-    return rest.length ? { name: maybeName, token: rest.join('|') } : { name: `account-${index + 1}`, token: maybeName };
-  });
+  const accounts = lines.map((token) => ({ token }));
   if (!accounts.length) { feedback('#bulkFeedback', 'أضف توكنًا واحدًا على الأقل، كل توكن في سطر.', 'error'); return; }
   $('#bulkConnectButton').disabled = true; feedback('#bulkFeedback', `جارٍ اتصال ${accounts.length} حساب بحد تزامن آمن…`);
   try {
@@ -249,8 +246,9 @@ function renderProfiles(clients = []) {
     const avatar = client.avatar ? `<img src="${escapeHTML(client.avatar)}" alt="" />` : escapeHTML((client.nickname || client.name || '?')[0].toUpperCase());
     const voiceText = voice ? `${escapeHTML(voice.guildName || voice.guildId)} · ${escapeHTML(voice.channelName || voice.channelId)}` : 'Not in a room';
     const flags = voice ? `${voice.selfMute ? 'Mute' : 'Unmute'}${voice.selfDeaf ? ' · Deafen' : ''}${voice.selfVideo ? ' · Video' : ''}${voice.selfStream ? ' · Stream' : ''}` : 'Offline';
-    return `<div class="profile-row"><span class="profile-row-avatar">${avatar}</span><div class="profile-row-main"><strong>${escapeHTML(client.nickname || client.displayName || client.name)}</strong><small>@${escapeHTML(client.username || client.name)} · ID: ${escapeHTML(client.id || '—')}</small></div><div class="profile-row-voice"><span class="profile-online"></span><strong>${voiceText}</strong><small>${flags}</small></div></div>`;
+    return `<div class="profile-row"><span class="profile-row-avatar">${avatar}</span><div class="profile-row-main"><strong>${escapeHTML(client.nickname || client.displayName || client.name)}</strong><small>@${escapeHTML(client.username || client.name)} · ID: ${escapeHTML(client.id || '—')}</small></div><div class="profile-row-voice"><span class="profile-online"></span><strong>${voiceText}</strong><small>${flags}</small></div><button class="profile-leave" type="button" data-profile-leave="${escapeHTML(client.name)}" data-profile-guild="${escapeHTML(voice?.guildId || '')}" ${voice ? '' : 'disabled'}>Leave</button></div>`;
   }).join('');
+  list.querySelectorAll('[data-profile-leave]').forEach((button) => button.addEventListener('click', () => quickLeave(button.dataset.profileLeave, button.dataset.profileGuild)));
 }
 
 async function disconnect() {
@@ -279,7 +277,7 @@ async function join() {
     const result = await post('/api/voice/join', { accounts: selectedAccounts(), guildId: state.selectedTarget.guildId, channelId: state.selectedTarget.channelId });
     const success = result.summary?.ok || 0;
     if (!success) throw new Error(result.results?.find((item) => !item.ok)?.error || 'تعذر الدخول إلى القناة');
-    addActivity('دخلت الغرفة', `${state.selectedTarget.guildName} · ${state.selectedTarget.channelName}`, 'success');
+    addActivity('تنقل إلى غرفة', `${state.clients.find((client) => client.name === state.selectedAccount)?.nickname || state.selectedAccount} · ${state.selectedTarget.guildName} · ${state.selectedTarget.channelName}`, 'success', state.selectedAccount);
     toast(`تم الدخول إلى ${state.selectedTarget.channelName}`, 'success');
     await refreshSessions();
   } catch (error) { toast(error.message, 'error'); addActivity('تعذر دخول الغرفة', error.message, 'error'); }
@@ -301,7 +299,7 @@ async function leave() {
   try {
     const result = await post('/api/voice/leave', { accounts: selectedAccounts(), guildId: state.selectedTarget.guildId });
     if (!result.summary?.ok) throw new Error(result.results?.find((item) => !item.ok)?.error || 'تعذر الخروج');
-    toast('تم الخروج من الغرفة', 'success'); addActivity('خرجت من الغرفة', state.selectedTarget.channelName, 'success'); await refreshSessions();
+    toast('تم الخروج من الغرفة', 'success'); addActivity('خرج من الغرفة', `${state.clients.find((client) => client.name === state.selectedAccount)?.nickname || state.selectedAccount} · ${state.selectedTarget.channelName}`, 'success', state.selectedAccount); await refreshSessions();
   } catch (error) { toast(error.message, 'error'); }
   finally { setBusy('leave', false); }
 }
@@ -314,8 +312,14 @@ async function applyState(kind) {
     cam: { selfMute: false, selfDeaf: false, selfVideo: true, selfStream: false, label: 'Video enabled' },
     stream: { selfMute: false, selfDeaf: false, selfVideo: false, selfStream: true, label: 'Stream enabled' },
   };
-  const next = values[kind];
+  const next = { ...values[kind] };
   if (!next) return;
+  const currentVoice = state.clients.find((client) => client.name === state.selectedAccount)?.voice;
+  if (kind === 'mute' && currentVoice?.selfMute) { next.selfMute = false; next.selfDeaf = false; next.label = 'Mute disabled'; }
+  if (kind === 'deaf' && currentVoice?.selfDeaf) { next.selfMute = false; next.selfDeaf = false; next.label = 'Deafen disabled'; }
+  if (kind === 'unmute' && !currentVoice?.selfMute && !currentVoice?.selfDeaf) { next.selfMute = true; next.selfDeaf = false; next.label = 'Mute enabled'; }
+  if (kind === 'cam' && state.mediaKind === 'camera') { stopCurrentStream(); return; }
+  if (kind === 'stream' && state.mediaKind === 'screen') { stopCurrentStream(); return; }
   if (kind === 'cam') {
     await toggleCamera();
     return;
@@ -325,14 +329,15 @@ async function applyState(kind) {
     return;
   }
   if (!state.selectedTarget) { toast('ادخل غرفة أولًا لتغيير الحالة', 'error'); return; }
+  const buttons = [...document.querySelectorAll('.state-button')]; buttons.forEach((button) => { button.disabled = true; button.classList.add('is-pending'); });
   try {
     const result = await post('/api/voice/state', { accounts: selectedAccounts(), guildId: state.selectedTarget.guildId, ...next });
     if (!result.summary?.ok) throw new Error(result.results?.find((item) => !item.ok)?.error || 'تعذر تحديث الحالة');
     document.querySelectorAll('.state-button').forEach((button) => button.classList.toggle('is-active', button.dataset.state === kind));
     const failed = result.summary.failed || 0;
     const message = failed ? `${next.label}: ${result.summary.ok} succeeded, ${failed} failed` : next.label;
-    feedback('#stateFeedback', message, failed ? 'error' : 'success'); addActivity('تحديث الحالة', message, failed ? 'error' : 'success'); toast(message, failed ? 'error' : 'success'); await refreshSessions();
-  } catch (error) { feedback('#stateFeedback', error.message, 'error'); toast(error.message, 'error'); }
+    feedback('#stateFeedback', message, failed ? 'error' : 'success'); addActivity('تحديث حالة صوتية', `${state.clients.find((client) => client.name === state.selectedAccount)?.nickname || state.selectedAccount} · ${message}`, failed ? 'error' : 'success', state.selectedAccount); toast(message, failed ? 'error' : 'success'); await refreshSessions();
+  } catch (error) { feedback('#stateFeedback', error.message, 'error'); toast(error.message, 'error'); } finally { buttons.forEach((button) => { button.disabled = false; button.classList.remove('is-pending'); }); }
 }
 
 function formatDuration(seconds) { return `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`; }
@@ -343,7 +348,7 @@ function renderSessions(sessions = []) {
     list.innerHTML = '<div class="empty-state"><span class="empty-pulse"></span><p>لا توجد جلسات نشطة الآن</p><small>عند الدخول إلى غرفة ستظهر تفاصيلها هنا.</small></div>';
     return;
   }
-  list.innerHTML = sessions.map((session) => `<div class="session-row"><span class="session-avatar">${escapeHTML((session.name || '?')[0].toUpperCase())}</span><div class="session-info"><strong>${escapeHTML(session.name)}</strong><small>${escapeHTML(session.guildId)} · ${escapeHTML(session.channelId)}</small></div><div class="session-state">${session.selfMute ? 'Mute' : 'Unmute'}${session.selfDeaf ? ' · Deafen' : ''}${session.selfVideo ? ' · Video' : ''}${session.selfStream ? ' · Stream' : ''}</div><button class="session-leave" type="button" data-leave-name="${escapeHTML(session.name)}" data-leave-guild="${escapeHTML(session.guildId)}" title="خروج">×</button></div>`).join('');
+  list.innerHTML = sessions.map((session) => `<div class="session-row"><span class="session-avatar">${session.guildIcon ? `<img src="${escapeHTML(session.guildIcon)}" alt="" />` : escapeHTML((session.guildName || '?')[0].toUpperCase())}</span><div class="session-info"><strong>${escapeHTML(session.name)}</strong><small>${escapeHTML(session.guildName || session.guildId)} · ${escapeHTML(session.channelName || session.channelId)} · ${Number(session.memberCount || 0)} متصل</small></div><div class="session-state">${session.selfMute ? 'Mute' : 'Unmute'}${session.selfDeaf ? ' · Deafen' : ''}${session.selfVideo ? ' · Video' : ''}${session.selfStream ? ' · Stream' : ''}</div><button class="session-leave" type="button" data-leave-name="${escapeHTML(session.name)}" data-leave-guild="${escapeHTML(session.guildId)}" title="خروج">×</button></div>`).join('');
   list.querySelectorAll('[data-leave-name]').forEach((button) => button.addEventListener('click', () => quickLeave(button.dataset.leaveName, button.dataset.leaveGuild)));
 }
 async function refreshSessions() {
@@ -415,7 +420,7 @@ async function stopTask(type, id) {
   catch (error) { toast(error.message, 'error'); }
 }
 async function quickLeave(name, guildId) {
-  try { await post('/api/voice/leave', { accounts: [name], guildId }); toast('تم إنهاء الجلسة', 'success'); addActivity('إنهاء جلسة', name); await refreshSessions(); }
+  try { await post('/api/voice/leave', { accounts: [name], guildId }); toast('تم إنهاء الجلسة', 'success'); addActivity('إنهاء جلسة', `${state.clients.find((client) => client.name === name)?.nickname || name} · ${guildId}`, 'success', name); await refreshSessions(); }
   catch (error) { toast(error.message, 'error'); }
 }
 
@@ -465,12 +470,14 @@ function showMediaStream(stream, kind) {
 }
 async function toggleCamera() {
   if (state.mediaKind === 'camera') { stopCurrentStream(); return; }
-  if (!navigator.mediaDevices?.getUserMedia) { toast('المتصفح لا يدعم الوصول إلى الكاميرا', 'error'); return; }
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' }, audio: false });
+    const canvas = document.createElement('canvas'); canvas.width = 1280; canvas.height = 720;
+    const ctx = canvas.getContext('2d'); ctx.fillStyle = '#080b18'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+    const stream = canvas.captureStream(15);
     showMediaStream(stream, 'camera');
+    $('#mediaNotice').textContent = 'Safe camera preview: a blank frame is used; no camera permission is requested.';
     await syncMediaVoiceState({ selfVideo: true, selfStream: false }, 'Camera');
-  } catch (error) { toast(error.name === 'NotAllowedError' ? 'تم رفض إذن الكاميرا' : `تعذر تشغيل الكاميرا: ${error.message}`, 'error'); addActivity('فشل تشغيل الكاميرا', error.message, 'error'); }
+  } catch (error) { toast(`تعذر تشغيل المعاينة: ${error.message}`, 'error'); addActivity('فشل تشغيل الكاميرا', error.message, 'error'); }
 }
 async function toggleScreen() {
   if (state.mediaKind === 'screen') { stopCurrentStream(); return; }
@@ -485,6 +492,10 @@ async function toggleScreen() {
   }
 }
 
+function renderFullActivity(page = 0) { const filter = $('#activityAccountFilter')?.value || ''; const items = JSON.parse(localStorage.getItem('voice-activity') || '[]').filter((item) => !filter || item.account === filter); const size = 20; const pages = Math.max(1, Math.ceil(items.length / size)); state.activityPage = Math.max(0, Math.min(page, pages - 1)); const visible = items.slice(state.activityPage * size, (state.activityPage + 1) * size); $('#fullActivityList').innerHTML = visible.length ? visible.map((item) => `<div class="activity-row"><span class="activity-dot ${escapeHTML(item.tone || '')}"></span><div><strong>${escapeHTML(item.title)}</strong><small>${escapeHTML(item.detail)}</small></div><time>${escapeHTML(new Date(item.time).toLocaleString())}</time></div>`).join('') : '<div class="task-empty">No activity yet</div>'; $('#activityPageLabel').textContent = `${state.activityPage + 1} / ${pages}`; $('#activityPrevButton').disabled = state.activityPage === 0; $('#activityNextButton').disabled = state.activityPage >= pages - 1; }
+function initActivity() { $('#activityExpandButton')?.addEventListener('click', () => { const filter = $('#activityAccountFilter'); filter.innerHTML = '<option value="">All accounts</option>' + state.clients.map((client) => `<option value="${escapeHTML(client.name)}">${escapeHTML(client.nickname || client.name)}</option>`).join(''); $('#activityModal').hidden = false; renderFullActivity(0); }); $('#activityAccountFilter')?.addEventListener('change', () => renderFullActivity(0)); $('#activityCloseButton')?.addEventListener('click', () => { $('#activityModal').hidden = true; }); $('#activityPrevButton')?.addEventListener('click', () => renderFullActivity(state.activityPage - 1)); $('#activityNextButton')?.addEventListener('click', () => renderFullActivity(state.activityPage + 1)); }
+function openLeaveAll() { const active = state.clients.filter((client) => client.voice); const list = $('#leaveAccountList'); list.innerHTML = active.length ? active.map((client) => `<label class="account-target"><input type="checkbox" value="${escapeHTML(client.name)}" data-leave-guild="${escapeHTML(client.voice.guildId)}" checked /><span class="target-avatar">${client.avatar ? `<img src="${escapeHTML(client.avatar)}" alt="" />` : escapeHTML((client.nickname || '?')[0])}</span><span class="target-copy"><strong>${escapeHTML(client.nickname || client.name)}</strong><small>${escapeHTML(client.voice.guildName || client.voice.guildId)} · ${escapeHTML(client.voice.channelName || client.voice.channelId)}</small></span></label>`).join('') : '<div class="task-empty">No connected account is currently in voice</div>'; $('#leaveModal').hidden = false; }
+async function leaveAllSelected() { const selected = [...document.querySelectorAll('#leaveAccountList input:checked')].map((input) => ({ name: input.value, guildId: input.dataset.leaveGuild })); if (!selected.length) { toast('اختر حسابًا واحدًا على الأقل', 'error'); return; } const groups = new Map(); selected.forEach((item) => { if (!groups.has(item.guildId)) groups.set(item.guildId, []); groups.get(item.guildId).push(item.name); }); $('#leaveModal').hidden = true; try { for (const [guildId, accounts] of groups) await post('/api/voice/leave', { accounts, guildId });   addActivity('خروج جماعي', `${selected.length} حساب`, 'success'); toast(`تم إخراج ${selected.length} حساب`, 'success'); await refreshSessions(); } catch (error) { toast(error.message, 'error'); } }
 function initTheme() {
   const saved = localStorage.getItem('voice-theme');
   if (saved === 'light') document.body.classList.add('light-theme');
@@ -502,9 +513,9 @@ function initLanguage() {
 }
 function initNavigation() { document.querySelectorAll('[data-section]').forEach((button) => button.addEventListener('click', () => { const section = button.dataset.section; document.querySelectorAll('.side-nav-item').forEach((item) => item.classList.toggle('is-active', item === button)); const breadcrumb = document.querySelector('.breadcrumb strong'); if (breadcrumb) breadcrumb.textContent = section[0].toUpperCase() + section.slice(1); document.querySelectorAll('[data-panel]').forEach((panel) => { const panels = panel.dataset.panel.split(/\s+/); panel.hidden = !panels.includes(section); }); })); document.querySelector('[data-section="dashboard"]')?.click(); }
 function init() {
-  initTheme(); initLanguage(); initNavigation();
+  initTheme(); initLanguage(); initNavigation(); initActivity();
   $('#connectButton').addEventListener('click', connect); $('#bulkConnectButton').addEventListener('click', bulkConnect); $('#disconnectButton').addEventListener('click', disconnect); $('#refreshButton').addEventListener('click', refreshChannels); $('#accountSelect').addEventListener('change', async (event) => { state.selectedAccount = event.target.value; await loadGuilds(); await loadAutomationCatalog(); }); $('#automationGuild').addEventListener('change', renderAutomationChannels); $('#automationChannel').addEventListener('change', renderTargetAccounts); $('#rotationRoomFilter').addEventListener('input', (event) => { state.rotationRoomFilter = event.target.value; state.rotationRoomPage = 0; renderRotationRooms(); }); $('#rotationPrevButton').addEventListener('click', () => { state.rotationRoomPage -= 1; renderRotationRooms(); }); $('#rotationNextButton').addEventListener('click', () => { state.rotationRoomPage += 1; renderRotationRooms(); }); $('#bulkJoinButton').addEventListener('click', bulkJoinSelected); $('#channelSelect').addEventListener('change', handleChannelChange); $('#joinButton').addEventListener('click', join); $('#joinAllButton').addEventListener('click', joinAll); $('#leaveButton').addEventListener('click', leave); $('#cameraButton').addEventListener('click', toggleCamera); $('#screenButton').addEventListener('click', toggleScreen); $('#startRotationButton').addEventListener('click', startRotation); $('#startCycleButton').addEventListener('click', startCycle); $('#stopMediaButton').addEventListener('click', () => stopCurrentStream()); document.querySelectorAll('.state-button').forEach((button) => button.addEventListener('click', () => applyState(button.dataset.state))); document.querySelectorAll('#statePicker input').forEach((input) => input.addEventListener('change', () => input.closest('.state-option')?.classList.toggle('is-selected', input.checked)));
-  $('#operationClose').addEventListener('click', () => { $('#operationModal').hidden = true; $('.operation-loader')?.classList.remove('is-done', 'is-error'); }); window.addEventListener('beforeunload', () => stopCurrentStream({ updateDiscord: false }));
+  $('#operationClose').addEventListener('click', () => { $('#operationModal').hidden = true; $('.operation-loader')?.classList.remove('is-done', 'is-error'); }); $('#leaveAllButton')?.addEventListener('click', openLeaveAll); $('#confirmLeaveButton')?.addEventListener('click', leaveAllSelected); $('#cancelLeaveButton')?.addEventListener('click', () => { $('#leaveModal').hidden = true; }); window.addEventListener('beforeunload', () => stopCurrentStream({ updateDiscord: false }));
   loadClients().catch(() => {}); refreshSessions(); setInterval(refreshSessions, 8000);
 }
 init();
