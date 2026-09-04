@@ -120,6 +120,9 @@ function cleanAccounts(accounts) {
   const values = Array.isArray(accounts) ? accounts : [accounts];
   return [...new Set(values.map((value) => String(value || '').trim()).filter(Boolean))].slice(0, 500);
 }
+function normalizeVoiceState(state = {}) {
+  return { selfMute: !!state.selfMute, selfDeaf: !!state.selfDeaf, selfVideo: !!state.selfVideo, selfStream: !!state.selfStream };
+}
 function cleanChannelIds(channelIds) {
   if (!Array.isArray(channelIds)) return [];
   return [...new Set(channelIds.map((value) => String(value || '').trim()).filter(Boolean))].slice(0, 500);
@@ -532,12 +535,17 @@ async function moveAccount(name, guildId, channelId, opts = {}) {
     if (!target.ok) return { name, ok: false, error: target.error };
     const current = readGatewayVoiceState(client, guildId) || voiceSessions.get(sessionKey(name, guildId));
     if (current?.channelId === channelId) return { name, ok: true, alreadyIn: true, channelId };
+    const desired = normalizeVoiceState({ ...(current || {}), ...opts });
     if (syntheticStreams.has(name)) stopSyntheticStream(name);
-    const result = await sendVoiceOpConfirmed(client, guildId, channelId, { ...opts, selfVideo: false, selfStream: false });
+    const result = await sendVoiceOpConfirmed(client, guildId, channelId, { ...desired, selfVideo: false, selfStream: false });
     if (result.ok) {
       for (const key of [...voiceSessions.keys()]) if (key.startsWith(`${name}__`) && key !== sessionKey(name, guildId)) voiceSessions.delete(key);
       const actual = readGatewayVoiceState(client, guildId);
-      upsertSession(name, guildId, channelId, { ...opts, ...(actual || {}), selfVideo: false, selfStream: false });
+      upsertSession(name, guildId, channelId, { ...desired, ...(actual || {}), selfVideo: desired.selfVideo, selfStream: desired.selfStream });
+      if (desired.selfStream || desired.selfVideo) {
+        const media = await startSyntheticStream(name, guildId, desired.selfStream ? 'go-live' : 'camera');
+        if (!media.ok) return { name, ok: false, error: media.error, channelId };
+      }
     }
     return { name, ok: result.ok, error: result.ok ? null : result.error, channelId };
   });
@@ -546,8 +554,14 @@ async function moveAccount(name, guildId, channelId, opts = {}) {
 async function connectOne(token, name) {
   if (typeof token !== 'string' || !token.trim()) throw new Error('A Discord token is required');
   let finalName = String(name || '').trim().slice(0, 48);
+  const normalizedToken = token.trim();
+  const existing = [...clients.entries()].find(([, entry]) => entry.token === normalizedToken);
+  if (existing) {
+    const existingClient = existing[1].client;
+    return { name: existing[0], username: existingClient.user?.tag || existingClient.user?.username || existing[0], displayName: existingClient.user?.globalName || existingClient.user?.username || existing[0], nickname: existingClient.user?.globalName || existingClient.user?.username || existing[0], id: existingClient.user?.id || null, avatar: existingClient.user?.displayAvatarURL?.({ size: 128 }) || null, alreadyConnected: true };
+  }
   const client = new Client({ checkUpdate: false, fetchAllMembers: false });
-  await client.login(token.trim());
+  await client.login(normalizedToken);
   if (!finalName) finalName = String(client.user?.globalName || client.user?.username || `account-${clients.size + 1}`).trim().slice(0, 48);
   if (clients.has(finalName)) {
     stopTasksForAccount(finalName);
@@ -555,7 +569,7 @@ async function connectOne(token, name) {
     try { await clients.get(finalName).client.destroy(); } catch {}
     clients.delete(finalName);
   }
-  const entry = { client, token: token.trim(), savedAt: Date.now(), connectedAt: Date.now(), lastSeenAt: Date.now(), lastError: null };
+  const entry = { client, token: normalizedToken, savedAt: Date.now(), connectedAt: Date.now(), lastSeenAt: Date.now(), lastError: null };
   clients.set(finalName, entry);
   persistConnectedAccounts();
   const markError = (error) => { entry.lastError = redact(error?.message || String(error || 'Unknown Discord client error')); entry.lastSeenAt = Date.now(); emitLive('account.health.changed', { account: accountHealth(finalName, entry) }); };
@@ -907,7 +921,12 @@ app.post('/api/voice/rotation/start', async (req, res) => {
   const channelIds = cleanChannelIds(req.body?.channelIds);
   const delay = Math.max(1000, Number(intervalMs || 60000));
   if (!accounts.length || !guildId || !Array.isArray(channelIds) || channelIds.length < 2) return fail(res, new Error('At least two channels and one account are required'), 400);
-  const initial = await Promise.all(accounts.map((name) => moveAccount(name, guildId, channelIds[0])));
+  const initial = await Promise.all(accounts.map((name, index) => {
+    const current = voiceSessions.get(sessionKey(name, guildId));
+    const currentIndex = channelIds.indexOf(current?.channelId);
+    const targetIndex = currentIndex >= 0 ? (currentIndex + 1) % channelIds.length : index % channelIds.length;
+    return moveAccount(name, guildId, channelIds[targetIndex], normalizeVoiceState(current || {}));
+  }));
   const readyAccounts = initial.filter((result) => result.ok).map((result) => result.name);
   if (!readyAccounts.length) return ok(res, { id: null, started: false, initial, summary: summary(initial) });
   const id = crypto.randomUUID();
@@ -920,7 +939,12 @@ app.post('/api/voice/rotation/start', async (req, res) => {
     task.currentIdx = (task.currentIdx + 1) % task.channels.length;
     const ids = task.randomOrder ? [...task.channels].sort(() => Math.random() - 0.5) : task.channels;
     try {
-      task.lastResults = await Promise.all(task.accounts.map((name, index) => moveAccount(name, task.guildId, ids[(task.currentIdx + index) % ids.length])));
+      task.lastResults = await Promise.all(task.accounts.map((name, index) => {
+        const current = voiceSessions.get(sessionKey(name, task.guildId));
+        const currentIndex = ids.indexOf(current?.channelId);
+        const targetIndex = currentIndex >= 0 ? (currentIndex + 1) % ids.length : (task.currentIdx + index) % ids.length;
+        return moveAccount(name, task.guildId, ids[targetIndex], normalizeVoiceState(current || {}));
+      }));
       task.nextAt = Date.now() + task.intervalMs;
     } finally { task.running = false; }
   }, delay);
@@ -949,7 +973,7 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
     const current = voiceSessions.get(sessionKey(name, task.guildId));
     const client = getClient(name);
     if (!current || !client) return { name, ok: false, error: 'Account is not currently in a voice channel' };
-    const next = { ...current, ...task.states[0] };
+    const next = { ...current, ...normalizeVoiceState(task.states[0]) };
     if (next.selfDeaf && (next.selfVideo || next.selfStream)) return { name, ok: false, error: 'Invalid deafened media state' };
     const result = (next.selfStream || next.selfVideo)
       ? await startSyntheticStream(name, task.guildId, next.selfStream ? 'go-live' : 'camera')
@@ -969,7 +993,7 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
         if (!current) return;
         const client = getClient(name);
         if (!client) return;
-        const next = { ...current, ...state };
+        const next = { ...current, ...normalizeVoiceState(state) };
         if (next.selfDeaf && (next.selfVideo || next.selfStream)) return;
         let result;
         if (next.selfStream || next.selfVideo) result = await startSyntheticStream(name, task.guildId, next.selfStream ? 'go-live' : 'camera');
