@@ -10,7 +10,8 @@ const helmet = require('helmet');
 const AUTH_COOKIE = 'voice_studio_auth';
 const CLIENT_DEVICE_COOKIE = 'voice_studio_client_device';
 const AUTH_TTL_MS = 12 * 60 * 60 * 1000;
-const AUTH_ENABLED = Boolean(process.env.APP_PASSWORD || process.env.NODE_ENV === 'production');
+// Fail closed: a production deployment without an owner password must not expose the API.
+const AUTH_ENABLED = true;
 const ACCOUNT_FILE = path.join(__dirname, 'data', 'accounts.enc');
 
 const app = express();
@@ -614,7 +615,7 @@ app.post('/api/auth', (req, res) => {
     }
   }
   const value = makeAuthCookie(role, role === 'owner' ? process.env.APP_PASSWORD : process.env.CLIENT_PASSWORD);
-  const secure = req.secure || req.headers['x-forwarded-proto'] === 'https'; const flags = `Path=/; HttpOnly; SameSite=Lax${secure ? '; Secure' : ''}`;
+  const secure = req.secure || req.headers['x-forwarded-proto'] === 'https'; const flags = `Path=/; HttpOnly; SameSite=Strict${secure ? '; Secure' : ''}`;
   const cookies = [`${AUTH_COOKIE}=${encodeURIComponent(value)}; Max-Age=${Math.floor(AUTH_TTL_MS / 1000)}; ${flags}`];
   if (deviceCookie) cookies.push(`${CLIENT_DEVICE_COOKIE}=${encodeURIComponent(deviceCookie)}; Max-Age=${Math.floor(AUTH_TTL_MS / 1000)}; ${flags}`);
   res.setHeader('Cache-Control', 'no-store');
@@ -627,6 +628,7 @@ const requestBuckets = new Map();
 const authAttempts = new Map();
 function originGuard(req, res, next) {
   if (req.method === 'GET' || req.path === '/auth') return next();
+  if (req.get('x-voice-studio') !== '1') return res.status(403).json({ success: false, error: 'Invalid request context' });
   const origin = req.get('origin');
   if (!origin) return next();
   try { if (new URL(origin).host !== req.get('host')) return res.status(403).json({ success: false, error: 'Cross-origin request blocked' }); } catch { return res.status(403).json({ success: false, error: 'Invalid request origin' }); }

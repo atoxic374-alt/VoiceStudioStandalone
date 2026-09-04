@@ -64,7 +64,7 @@ function requestAuthentication(message = 'أدخل كلمة مرور المسا�
       cancel.disabled = true;
       setFeedback('جارٍ التحقق…');
       try {
-        const auth = await fetch('/api/auth', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password }), credentials: 'include', cache: 'no-store' });
+        const auth = await fetch('/api/auth', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Voice-Studio': '1' }, body: JSON.stringify({ password }), credentials: 'include', cache: 'no-store' });
         const payload = await auth.json().catch(() => ({}));
         if (!auth.ok || payload.success === false) throw new Error(auth.status === 429 ? 'محاولات كثيرة. حاول لاحقًا.' : 'كلمة المرور غير صحيحة.');
         const session = await fetch('/api/auth/status', { credentials: 'include', cache: 'no-store' });
@@ -91,7 +91,7 @@ function requestAuthentication(message = 'أدخل كلمة مرور المسا�
 }
 
 const api = async (url, options = {}) => {
-  const response = await fetch(url, { ...options, credentials: 'include', cache: 'no-store', headers: { 'Content-Type': 'application/json', ...(options.headers || {}) } });
+  const response = await fetch(url, { ...options, credentials: 'include', cache: 'no-store', headers: { 'Content-Type': 'application/json', 'X-Voice-Studio': '1', ...(options.headers || {}) } });
   const payload = await response.json().catch(() => ({}));
   if (response.status === 401 && !options._authRetry) {
     await requestAuthentication();
