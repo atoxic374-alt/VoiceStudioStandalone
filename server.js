@@ -77,7 +77,7 @@ let videoStreamModulePromise;
 const liveEvents = new EventEmitter();
 liveEvents.setMaxListeners(0);
 const accountLocks = new Map();
-const SYNTHETIC_VIDEO_FILE = path.join(DATA_DIR, 'synthetic-stream.mp4');
+const SYNTHETIC_VIDEO_FILE = path.join(DATA_DIR, 'synthetic-stream-black-v2.mp4');
 
 function ok(res, payload = {}) { return res.json({ success: true, ...payload }); }
 function redact(value) { return String(value ?? '').replace(/(token|authorization|password|cookie)(["']?\s*[:=]\s*["']?)[^"',;\s}]+/gi, '$1$2[redacted]'); }
@@ -159,7 +159,7 @@ for (const session of readPersistedSessions()) {
 function ensureSyntheticVideo() {
   if (fs.existsSync(SYNTHETIC_VIDEO_FILE)) return SYNTHETIC_VIDEO_FILE;
   try {
-    execFileSync(FFMPEG_PATH || 'ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi', '-i', 'color=c=black:s=640x360:r=15', '-t', '60', '-an', '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', SYNTHETIC_VIDEO_FILE], { stdio: 'ignore' });
+    execFileSync(FFMPEG_PATH || 'ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi', '-i', 'color=c=black:s=640x360:r=15', '-t', '3600', '-an', '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', SYNTHETIC_VIDEO_FILE], { stdio: 'ignore' });
     return SYNTHETIC_VIDEO_FILE;
   } catch (error) {
     throw new Error(`Unable to create synthetic stream source: ${error.message}`);
