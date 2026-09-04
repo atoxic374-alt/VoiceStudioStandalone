@@ -24,7 +24,7 @@
         <button class="side-nav-item" type="button" data-section="accounts"><span class="nav-glyph">◎</span><span>Accounts</span><span id="navAccountCount" class="nav-count">0</span></button>
         <button class="side-nav-item" type="button" data-section="voice"><span class="nav-glyph">♫</span><span>Voice</span></button>
         <button class="side-nav-item" type="button" data-section="automation"><span class="nav-glyph">↻</span><span>Automation</span></button>
-        <button class="side-nav-item" type="button" data-section="media"><span class="nav-glyph">◉</span><span>Media</span></button>
+        <button class="side-nav-item" type="button" data-section="voice"><span class="nav-glyph">◉</span><span>Media</span></button>
         <button class="side-nav-item" type="button" data-section="activity"><span class="nav-glyph">≋</span><span>Activity</span><span id="navSessionCount" class="nav-count">0</span></button>
       </nav>
       <div class="sidebar-footer">
@@ -113,19 +113,7 @@
           </div>
 
           <div class="column-side">
-            <article id="mediaCard" class="card media-card" data-panel="media">
-              <div class="card-heading compact"><div><span class="card-kicker">MEDIA / PREVIEW</span><h2>Camera & Screen</h2></div><span id="mediaStatus" class="media-status"><span></span> Offline</span></div>
-              <div class="media-stage" id="mediaStage">
-                <video id="cameraPreview" class="preview-video" autoplay muted playsinline></video>
-                <div id="stagePlaceholder" class="stage-placeholder"><div class="stage-glow"></div><div class="stage-icon">✦</div><strong>Media preview</strong><small>Start Camera or Screen share<br />to preview it here.</small></div>
-                <div id="stageOverlay" class="stage-overlay"><span id="stageSource">—</span><span id="stageTimer">00:00</span></div>
-              </div>
-              <div class="media-controls"><button id="cameraButton" class="media-control" type="button"><span class="control-icon">●</span><span>Camera</span><small id="cameraState">Off</small></button><button id="screenButton" class="media-control" type="button"><span class="control-icon">▣</span><span>Screen share</span><small id="screenState">Off</small></button></div>
-              <div class="media-notice"><span>i</span><p id="mediaNotice">Preview runs locally in your browser. A source starts only after permission.</p></div>
-              <button id="stopMediaButton" class="stop-media-button" type="button" disabled>Stop source</button>
-            </article>
-
-            <article class="card quick-card" data-panel="voice">
+<article class="card quick-card" data-panel="voice">
               <div class="card-heading compact"><div><span class="card-kicker">VOICE / QUICK STATE</span><h2>Quick controls</h2></div><span class="shortcut-hint">⌘ K</span></div>
               <div class="state-grid"><button class="state-button" data-state="mute" type="button"><span class="state-icon">♩</span><span>Mute</span><small>Microphone off</small></button><button class="state-button" data-state="deaf" type="button"><span class="state-icon">◌</span><span>Deafen</span><small>Audio off</small></button><button class="state-button" data-state="unmute" type="button"><span class="state-icon">♫</span><span>Unmute</span><small>Voice on</small></button><button class="state-button" data-state="cam" type="button"><span class="state-icon">▣</span><span>Video</span><small>Camera on</small></button><button class="state-button" data-state="stream" type="button"><span class="state-icon">▤</span><span>Stream</span><small>Screen share</small></button></div>
               <div id="stateFeedback" class="inline-feedback" role="status" aria-live="polite"></div>

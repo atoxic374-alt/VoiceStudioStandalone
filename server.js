@@ -2,6 +2,7 @@ const express = require('express');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
+const { execFileSync } = require('child_process');
 const { Client } = require('discord.js-selfbot-v13');
 const helmet = require('helmet');
 
@@ -20,6 +21,8 @@ const clients = new Map();
 const voiceSessions = new Map();
 const rotations = new Map();
 const stateCycles = new Map();
+const syntheticStreams = new Map();
+const SYNTHETIC_VIDEO_FILE = path.join(DATA_DIR, 'synthetic-stream.mp4');
 
 function ok(res, payload = {}) { return res.json({ success: true, ...payload }); }
 function fail(res, error, status = 200) {
@@ -62,6 +65,42 @@ for (const session of readPersistedSessions()) {
   if (session?.name && session?.guildId && session?.channelId) voiceSessions.set(sessionKey(session.name, session.guildId), session);
 }
 
+function ensureSyntheticVideo() {
+  if (fs.existsSync(SYNTHETIC_VIDEO_FILE)) return SYNTHETIC_VIDEO_FILE;
+  try {
+    execFileSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi', '-i', 'color=c=black:s=640x360:r=15', '-t', '60', '-an', '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', SYNTHETIC_VIDEO_FILE], { stdio: 'ignore' });
+    return SYNTHETIC_VIDEO_FILE;
+  } catch (error) {
+    throw new Error(`Unable to create synthetic stream source: ${error.message}`);
+  }
+}
+function stopSyntheticStream(name) {
+  const active = syntheticStreams.get(name);
+  if (!active) return;
+  try { active.dispatcher?.destroy?.(); } catch {}
+  try { active.streamConnection?.disconnect?.(); } catch {}
+  syntheticStreams.delete(name);
+}
+async function startSyntheticStream(name, guildId) {
+  const client = getClient(name);
+  const session = voiceSessions.get(sessionKey(name, guildId));
+  if (!client || !session?.channelId) return { ok: false, error: 'Account is not in a voice channel' };
+  if (syntheticStreams.has(name)) return { ok: true, alreadyActive: true };
+  const guild = client.guilds?.cache?.get?.(guildId);
+  const channel = guild?.channels?.cache?.get?.(session.channelId);
+  if (!channel) return { ok: false, error: 'Voice channel is not available for streaming' };
+  try {
+    const connection = await client.voice.joinChannel(channel, { selfMute: !!session.selfMute, selfDeaf: false, selfVideo: true, videoCodec: 'H264' });
+    const streamConnection = await connection.createStreamConnection();
+    const dispatcher = streamConnection.playVideo(ensureSyntheticVideo(), { fps: 15, preset: 'ultrafast', bitrate: 500 });
+    syntheticStreams.set(name, { connection, streamConnection, dispatcher, guildId, channelId: session.channelId });
+    dispatcher.once?.('finish', () => { if (syntheticStreams.get(name)?.dispatcher === dispatcher) stopSyntheticStream(name); });
+    return { ok: true };
+  } catch (error) {
+    stopSyntheticStream(name);
+    return { ok: false, error: error?.message || 'Unable to start synthetic stream' };
+  }
+}
 function getClient(name) {
   const entry = clients.get(String(name || ''));
   return entry?.client || null;
@@ -288,11 +327,13 @@ app.post('/api/discord/disconnect', async (req, res) => {
   const name = String(req.body?.name || [...clients.keys()][0] || '');
   const entry = clients.get(name);
   if (!entry) return ok(res);
+  stopSyntheticStream(name);
   try { await entry.client.destroy(); } catch {}
   clients.delete(name);
   return ok(res, { name });
 });
 app.post('/api/discord/disconnect-all', async (_req, res) => {
+  for (const name of clients.keys()) stopSyntheticStream(name);
   for (const entry of clients.values()) { try { await entry.client.destroy(); } catch {} }
   clients.clear();
   return ok(res);
@@ -372,6 +413,7 @@ app.post('/api/voice/leave', async (req, res) => {
   const results = await Promise.all(accounts.map(async (name) => {
     const client = getClient(name);
     if (!client) return { name, ok: false, error: 'Account is not connected' };
+    stopSyntheticStream(name);
     const result = await sendVoiceOpConfirmed(client, guildId, null, {}, 5000);
     if (result.ok) removeSessionsForAccount(name, guildId);
     return { name, ok: result.ok, error: result.ok ? null : result.error };
@@ -396,8 +438,13 @@ app.post('/api/voice/state', async (req, res) => {
       selfStream: selfStream !== undefined ? selfStream : !!current.selfStream,
     };
     if (next.selfDeaf && (next.selfVideo || next.selfStream)) return { name, ok: false, error: 'Video or screen share cannot be enabled while deafened' };
-    const result = await sendVoiceOpConfirmed(client, guildId, current.channelId, next, 5000);
-    if (result.ok) { const actual = readGatewayVoiceState(client, guildId); Object.assign(current, next, actual || {}, { updatedAt: Date.now() }); persistSessions(); }
+    let result;
+    if (next.selfStream) result = await startSyntheticStream(name, guildId);
+    else {
+      if (current.selfStream) stopSyntheticStream(name);
+      result = await sendVoiceOpConfirmed(client, guildId, current.channelId, next, 5000);
+    }
+    if (result.ok) { const actual = readGatewayVoiceState(client, guildId); Object.assign(current, next, actual || {}, { selfStream: !!next.selfStream, updatedAt: Date.now() }); persistSessions(); }
     return { name, ok: result.ok, error: result.ok ? null : result.error };
   }));
   return ok(res, { results, summary: summary(results) });
@@ -468,8 +515,8 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
     if (!current || !client) return { name, ok: false, error: 'Account is not currently in a voice channel' };
     const next = { ...current, ...task.states[0] };
     if (next.selfDeaf && (next.selfVideo || next.selfStream)) return { name, ok: false, error: 'Invalid deafened media state' };
-    const result = await sendVoiceOpConfirmed(client, task.guildId, current.channelId, next, 5000);
-    if (result.ok) { Object.assign(current, next, { updatedAt: Date.now() }); persistSessions(); }
+    const result = next.selfStream ? await startSyntheticStream(name, task.guildId) : await sendVoiceOpConfirmed(client, task.guildId, current.channelId, next, 5000);
+    if (result.ok) { Object.assign(current, next, { selfStream: !!next.selfStream, updatedAt: Date.now() }); persistSessions(); }
     return { name, ok: result.ok, error: result.ok ? null : result.error };
   }));
   task.timer = setInterval(async () => {
@@ -486,8 +533,14 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
         if (!client) return;
         const next = { ...current, ...state };
         if (next.selfDeaf && (next.selfVideo || next.selfStream)) return;
-        const result = await sendVoiceOpConfirmed(client, task.guildId, current.channelId, next, 3000);
-        if (result.ok) { Object.assign(current, next); persistSessions(); }
+        let result;
+        if (next.selfStream) result = await startSyntheticStream(name, task.guildId);
+        else {
+          if (current.selfStream) stopSyntheticStream(name);
+          result = await sendVoiceOpConfirmed(client, task.guildId, current.channelId, next, 5000);
+        }
+        if (result.ok) { Object.assign(current, next, { selfStream: !!next.selfStream, updatedAt: Date.now() }); persistSessions(); }
+        task.lastResults.push({ name, ok: result.ok, error: result.ok ? null : result.error });
       }));
       task.nextAt = Date.now() + task.intervalMs;
     } finally { task.running = false; }
@@ -508,4 +561,4 @@ if (require.main === module) {
   app.listen(PORT, '0.0.0.0', () => console.log(`Voice Studio listening on http://localhost:${PORT}`));
 }
 
-module.exports = { app, clients, voiceSessions, sendVoiceOp, sendVoiceOpConfirmed, validateTarget };
+module.exports = { app, clients, voiceSessions, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo };

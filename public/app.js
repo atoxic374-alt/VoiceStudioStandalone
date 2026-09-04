@@ -480,16 +480,19 @@ async function toggleCamera() {
   } catch (error) { toast(`تعذر تشغيل المعاينة: ${error.message}`, 'error'); addActivity('فشل تشغيل الكاميرا', error.message, 'error'); }
 }
 async function toggleScreen() {
-  if (state.mediaKind === 'screen') { stopCurrentStream(); return; }
-  if (!navigator.mediaDevices?.getDisplayMedia) { toast('المتصفح لا يدعم مشاركة الشاشة', 'error'); return; }
+  if (!state.selectedTarget || !state.selectedAccount) { toast('ادخل الحساب إلى غرفة صوتية أولًا', 'error'); return; }
+  const current = state.clients.find((client) => client.name === state.selectedAccount)?.voice;
+  const enabled = !current?.selfStream;
   try {
-    const stream = await navigator.mediaDevices.getDisplayMedia({ video: { cursor: 'always', frameRate: { ideal: 30, max: 60 } }, audio: false });
-    showMediaStream(stream, 'screen');
-    $('#cameraPreview').style.transform = 'none';
-    await syncMediaVoiceState({ selfVideo: false, selfStream: true }, 'Screen share');
-  } catch (error) {
-    if (error.name !== 'NotAllowedError' && error.name !== 'AbortError') toast(`تعذرت مشاركة الشاشة: ${error.message}`, 'error');
-  }
+    const result = await api('/api/voice/state', { method: 'POST', body: JSON.stringify({ accounts: selectedAccounts(), guildId: state.selectedTarget.guildId, selfVideo: enabled, selfStream: enabled }) });
+    if (!result.summary?.ok) throw new Error(result.results?.find((item) => !item.ok)?.error || 'تعذر تشغيل البث الاصطناعي');
+    const button = document.querySelector('.state-button[data-state="stream"]');
+    button?.classList.toggle('is-active', enabled);
+    button?.querySelector('small') && (button.querySelector('small').textContent = enabled ? 'Synthetic stream on' : 'Screen share off');
+    await refreshSessions();
+    addActivity(enabled ? 'بدأ بث اصطناعي' : 'أوقف البث الاصطناعي', `${state.clients.find((client) => client.name === state.selectedAccount)?.nickname || state.selectedAccount} · ${state.selectedTarget.channelName}`, 'success', state.selectedAccount);
+    toast(enabled ? 'تم تشغيل البث الاصطناعي' : 'تم إيقاف البث الاصطناعي', 'success');
+  } catch (error) { toast(error.message, 'error'); }
 }
 
 function renderFullActivity(page = 0) { const filter = $('#activityAccountFilter')?.value || ''; const items = JSON.parse(localStorage.getItem('voice-activity') || '[]').filter((item) => !filter || item.account === filter); const size = 20; const pages = Math.max(1, Math.ceil(items.length / size)); state.activityPage = Math.max(0, Math.min(page, pages - 1)); const visible = items.slice(state.activityPage * size, (state.activityPage + 1) * size); $('#fullActivityList').innerHTML = visible.length ? visible.map((item) => `<div class="activity-row"><span class="activity-dot ${escapeHTML(item.tone || '')}"></span><div><strong>${escapeHTML(item.title)}</strong><small>${escapeHTML(item.detail)}</small></div><time>${escapeHTML(new Date(item.time).toLocaleString())}</time></div>`).join('') : '<div class="task-empty">No activity yet</div>'; $('#activityPageLabel').textContent = `${state.activityPage + 1} / ${pages}`; $('#activityPrevButton').disabled = state.activityPage === 0; $('#activityNextButton').disabled = state.activityPage >= pages - 1; }
