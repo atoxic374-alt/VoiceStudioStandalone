@@ -205,11 +205,16 @@ async function startSyntheticStream(name, guildId, mediaKind = 'go-live') {
         await withTimeout(streamer.joinVoice(guildId, session.channelId), 20000, 'Voice WebRTC connection timed out');
         logMediaEvent('info', 'stream.media_connecting', { account: name, guildId, channelId: session.channelId, attempt });
         controller = new AbortController();
-        syntheticStreams.set(name, { streamer, controller, guildId, channelId: session.channelId, mediaKind });
+        const active = { streamer, controller, guildId, channelId: session.channelId, mediaKind, startedAt: Date.now() };
+        syntheticStreams.set(name, active);
         const task = playStream(source, streamer, { type: mediaKind, width: 640, height: 360, frameRate: 15 }, controller.signal);
-        syntheticStreams.get(name).task = task;
-        task.then(() => { if (syntheticStreams.get(name)?.task === task) stopSyntheticStream(name); }).catch((error) => logMediaEvent('error', 'stream.runtime_failed', { account: name, guildId, channelId: session.channelId, error: error?.message || String(error) }));
+        active.task = task;
+        task.then(() => {
+          active.completedAt = Date.now();
+          if (syntheticStreams.get(name)?.task === task) stopSyntheticStream(name);
+        }).catch((error) => logMediaEvent('error', 'stream.runtime_failed', { account: name, guildId, channelId: session.channelId, error: error?.message || String(error) }));
         await new Promise((resolve) => setTimeout(resolve, 700));
+        if (active.completedAt || syntheticStreams.get(name) !== active) throw new Error('Media transport stopped before Discord confirmed it was active');
         logMediaEvent('info', 'stream.ready', { account: name, guildId, channelId: session.channelId, durationMs: Date.now() - startedAt, attempt });
         return { ok: true };
       } catch (error) {
