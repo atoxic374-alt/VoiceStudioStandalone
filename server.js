@@ -193,7 +193,8 @@ async function startSyntheticStream(name, guildId) {
       try {
         const existing = client.voice.connection;
         connection = existing?.channel?.id === session.channelId ? existing : await withTimeout(client.voice.joinChannel(channel, { selfMute: !!session.selfMute, selfDeaf: false, selfVideo: false, videoCodec: 'H264' }), 12000, 'Voice connection timed out while starting stream');
-        const streamConnection = await withTimeout(connection.createStreamConnection(), 8000, 'Stream connection timed out');
+        logMediaEvent('info', 'stream.media_connecting', { account: name, guildId, channelId: session.channelId, attempt });
+        const streamConnection = await withTimeout(connection.createStreamConnection(), 20000, 'Stream connection timed out while waiting for Discord Media');
         let dispatcher;
         let playError;
         for (const options of [{ fps: 15, presetH26x: 'superfast', bitrate: 500, inputFFmpegArgs: ['-stream_loop', '-1'], outputFFmpegArgs: ['-g', '30'] }, { fps: 10, presetH26x: 'veryfast', bitrate: 300, inputFFmpegArgs: ['-stream_loop', '-1'], outputFFmpegArgs: ['-g', '20'] }]) {
@@ -208,6 +209,7 @@ async function startSyntheticStream(name, guildId) {
         return { ok: true };
       } catch (error) {
         lastError = error;
+        try { connection?.streamConnection?.disconnect?.(); } catch {}
         try { connection?.streamConnection?.disconnect?.(); } catch {}
         try { sendVoiceOp(client, guildId, session.channelId, { selfMute: !!session.selfMute, selfDeaf: !!session.selfDeaf, selfVideo: false, selfStream: false }); } catch {}
         logMediaEvent('error', 'stream.attempt_failed', { account: name, guildId, channelId: session.channelId, attempt, durationMs: Date.now() - startedAt, error: error?.message || String(error) });
