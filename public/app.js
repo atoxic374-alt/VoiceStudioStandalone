@@ -14,16 +14,22 @@ const state = {
   rotationRoomSelection: new Set(),
   busy: new Set(),
   overviewFilter: '', overviewSort: 'account',
-  lastOperation: null,
+  lastOperation: null, authenticated: false,
   refreshPromise: null, liveEvents: null, liveRefreshTimer: null,
 };
 
 const api = async (url, options = {}) => {
-  const response = await fetch(url, {
-    ...options,
-    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
-  });
+  const response = await fetch(url, { ...options, headers: { 'Content-Type': 'application/json', ...(options.headers || {}) } });
   const payload = await response.json().catch(() => ({}));
+  if (response.status === 401 && !options._authRetry) {
+    const password = window.prompt('Enter the Voice Studio access password');
+    if (!password) throw new Error('Authentication required');
+    const auth = await fetch('/api/auth', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password }) });
+    const authPayload = await auth.json().catch(() => ({}));
+    if (!auth.ok || authPayload.success === false) throw new Error('Invalid access password');
+    state.authenticated = true;
+    return api(url, { ...options, _authRetry: true });
+  }
   if (!response.ok || payload.success === false) throw new Error(payload.error || `Request failed (${response.status})`);
   return payload;
 };

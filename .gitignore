@@ -1,7 +1,11 @@
 node_modules/
 .env
 .env.*
+!.env.example
 *.log
 data/*.json
 data/*.tmp
+data/*.mp4
+data/*.webm
+*.sqlite
 .DS_Store

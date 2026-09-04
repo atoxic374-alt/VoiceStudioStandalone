@@ -77,3 +77,12 @@ All write operations use one consistent processing dialog. It shows the operatio
 ## Clear status controls and large account lists
 
 Technical voice states use consistent English labels throughout the interface: `Mute`, `Unmute`, `Deafen`, `Video`, and `Stream`. The Automation state selector is a large visual panel rather than a compact multi-select, with a separate card for each state and a short explanation. The Accounts and live profile lists use bounded scrolling so a large number of connected accounts remains usable without stretching the page indefinitely.
+
+
+## Railway security requirements
+
+عند النشر على Railway يجب ضبط `NODE_ENV=production` وإنشاء `APP_PASSWORD` قوية وعشوائية داخل Railway Variables. في وضع الإنتاج تعمل الواجهة بنظام مغلق افتراضيًا؛ أي طلب API بدون Cookie صالحة يعيد `401`. توكنات Discord تدخل فقط عبر واجهة HTTPS المصادق عليها، ولا يعيدها أي endpoint ولا يحفظها التطبيق في ملف أو قاعدة بيانات. يجب الإبقاء على HTTPS وعدم وضع Node خلف proxy عام يلغي المصادقة.
+
+يطبق الخادم كذلك Security Headers، وContent Security Policy، وحدود حجم الطلب، وRate Limiting، وتحديد محاولات المصادقة، و`Cache-Control: no-store` لاستجابات API، وتنقيح رسائل الأخطاء من أنماط token وpassword وauthorization. ملفات الجلسات وملفات البث الناتجة أثناء التشغيل مستثناة من Git. إذا تعرض مشروع Railway أو جلسة المتصفح أو السجلات أو Variables، يجب تغيير `APP_PASSWORD` وتدوير جميع توكنات Discord فورًا.
+
+قبل النشر، تحقق من وجود `APP_PASSWORD` داخل Railway Variables، ومن عدم ظهور أي توكن في Build Logs أو Deployment Logs، ومن أن `/api/health` يعيد `401` بدون Cookie المصادقة. حافظ على المستودع Private، ولا ترفع `.env` أو صادرات Railway أو مجلد `data/` أو لقطات شاشة تحتوي على توكنات أو Browser Storage منسوخ.

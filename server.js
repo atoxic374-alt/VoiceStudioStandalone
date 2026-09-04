@@ -6,6 +6,9 @@ const { execFileSync } = require('child_process');
 const { EventEmitter } = require('events');
 const { Client } = require('discord.js-selfbot-v13');
 const helmet = require('helmet');
+const AUTH_COOKIE = 'voice_studio_auth';
+const AUTH_TTL_MS = 12 * 60 * 60 * 1000;
+const AUTH_ENABLED = Boolean(process.env.APP_PASSWORD || process.env.NODE_ENV === 'production');
 
 const app = express();
 const PORT = Number(process.env.PORT || 5050);
@@ -13,7 +16,11 @@ const DATA_DIR = path.join(__dirname, 'data');
 const VOICE_STATE_FILE = path.join(DATA_DIR, 'voice-sessions.json');
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
-app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
+app.set('trust proxy', 1);
+app.use(helmet({
+  crossOriginEmbedderPolicy: false,
+  contentSecurityPolicy: { directives: { defaultSrc: ["'self'"], scriptSrc: ["'self'"], styleSrc: ["'self'", "'unsafe-inline'"], imgSrc: ["'self'", 'data:', 'https:'], connectSrc: ["'self'"], fontSrc: ["'self'", 'https:', 'data:'], objectSrc: ["'none'"], baseUri: ["'self'"], frameAncestors: ["'none'"] } },
+}));
 app.use(express.json({ limit: '1mb' }));
 app.use(express.static(path.join(__dirname, 'public'), { extensions: ['html'] }));
 
@@ -29,6 +36,26 @@ const accountLocks = new Map();
 const SYNTHETIC_VIDEO_FILE = path.join(DATA_DIR, 'synthetic-stream.mp4');
 
 function ok(res, payload = {}) { return res.json({ success: true, ...payload }); }
+function redact(value) { return String(value ?? '').replace(/(token|authorization|password|cookie)(["']?\s*[:=]\s*["']?)[^"',;\s}]+/gi, '$1$2[redacted]'); }
+function fail(res, error, status = 200) {
+  const message = redact(error?.message || String(error || 'Unknown error'));
+  return res.status(status).json({ success: false, error: message });
+}
+function parseCookies(req) { const result = {}; for (const part of String(req.headers.cookie || '').split(';')) { const separator = part.indexOf('='); if (separator < 1) continue; const key = part.slice(0, separator).trim(); const raw = part.slice(separator + 1).trim(); try { result[key] = decodeURIComponent(raw); } catch {} } return result; }
+function authSignature(value) { return crypto.createHmac('sha256', process.env.APP_PASSWORD || 'disabled').update(value).digest('base64url'); }
+function hasValidAuth(req) {
+  if (!AUTH_ENABLED) return true;
+  const raw = parseCookies(req)[AUTH_COOKIE];
+  if (!raw) return false;
+  const [stamp, signature] = raw.split('.');
+  if (!stamp || !signature || Date.now() - Number(stamp) > AUTH_TTL_MS) return false;
+  const expected = authSignature(stamp);
+  return expected.length === signature.length && crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
+}
+function requireAuth(req, res, next) {
+  if (hasValidAuth(req)) return next();
+  return res.status(401).json({ success: false, error: 'Authentication required' });
+}
 function emitLive(type, payload = {}) { liveEvents.emit('event', { type, at: Date.now(), ...payload }); }
 function accountHealth(name, entry) {
   const client = entry?.client;
@@ -36,10 +63,6 @@ function accountHealth(name, entry) {
   const ready = status === 0;
   const state = ready ? 'healthy' : status == null ? 'unknown' : 'degraded';
   return { name, state, gatewayStatus: status ?? null, username: client?.user?.tag || client?.user?.username || name, lastError: entry?.lastError || null, connectedAt: entry?.connectedAt || null, lastSeenAt: entry?.lastSeenAt || null };
-}
-function fail(res, error, status = 200) {
-  const message = error?.message || String(error || 'Unknown error');
-  return res.status(status).json({ success: false, error: message });
 }
 function sessionKey(name, guildId) { return `${name}__${guildId}`; }
 function cleanAccounts(accounts) {
@@ -304,9 +327,9 @@ async function connectOne(token, name) {
     try { await clients.get(finalName).client.destroy(); } catch {}
     clients.delete(finalName);
   }
-  const entry = { client, token: token.trim(), connectedAt: Date.now(), lastSeenAt: Date.now(), lastError: null };
+  const entry = { client, connectedAt: Date.now(), lastSeenAt: Date.now(), lastError: null };
   clients.set(finalName, entry);
-  const markError = (error) => { entry.lastError = error?.message || String(error || 'Unknown Discord client error'); entry.lastSeenAt = Date.now(); emitLive('account.health.changed', { account: accountHealth(finalName, entry) }); };
+  const markError = (error) => { entry.lastError = redact(error?.message || String(error || 'Unknown Discord client error')); entry.lastSeenAt = Date.now(); emitLive('account.health.changed', { account: accountHealth(finalName, entry) }); };
   client.on?.('error', markError);
   client.on?.('ready', () => { entry.lastError = null; entry.lastSeenAt = Date.now(); emitLive('account.health.changed', { account: accountHealth(finalName, entry) }); });
   client.on?.('disconnect', () => { entry.lastSeenAt = Date.now(); emitLive('account.health.changed', { account: accountHealth(finalName, entry) }); });
@@ -330,6 +353,43 @@ async function connectOne(token, name) {
   };
 }
 
+app.post('/api/auth', (req, res) => {
+  if (!AUTH_ENABLED) return ok(res, { authenticated: true, required: false });
+  const supplied = String(req.body?.password || '');
+  const ip = req.ip || req.socket.remoteAddress || 'unknown'; const attempt = authAttempts.get(ip) || { start: Date.now(), count: 0 };
+  if (Date.now() - attempt.start > 15 * 60 * 1000) { attempt.start = Date.now(); attempt.count = 0; }
+  attempt.count += 1; authAttempts.set(ip, attempt);
+  if (authAttempts.size > 10000) { for (const [attemptIp, value] of authAttempts) if (Date.now() - value.start > 30 * 60 * 1000) authAttempts.delete(attemptIp); }
+  if (attempt.count > 10) return fail(res, new Error('Too many authentication attempts; try again later'), 429);
+  const expectedPassword = Buffer.from(process.env.APP_PASSWORD || ''); const suppliedPassword = Buffer.from(supplied);
+  const passwordMatches = expectedPassword.length === suppliedPassword.length && crypto.timingSafeEqual(expectedPassword, suppliedPassword);
+  if (!process.env.APP_PASSWORD || !supplied || supplied.length > 256 || !passwordMatches) return fail(res, new Error('Invalid access password'), 401);
+  const stamp = String(Date.now());
+  const value = `${stamp}.${authSignature(stamp)}`;
+  const secure = req.secure || req.headers['x-forwarded-proto'] === 'https';
+  res.setHeader('Set-Cookie', `${AUTH_COOKIE}=${encodeURIComponent(value)}; Max-Age=${Math.floor(AUTH_TTL_MS / 1000)}; Path=/; HttpOnly; SameSite=Strict${secure ? '; Secure' : ''}`);
+  return ok(res, { authenticated: true, required: true });
+});
+const requestBuckets = new Map();
+const authAttempts = new Map();
+function originGuard(req, res, next) {
+  if (req.method === 'GET' || req.path === '/auth') return next();
+  const origin = req.get('origin');
+  if (!origin) return next();
+  try { if (new URL(origin).host !== req.get('host')) return res.status(403).json({ success: false, error: 'Cross-origin request blocked' }); } catch { return res.status(403).json({ success: false, error: 'Invalid request origin' }); }
+  return next();
+}
+function rateLimit(req, res, next) {
+  const key = `${req.ip}:${req.method === 'GET' ? 'read' : 'write'}`;
+  const now = Date.now(); const bucket = requestBuckets.get(key) || { start: now, count: 0 };
+  if (now - bucket.start >= 60000) { bucket.start = now; bucket.count = 0; }
+  bucket.count += 1; requestBuckets.set(key, bucket);
+  if (requestBuckets.size > 10000) { for (const [bucketKey, value] of requestBuckets) if (now - value.start > 120000) requestBuckets.delete(bucketKey); }
+  if (bucket.count > (req.method === 'GET' ? 240 : 90)) return res.status(429).json({ success: false, error: 'Too many requests; try again shortly' });
+  res.setHeader('Cache-Control', 'no-store');
+  return next();
+}
+app.use('/api', rateLimit, originGuard, requireAuth);
 app.get('/api/health', (_req, res) => ok(res, { service: 'voice-studio', connected: clients.size, accounts: [...clients.entries()].map(([name, entry]) => accountHealth(name, entry)) }));
 const healthTimer = setInterval(() => {
   for (const [name, entry] of clients.entries()) {
