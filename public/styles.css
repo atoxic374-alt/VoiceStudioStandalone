@@ -194,3 +194,7 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .state-button { grid-template-columns: 28px minmax(0, 1fr) auto; grid-template-rows: 1fr; min-height: 49px; padding: 9px 11px; text-align: right; }
 .state-icon { grid-row: auto; }
 .state-button small { white-space: nowrap; }
+.activity-actions { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
+.activity-actions .activity-expand { flex: 1; margin-top: 0; }
+.activity-actions .activity-clear { color: var(--red); border-color: rgba(255,113,139,.35); }
+.activity-actions .activity-clear:hover { background: rgba(255,113,139,.1); border-color: rgba(255,113,139,.65); }
