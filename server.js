@@ -210,6 +210,16 @@ function withTimeout(promise, timeoutMs, message) {
   let timer;
   return Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), timeoutMs); })]).finally(() => clearTimeout(timer));
 }
+function waitForWebRtcReady(streamer, timeoutMs = 6000) {
+  return withTimeout(new Promise((resolve) => {
+    const startedAt = Date.now();
+    const check = () => {
+      if (streamer.voiceConnection?.webRtcConn?.ready === true) return resolve();
+      if (Date.now() - startedAt < timeoutMs) return setTimeout(check, 150);
+    };
+    check();
+  }), timeoutMs, 'Camera WebRTC media transport was not ready');
+}
 async function loadVideoStreamModule() {
   videoStreamModulePromise ||= import('@dank074/discord-video-stream');
   return videoStreamModulePromise;
@@ -248,7 +258,7 @@ async function startSyntheticStream(name, guildId, mediaKind = 'go-live') {
   const guild = client.guilds?.cache?.get?.(guildId);
   const channel = guild?.channels?.cache?.get?.(session.channelId);
   if (!channel) return { ok: false, error: 'Voice channel is not available for streaming' };
-  if (mediaKind === 'go-live' || mediaKind === 'camera') return startBuiltInGoLive(name, guildId, session, mediaKind);
+  if (mediaKind === 'go-live') return startBuiltInGoLive(name, guildId, session, mediaKind);
   let lastError;
   const startedAt = Date.now();
   logMediaEvent('info', 'stream.start', { account: name, guildId, channelId: session.channelId });
@@ -280,6 +290,7 @@ async function startSyntheticStream(name, guildId, mediaKind = 'go-live') {
           active.completedAt = Date.now();
           if (syntheticStreams.get(name)?.task === task) stopSyntheticStream(name);
         }).catch((error) => logMediaEvent('error', 'stream.runtime_failed', { account: name, guildId, channelId: session.channelId, error: error?.message || String(error) }));
+        await waitForWebRtcReady(streamer, 6000);
         await new Promise((resolve) => setTimeout(resolve, 700));
         if (active.completedAt || syntheticStreams.get(name) !== active) throw new Error('Media transport stopped before Discord confirmed it was active');
         logMediaEvent('info', 'stream.ready', { account: name, guildId, channelId: session.channelId, durationMs: Date.now() - startedAt, attempt });
