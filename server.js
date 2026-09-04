@@ -645,7 +645,7 @@ app.post('/api/voice/state', async (req, res) => {
       if (current.selfStream) stopSyntheticStream(name);
       result = await sendVoiceOpConfirmed(client, guildId, current.channelId, next, 5000);
     }
-    if (result.ok) { const actual = readGatewayVoiceState(client, guildId); Object.assign(current, actual || {}, next, { selfStream: !!next.selfStream, updatedAt: Date.now() }); persistSessions(); }
+    if (result.ok) { const actual = readGatewayVoiceState(client, guildId); Object.assign(current, actual || {}, next, { selfStream: !!next.selfStream, selfVideo: !!next.selfVideo, updatedAt: Date.now() }); persistSessions(); }
     return { name, ok: result.ok, error: result.ok ? null : result.error };
   }));
   emitLive('operation.completed', { operation: 'state', results, summary: summary(results) });
