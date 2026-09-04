@@ -193,7 +193,7 @@ async function loadVideoStreamModule() {
   videoStreamModulePromise ||= import('@dank074/discord-video-stream');
   return videoStreamModulePromise;
 }
-async function startBuiltInGoLive(name, guildId, session) {
+async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live') {
   const client = getClient(name);
   const connection = client?.voice?.connection;
   if (!connection || connection.channel?.id !== session.channelId) return { ok: false, error: 'The account has no active voice connection' };
@@ -202,11 +202,11 @@ async function startBuiltInGoLive(name, guildId, session) {
   try {
     streamConnection = await withTimeout(connection.createStreamConnection(), 8000, 'Discord media connection timed out after 8 seconds');
     const dispatcher = streamConnection.playVideo(source.stream, { fps: 15, presetH26x: 'superfast', bitrate: 300, inputFFmpegArgs: ['-re'], outputFFmpegArgs: ['-g', '30'] });
-    const active = { connection, streamConnection, dispatcher, sourceProcess: source.sourceProcess, guildId, channelId: session.channelId, mediaKind: 'go-live' };
+    const active = { connection, streamConnection, dispatcher, sourceProcess: source.sourceProcess, guildId, channelId: session.channelId, mediaKind };
     syntheticStreams.set(name, active);
     dispatcher.on?.('error', (error) => logMediaEvent('error', 'stream.runtime_failed', { account: name, guildId, channelId: session.channelId, error: error?.message || String(error) }));
     dispatcher.once?.('finish', () => { if (syntheticStreams.get(name) === active) stopSyntheticStream(name); });
-    const confirmed = await sendVoiceOpConfirmed(client, guildId, session.channelId, { selfStream: true }, 3000);
+    const confirmed = await sendVoiceOpConfirmed(client, guildId, session.channelId, mediaKind === 'camera' ? { selfDeaf: false, selfVideo: true, selfStream: false } : { selfDeaf: false, selfStream: true }, 3000);
     if (!confirmed.ok) throw new Error(confirmed.error || 'Discord did not confirm Go Live state');
     return { ok: true };
   } catch (error) {
@@ -224,7 +224,7 @@ async function startSyntheticStream(name, guildId, mediaKind = 'go-live') {
   const guild = client.guilds?.cache?.get?.(guildId);
   const channel = guild?.channels?.cache?.get?.(session.channelId);
   if (!channel) return { ok: false, error: 'Voice channel is not available for streaming' };
-  if (mediaKind === 'go-live') return startBuiltInGoLive(name, guildId, session);
+  if (mediaKind === 'go-live' || mediaKind === 'camera') return startBuiltInGoLive(name, guildId, session, mediaKind);
   let lastError;
   const startedAt = Date.now();
   logMediaEvent('info', 'stream.start', { account: name, guildId, channelId: session.channelId });
@@ -420,8 +420,19 @@ function validateTarget(client, guildId, channelId) {
 function readGatewayVoiceState(client, guildId) {
   const state = client?.guilds?.cache?.get?.(guildId)?.voiceStates?.cache?.get?.(client.user?.id)
     || client?.voiceStates?.cache?.get?.(client.user?.id);
-  if (!state || String(state.guild?.id || state.guildId || guildId) !== String(guildId)) return null;
+  const connection = client?.voice?.connection;
+  const connectedGuildId = connection?.channel?.guild?.id || connection?.channel?.guildId;
+  const fallback = connection?.channel?.id && (!guildId || String(connectedGuildId) === String(guildId)) ? {
+    channelId: connection.channel.id,
+    selfMute: !!(connection.voice?.selfMute ?? connection.voice?.self_mute),
+    selfDeaf: !!(connection.voice?.selfDeaf ?? connection.voice?.self_deaf),
+    selfVideo: !!(connection.voice?.selfVideo ?? connection.voice?.self_video),
+    selfStream: !!(connection.voice?.streaming ?? connection.voice?.selfStream ?? connection.voice?.self_stream),
+    guildId: connectedGuildId || guildId,
+  } : null;
+  if (!state || String(state.guild?.id || state.guildId || guildId) !== String(guildId)) return fallback;
   return {
+    guildId: state.guild?.id || state.guildId || guildId,
     channelId: state.channelId ?? state.channel_id ?? null,
     selfMute: !!(state.selfMute ?? state.self_mute),
     selfDeaf: !!(state.selfDeaf ?? state.self_deaf),
@@ -602,7 +613,9 @@ app.get('/api/discord/clients', (_req, res) => {
   const sessionByName = new Map([...voiceSessions.values()].map((session) => [session.name, session]));
   return ok(res, { clients: [...clients.entries()].map(([name, entry]) => {
     const user = entry.client.user;
-    const voice = sessionByName.get(name) || null;
+    const savedVoice = sessionByName.get(name) || null;
+    const actualVoice = readGatewayVoiceState(entry.client, savedVoice?.guildId || '') || null;
+    const voice = actualVoice?.channelId ? { ...(savedVoice || {}), ...actualVoice, name } : savedVoice;
     const guild = voice ? entry.client.guilds?.cache?.get?.(voice.guildId) : null;
     const member = guild?.members?.cache?.get?.(user?.id);
     const channel = voice ? guild?.channels?.cache?.get?.(voice.channelId) : null;
