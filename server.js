@@ -213,6 +213,12 @@ async function startSyntheticStream(name, guildId) {
   logMediaEvent('error', 'stream.failed', { account: name, guildId, channelId: session.channelId, durationMs: Date.now() - startedAt, error: lastError?.message || 'Unable to start synthetic stream' });
   return { ok: false, error: lastError?.message || 'Unable to start synthetic stream' };
 }
+async function setStreamIndicator(name, guildId, current, enabled) {
+  const client = getClient(name);
+  if (!client || !current?.channelId) return { ok: false, error: 'Account is not in a voice channel' };
+  if (!enabled) stopSyntheticStream(name);
+  return sendVoiceOpConfirmed(client, guildId, current.channelId, { selfMute: !!current.selfMute, selfDeaf: !!current.selfDeaf, selfVideo: false, selfStream: !!enabled }, 9000);
+}
 async function withAccountLock(name, operation) {
   const key = String(name);
   const previous = accountLocks.get(key) || Promise.resolve();
@@ -701,7 +707,7 @@ app.post('/api/voice/state', async (req, res) => {
     };
     if (next.selfDeaf && (next.selfVideo || next.selfStream)) return { name, ok: false, error: 'Video or screen share cannot be enabled while deafened' };
     let result;
-    if (next.selfStream) result = await startSyntheticStream(name, guildId);
+    if (next.selfStream) result = await setStreamIndicator(name, guildId, current, true);
     else {
       if (current.selfStream) stopSyntheticStream(name);
       result = await sendVoiceOpConfirmed(client, guildId, current.channelId, next, 9000);
@@ -782,7 +788,7 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
     if (!current || !client) return { name, ok: false, error: 'Account is not currently in a voice channel' };
     const next = { ...current, ...task.states[0] };
     if (next.selfDeaf && (next.selfVideo || next.selfStream)) return { name, ok: false, error: 'Invalid deafened media state' };
-    const result = next.selfStream ? await startSyntheticStream(name, task.guildId) : await sendVoiceOpConfirmed(client, task.guildId, current.channelId, next, 5000);
+    const result = next.selfStream ? await setStreamIndicator(name, task.guildId, current, true) : await sendVoiceOpConfirmed(client, task.guildId, current.channelId, next, 9000);
     if (result.ok) { Object.assign(current, next, { selfStream: !!next.selfStream, updatedAt: Date.now() }); persistSessions(); }
     return { name, ok: result.ok, error: result.ok ? null : result.error };
   }));
@@ -801,7 +807,7 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
         const next = { ...current, ...state };
         if (next.selfDeaf && (next.selfVideo || next.selfStream)) return;
         let result;
-        if (next.selfStream) result = await startSyntheticStream(name, task.guildId);
+        if (next.selfStream) result = await setStreamIndicator(name, task.guildId, current, true);
         else {
           if (current.selfStream) stopSyntheticStream(name);
           result = await sendVoiceOpConfirmed(client, task.guildId, current.channelId, next, 5000);
