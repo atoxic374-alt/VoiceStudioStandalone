@@ -267,7 +267,11 @@ async function startSyntheticStream(name, guildId, mediaKind = 'go-live') {
   const client = getClient(name);
   const session = { ...(voiceSessions.get(sessionKey(name, guildId)) || {}), ...(readGatewayVoiceState(client, guildId) || {}) };
   if (!client || !session?.channelId) return { ok: false, error: 'Account is not in a voice channel' };
-  if (syntheticStreams.has(name)) return { ok: true, alreadyActive: true };
+  const existing = syntheticStreams.get(name);
+  if (existing) {
+    if (existing.mediaKind === mediaKind) return { ok: true, alreadyActive: true };
+    stopSyntheticStream(name);
+  }
   // Reuse the active voice connection. A second joinVoice() causes Discord to
   // leave/rejoin the room and races the rotation/state-cycle timers.
   return startBuiltInGoLive(name, guildId, session, mediaKind);
@@ -1031,7 +1035,7 @@ async function restoreAutomationTasks() {
         task.lastResults = await Promise.all(task.accounts.map((name) => withAccountLock(name, async () => {
           const current = voiceSessions.get(sessionKey(name, task.guildId)); const client = getClient(name);
           if (!current || !client) return { name, ok: false, error: 'Account is not currently in a voice channel' };
-          const next = { ...current, ...state };
+          const next = { ...current, ...normalizeVoiceState(state), selfMute: state.selfMute === undefined ? !!current.selfMute : !!state.selfMute };
           if (next.selfDeaf && (next.selfVideo || next.selfStream)) return { name, ok: false, error: 'Invalid deafened media state' };
           let result;
           if (next.selfStream || next.selfVideo) result = await startSyntheticStream(name, task.guildId, next.selfStream ? 'go-live' : 'camera');
