@@ -163,6 +163,10 @@ function stopSyntheticStream(name) {
   try { active.streamConnection?.disconnect?.(); } catch {}
   syntheticStreams.delete(name);
 }
+function withTimeout(promise, timeoutMs, message) {
+  let timer;
+  return Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), timeoutMs); })]).finally(() => clearTimeout(timer));
+}
 async function startSyntheticStream(name, guildId) {
   const client = getClient(name);
   const session = voiceSessions.get(sessionKey(name, guildId));
@@ -171,18 +175,30 @@ async function startSyntheticStream(name, guildId) {
   const guild = client.guilds?.cache?.get?.(guildId);
   const channel = guild?.channels?.cache?.get?.(session.channelId);
   if (!channel) return { ok: false, error: 'Voice channel is not available for streaming' };
+  let lastError;
   try {
-    const existing = client.voice.connection;
-    const connection = existing?.channel?.id === session.channelId ? existing : await client.voice.joinChannel(channel, { selfMute: !!session.selfMute, selfDeaf: false, selfVideo: true, videoCodec: 'H264' });
-    const streamConnection = await connection.createStreamConnection();
-    const dispatcher = streamConnection.playVideo(ensureSyntheticVideo(), { fps: 15, preset: 'ultrafast', bitrate: 500 });
-    syntheticStreams.set(name, { connection, streamConnection, dispatcher, guildId, channelId: session.channelId });
-    dispatcher.once?.('finish', () => { if (syntheticStreams.get(name)?.dispatcher === dispatcher) stopSyntheticStream(name); });
-    return { ok: true };
-  } catch (error) {
-    stopSyntheticStream(name);
-    return { ok: false, error: error?.message || 'Unable to start synthetic stream' };
-  }
+    const source = ensureSyntheticVideo();
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      let connection;
+      let createdConnection = false;
+      try {
+        const existing = client.voice.connection;
+        createdConnection = existing?.channel?.id !== session.channelId;
+        connection = createdConnection ? await withTimeout(client.voice.joinChannel(channel, { selfMute: !!session.selfMute, selfDeaf: false, selfVideo: true, videoCodec: 'H264' }), 9000, 'Voice connection timed out while starting stream') : existing;
+        const streamConnection = await withTimeout(connection.createStreamConnection(), 4000, 'Stream connection timed out');
+        const dispatcher = streamConnection.playVideo(source, { fps: 15, preset: 'ultrafast', bitrate: 500 });
+        syntheticStreams.set(name, { connection, streamConnection, dispatcher, guildId, channelId: session.channelId });
+        dispatcher.once?.('finish', () => { if (syntheticStreams.get(name)?.dispatcher === dispatcher) stopSyntheticStream(name); });
+        return { ok: true };
+      } catch (error) {
+        lastError = error;
+        if (createdConnection) { try { client.voice.connection?.disconnect?.(); } catch {} }
+        if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+    }
+  } catch (error) { lastError = error; }
+  stopSyntheticStream(name);
+  return { ok: false, error: lastError?.message || 'Unable to start synthetic stream' };
 }
 async function withAccountLock(name, operation) {
   const key = String(name);
@@ -771,7 +787,7 @@ async function restoreSavedAccounts() {
 }
 app.get('/{*splat}', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 if (require.main === module) {
-  app.listen(PORT, '0.0.0.0', () => { console.log(`Voice Studio listening on http://localhost:${PORT}`); restoreSavedAccounts().catch((error) => console.warn('[accounts] restore failed:', error.message)); });
+  app.listen(PORT, '0.0.0.0', () => { console.log(`Voice Studio listening on http://localhost:${PORT}`); setImmediate(() => { try { ensureSyntheticVideo(); } catch (error) { console.warn('[stream] source prewarm failed:', error.message); } }); restoreSavedAccounts().catch((error) => console.warn('[accounts] restore failed:', error.message)); });
 }
 
 module.exports = { app, clients, voiceSessions, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, saveAccounts, loadAccounts };
