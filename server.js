@@ -18,6 +18,7 @@ const app = express();
 const PORT = Number(process.env.PORT || 5050);
 const DATA_DIR = path.join(__dirname, 'data');
 const VOICE_STATE_FILE = path.join(DATA_DIR, 'voice-sessions.json');
+const AUTOMATION_TASKS_FILE = path.join(DATA_DIR, 'automation-tasks.json');
 const CLIENT_BIND_FILE = path.join(DATA_DIR, 'client-binding.json');
 const MEDIA_LOG_FILE = path.join(DATA_DIR, 'media-events.log');
 fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -123,6 +124,12 @@ function cleanAccounts(accounts) {
 function normalizeVoiceState(state = {}) {
   return { selfMute: !!state.selfMute, selfDeaf: !!state.selfDeaf, selfVideo: !!state.selfVideo, selfStream: !!state.selfStream };
 }
+function persistAutomationTasks() {
+  const payload = { version: 1, rotations: [...rotations.values()].map(({ timer, running, ...task }) => task), stateCycles: [...stateCycles.values()].map(({ timer, running, ...task }) => task), savedAt: Date.now() };
+  const temp = `${AUTOMATION_TASKS_FILE}.tmp`;
+  try { fs.writeFileSync(temp, JSON.stringify(payload, null, 2), { mode: 0o600 }); fs.renameSync(temp, AUTOMATION_TASKS_FILE); } catch (error) { try { fs.rmSync(temp, { force: true }); } catch {} console.warn('[automation] unable to persist tasks:', error.message); }
+}
+function loadAutomationTasks() { try { const value = JSON.parse(fs.readFileSync(AUTOMATION_TASKS_FILE, 'utf8')); return value && typeof value === 'object' ? value : { rotations: [], stateCycles: [] }; } catch { return { rotations: [], stateCycles: [] }; } }
 function cleanChannelIds(channelIds) {
   if (!Array.isArray(channelIds)) return [];
   return [...new Set(channelIds.map((value) => String(value || '').trim()).filter(Boolean))].slice(0, 500);
@@ -324,14 +331,20 @@ async function withAccountLock(name, operation) {
   finally { release(); if (accountLocks.get(key) === current) accountLocks.delete(key); }
 }
 function stopTasksForAccount(name) {
+  let changed = false;
   for (const [id, task] of rotations.entries()) {
+    const before = task.accounts.length;
     task.accounts = task.accounts.filter((item) => item !== name);
+    changed ||= before !== task.accounts.length;
     if (!task.accounts.length) { clearInterval(task.timer); rotations.delete(id); emitLive('task.stopped', { id, reason: 'no accounts remaining' }); }
   }
   for (const [id, task] of stateCycles.entries()) {
+    const before = task.accounts.length;
     task.accounts = task.accounts.filter((item) => item !== name);
+    changed ||= before !== task.accounts.length;
     if (!task.accounts.length) { clearInterval(task.timer); stateCycles.delete(id); emitLive('task.stopped', { id, reason: 'no accounts remaining' }); }
   }
+  if (changed) persistAutomationTasks();
 }
 function getClient(name) {
   const entry = clients.get(String(name || ''));
@@ -949,13 +962,14 @@ app.post('/api/voice/rotation/start', async (req, res) => {
     } finally { task.running = false; }
   }, delay);
   rotations.set(id, task);
+  persistAutomationTasks();
   return ok(res, { id, started: true, initial, summary: summary(initial) });
 });
 app.post('/api/voice/rotation/stop', (req, res) => {
   const id = String(req.body?.id || '');
   const task = rotations.get(id);
   if (!task) return fail(res, new Error('Rotation not found'), 404);
-  clearInterval(task.timer); rotations.delete(id); return ok(res);
+  clearInterval(task.timer); rotations.delete(id); persistAutomationTasks(); return ok(res);
 });
 app.post('/api/voice/state-cycle/start', async (req, res) => {
   const accounts = cleanAccounts(req.body?.accounts);
@@ -1008,13 +1022,14 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
     } finally { task.running = false; }
   }, delay);
   stateCycles.set(id, task);
+  persistAutomationTasks();
   return ok(res, { id });
 });
 app.post('/api/voice/state-cycle/stop', (req, res) => {
   const id = String(req.body?.id || '');
   const task = stateCycles.get(id);
   if (!task) return fail(res, new Error('State cycle not found'), 404);
-  clearInterval(task.timer); stateCycles.delete(id); return ok(res);
+  clearInterval(task.timer); stateCycles.delete(id); persistAutomationTasks(); return ok(res);
 });
 
 async function restoreSavedAccounts() {
@@ -1026,9 +1041,59 @@ async function restoreSavedAccounts() {
     catch (error) { console.warn(`[accounts] unable to restore ${account.name}:`, redact(error.message)); }
   }
 }
+async function restoreAutomationTasks() {
+  const saved = loadAutomationTasks();
+  for (const item of Array.isArray(saved.rotations) ? saved.rotations : []) {
+    if (!item.id || !item.guildId || !Array.isArray(item.channels) || item.channels.length < 2) continue;
+    const task = { ...item, accounts: cleanAccounts(item.accounts), running: false };
+    task.timer = setInterval(async () => {
+      if (task.running) return;
+      task.running = true;
+      task.currentIdx = (task.currentIdx + 1) % task.channels.length;
+      const ids = task.randomOrder ? [...task.channels].sort(() => Math.random() - 0.5) : task.channels;
+      try {
+        task.lastResults = await Promise.all(task.accounts.map((name, index) => {
+          const current = voiceSessions.get(sessionKey(name, task.guildId));
+          const currentIndex = ids.indexOf(current?.channelId);
+          const targetIndex = currentIndex >= 0 ? (currentIndex + 1) % ids.length : (task.currentIdx + index) % ids.length;
+          return moveAccount(name, task.guildId, ids[targetIndex], normalizeVoiceState(current || {}));
+        }));
+        task.nextAt = Date.now() + task.intervalMs;
+        persistAutomationTasks();
+      } finally { task.running = false; }
+    }, Math.max(1000, Number(task.intervalMs || 60000)));
+    rotations.set(task.id, task);
+  }
+  for (const item of Array.isArray(saved.stateCycles) ? saved.stateCycles : []) {
+    if (!item.id || !item.guildId || !Array.isArray(item.states) || item.states.length < 2) continue;
+    const task = { ...item, accounts: cleanAccounts(item.accounts), running: false };
+    task.timer = setInterval(async () => {
+      if (task.running) return;
+      task.running = true;
+      task.currentIdx = (task.currentIdx + 1) % task.states.length;
+      const state = normalizeVoiceState(task.states[task.currentIdx]);
+      try {
+        task.lastResults = await Promise.all(task.accounts.map((name) => withAccountLock(name, async () => {
+          const current = voiceSessions.get(sessionKey(name, task.guildId)); const client = getClient(name);
+          if (!current || !client) return { name, ok: false, error: 'Account is not currently in a voice channel' };
+          const next = { ...current, ...state };
+          if (next.selfDeaf && (next.selfVideo || next.selfStream)) return { name, ok: false, error: 'Invalid deafened media state' };
+          let result;
+          if (next.selfStream || next.selfVideo) result = await startSyntheticStream(name, task.guildId, next.selfStream ? 'go-live' : 'camera');
+          else { if (current.selfStream || current.selfVideo) stopSyntheticStream(name); result = await sendVoiceOpConfirmed(client, task.guildId, current.channelId, next, 3000); }
+          if (result.ok) { Object.assign(current, next, { updatedAt: Date.now() }); persistSessions(); }
+          return { name, ok: result.ok, error: result.ok ? null : result.error };
+        })));
+        task.nextAt = Date.now() + task.intervalMs;
+        persistAutomationTasks();
+      } finally { task.running = false; }
+    }, Math.max(1000, Number(task.intervalMs || 60000)));
+    stateCycles.set(task.id, task);
+  }
+}
 app.get('/{*splat}', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 if (require.main === module) {
-  app.listen(PORT, '0.0.0.0', () => { console.log(`Voice Studio listening on http://localhost:${PORT}`); setInterval(() => { try { reconcileVoiceSessions(); } catch (error) { console.warn('[voice] session reconciliation failed:', error.message); } }, 3000).unref?.(); restoreSavedAccounts().catch((error) => console.warn('[accounts] restore failed:', error.message)); });
+  app.listen(PORT, '0.0.0.0', () => { console.log(`Voice Studio listening on http://localhost:${PORT}`); setInterval(() => { try { reconcileVoiceSessions(); } catch (error) { console.warn('[voice] session reconciliation failed:', error.message); } }, 3000).unref?.(); restoreSavedAccounts().then(() => restoreAutomationTasks()).catch((error) => console.warn('[restore] restore failed:', error.message)); });
 }
 
 module.exports = { app, clients, voiceSessions, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, saveAccounts, loadAccounts };
