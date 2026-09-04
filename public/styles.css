@@ -188,3 +188,7 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
   .selection-row .refresh-button { min-height: 43px; }
   .selection-row .room-search-input { height: 40px; margin-top: 7px; font-size: 12px; }
 }
+/* Quick controls use wide horizontal tiles instead of square cards. */
+.state-button { grid-template-columns: 28px minmax(0, 1fr) auto; grid-template-rows: 1fr; min-height: 49px; padding: 9px 11px; text-align: right; }
+.state-icon { grid-row: auto; }
+.state-button small { white-space: nowrap; }
