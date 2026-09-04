@@ -717,6 +717,24 @@ app.post('/api/discord/disconnect', async (req, res) => {
   emitLive('account.disconnected', { name });
   return ok(res, { name });
 });
+app.post('/api/discord/disconnect-bulk', async (req, res) => {
+  const names = cleanAccounts(req.body?.accounts);
+  if (!names.length) return fail(res, new Error('Select at least one account'), 400);
+  const results = [];
+  for (const name of names) {
+    const entry = clients.get(name);
+    if (!entry) { results.push({ name, ok: false, error: 'Account is not connected' }); continue; }
+    stopTasksForAccount(name);
+    stopSyntheticStream(name);
+    removeSessionsForAccount(name);
+    try { await entry.client.destroy(); } catch (error) { results.push({ name, ok: false, error: error.message }); continue; }
+    clients.delete(name);
+    emitLive('account.disconnected', { name });
+    results.push({ name, ok: true });
+  }
+  persistConnectedAccounts();
+  return ok(res, { results, summary: summary(results) });
+});
 app.post('/api/discord/disconnect-all', async (_req, res) => {
   for (const name of clients.keys()) { stopTasksForAccount(name); stopSyntheticStream(name); }
   for (const entry of clients.values()) { try { await entry.client.destroy(); } catch {} }
