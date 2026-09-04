@@ -193,6 +193,29 @@ async function loadVideoStreamModule() {
   videoStreamModulePromise ||= import('@dank074/discord-video-stream');
   return videoStreamModulePromise;
 }
+async function startBuiltInGoLive(name, guildId, session) {
+  const client = getClient(name);
+  const connection = client?.voice?.connection;
+  if (!connection || connection.channel?.id !== session.channelId) return { ok: false, error: 'The account has no active voice connection' };
+  const source = createBlackMediaSource();
+  let streamConnection;
+  try {
+    streamConnection = await withTimeout(connection.createStreamConnection(), 8000, 'Discord media connection timed out after 8 seconds');
+    const dispatcher = streamConnection.playVideo(source.stream, { fps: 15, presetH26x: 'superfast', bitrate: 300, inputFFmpegArgs: ['-re'], outputFFmpegArgs: ['-g', '30'] });
+    const active = { connection, streamConnection, dispatcher, sourceProcess: source.sourceProcess, guildId, channelId: session.channelId, mediaKind: 'go-live' };
+    syntheticStreams.set(name, active);
+    dispatcher.on?.('error', (error) => logMediaEvent('error', 'stream.runtime_failed', { account: name, guildId, channelId: session.channelId, error: error?.message || String(error) }));
+    dispatcher.once?.('finish', () => { if (syntheticStreams.get(name) === active) stopSyntheticStream(name); });
+    const confirmed = await sendVoiceOpConfirmed(client, guildId, session.channelId, { selfStream: true }, 3000);
+    if (!confirmed.ok) throw new Error(confirmed.error || 'Discord did not confirm Go Live state');
+    return { ok: true };
+  } catch (error) {
+    syntheticStreams.delete(name);
+    try { source.sourceProcess.kill('SIGTERM'); } catch {}
+    try { streamConnection?.disconnect?.(); } catch {}
+    return { ok: false, error: error.message || 'Unable to start Go Live' };
+  }
+}
 async function startSyntheticStream(name, guildId, mediaKind = 'go-live') {
   const client = getClient(name);
   const session = voiceSessions.get(sessionKey(name, guildId));
@@ -201,6 +224,7 @@ async function startSyntheticStream(name, guildId, mediaKind = 'go-live') {
   const guild = client.guilds?.cache?.get?.(guildId);
   const channel = guild?.channels?.cache?.get?.(session.channelId);
   if (!channel) return { ok: false, error: 'Voice channel is not available for streaming' };
+  if (mediaKind === 'go-live') return startBuiltInGoLive(name, guildId, session);
   let lastError;
   const startedAt = Date.now();
   logMediaEvent('info', 'stream.start', { account: name, guildId, channelId: session.channelId });
