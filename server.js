@@ -141,8 +141,10 @@ async function mapWithConcurrency(items, limit, worker) {
   return results;
 }
 function summary(results) {
-  const okCount = results.filter((item) => item?.ok === true).length;
-  return { total: results.length, ok: okCount, failed: results.length - okCount };
+  const okCount = results.filter((item) => item?.ok === true && !item?.skipped).length;
+  const skipped = results.filter((item) => item?.skipped === true).length;
+  const failed = results.filter((item) => item?.ok !== true && !item?.skipped).length;
+  return { total: results.length, ok: okCount, skipped, failed };
 }
 function readPersistedSessions() {
   try {
@@ -365,6 +367,14 @@ function stopTasksForAccount(name) {
     if (!task.accounts.length) { clearInterval(task.timer); stateCycles.delete(id); emitLive('task.stopped', { id, reason: 'no accounts remaining' }); }
   }
   if (changed) persistAutomationTasks();
+}
+function rotationControlledAccounts(guildId) {
+  const controlled = new Set();
+  for (const task of rotations.values()) {
+    if (String(task.guildId) !== String(guildId)) continue;
+    for (const name of task.accounts || []) controlled.add(name);
+  }
+  return controlled;
 }
 function getClient(name) {
   const entry = clients.get(String(name || ''));
@@ -906,7 +916,9 @@ app.post('/api/voice/state', async (req, res) => {
   if (!accounts.length || !guildId) return fail(res, new Error('accounts and guildId are required'), 400);
   for (const value of [selfMute, selfDeaf, selfVideo, selfStream]) if (value !== undefined && typeof value !== 'boolean') return fail(res, new Error('Voice state values must be boolean'), 400);
   if (selfDeaf === true && (selfVideo === true || selfStream === true)) return fail(res, new Error('Video or screen share cannot be enabled while deafened'), 400);
+  const rotationAccounts = rotationControlledAccounts(guildId);
   const results = await mapWithConcurrency(accounts, 8, (name) => withAccountLock(name, async () => {
+    if (rotationAccounts.has(name)) return { name, ok: true, skipped: true, reason: 'Account is controlled by an active rotation' };
     const operationStartedAt = Date.now();
     const mediaKind = selfStream !== undefined ? 'stream' : selfVideo !== undefined ? 'camera' : 'voice-state';
     const client = getClient(name);
@@ -1129,4 +1141,4 @@ if (require.main === module) {
   app.listen(PORT, '0.0.0.0', () => { console.log(`Voice Studio listening on http://localhost:${PORT}`); setInterval(() => { try { reconcileVoiceSessions(); } catch (error) { console.warn('[voice] session reconciliation failed:', error.message); } }, 3000).unref?.(); restoreSavedAccounts().then(() => restoreAutomationTasks()).catch((error) => console.warn('[restore] restore failed:', error.message)); });
 }
 
-module.exports = { app, clients, voiceSessions, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, saveAccounts, loadAccounts };
+module.exports = { app, clients, voiceSessions, rotations, rotationControlledAccounts, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, saveAccounts, loadAccounts };

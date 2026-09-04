@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
-const { sendVoiceOp, sendVoiceOpConfirmed } = require('../server');
+const { sendVoiceOp, sendVoiceOpConfirmed, rotations, rotationControlledAccounts } = require('../server');
 
 function fakeClient({ ready = true, confirms = true } = {}) {
   const ws = new EventEmitter();
@@ -65,4 +65,15 @@ test('does not accept a voice event that omits requested state flags', async () 
   const result = await pending;
   assert.equal(result.ok, false);
   assert.match(result.error, /did not confirm/);
+});
+
+test('isolates bulk voice control from accounts managed by rotation in the same guild', () => {
+  const taskId = 'test-rotation-isolation';
+  rotations.set(taskId, { id: taskId, guildId: 'guild-1', accounts: ['rotating-account'] });
+  try {
+    assert.deepEqual([...rotationControlledAccounts('guild-1')], ['rotating-account']);
+    assert.deepEqual([...rotationControlledAccounts('guild-2')], []);
+  } finally {
+    rotations.delete(taskId);
+  }
 });
