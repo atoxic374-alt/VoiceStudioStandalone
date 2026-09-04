@@ -265,16 +265,73 @@ async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live')
 }
 async function startSyntheticStream(name, guildId, mediaKind = 'go-live') {
   const client = getClient(name);
-  const session = { ...(voiceSessions.get(sessionKey(name, guildId)) || {}), ...(readGatewayVoiceState(client, guildId) || {}) };
+  const saved = voiceSessions.get(sessionKey(name, guildId)) || {};
+  const observed = client ? readGatewayVoiceState(client, guildId) : null;
+  const session = { ...saved, ...(observed || {}) };
+  for (const key of ['selfMute', 'selfDeaf', 'selfVideo', 'selfStream']) if (typeof observed?.[key] !== 'boolean' && typeof saved?.[key] === 'boolean') session[key] = saved[key];
   if (!client || !session?.channelId) return { ok: false, error: 'Account is not in a voice channel' };
   const existing = syntheticStreams.get(name);
   if (existing) {
-    if (existing.mediaKind === mediaKind) return { ok: true, alreadyActive: true };
+    if (existing.mediaKind === mediaKind && existing.channelId === session.channelId) return { ok: true, alreadyActive: true };
     stopSyntheticStream(name);
   }
-  // Reuse the active voice connection. A second joinVoice() causes Discord to
-  // leave/rejoin the room and races the rotation/state-cycle timers.
-  return startBuiltInGoLive(name, guildId, session, mediaKind);
+  const channel = client.guilds?.cache?.get?.(guildId)?.channels?.cache?.get?.(session.channelId);
+  if (!channel) return { ok: false, error: 'Voice channel is not available for streaming' };
+  const startedAt = Date.now();
+  let lastError;
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    let streamer;
+    let controller;
+    let source;
+    try {
+      const { Streamer, playStream } = await loadVideoStreamModule();
+      streamer = new Streamer(client);
+      streamer.signalVideo = (enabled) => streamer.sendOpcode(4, {
+        guild_id: guildId,
+        channel_id: session.channelId,
+        self_mute: !!session.selfMute,
+        self_deaf: false,
+        self_video: !!enabled,
+      });
+      logMediaEvent('info', 'media.join.start', { account: name, guildId, channelId: session.channelId, mediaKind, attempt });
+      await withTimeout(streamer.joinVoice(guildId, session.channelId), 10000, 'Dedicated media voice connection timed out after 10 seconds');
+      controller = new AbortController();
+      source = createBlackMediaSource();
+      const active = { streamer, controller, sourceProcess: source.sourceProcess, guildId, channelId: session.channelId, mediaKind, startedAt };
+      syntheticStreams.set(name, active);
+      const task = playStream(source.stream, streamer, { type: mediaKind, format: 'nut', width: 640, height: 360, frameRate: 15 }, controller.signal);
+      active.task = task;
+      task.then(() => { active.completedAt = Date.now(); if (syntheticStreams.get(name)?.task === task) stopSyntheticStream(name); })
+        .catch((error) => logMediaEvent('error', 'media.runtime_failed', { account: name, guildId, channelId: session.channelId, mediaKind, error: error?.message || String(error) }));
+      await withTimeout(new Promise((resolve) => {
+        const check = () => {
+          const voiceReady = streamer.voiceConnection?.webRtcConn?.ready === true;
+          const mediaReady = mediaKind === 'camera' || streamer.voiceConnection?.streamConnection?.webRtcConn?.ready === true;
+          if (voiceReady && mediaReady) return resolve();
+          setTimeout(check, 150);
+        };
+        check();
+      }), 6000, 'WebRTC media transport was not ready');
+      if (active.completedAt || syntheticStreams.get(name) !== active) throw new Error('Media transport stopped before activation');
+      const confirmed = await sendVoiceOpConfirmed(client, guildId, session.channelId, mediaKind === 'camera'
+        ? { selfMute: !!session.selfMute, selfDeaf: false, selfVideo: true, selfStream: false }
+        : { selfMute: !!session.selfMute, selfDeaf: false, selfVideo: false, selfStream: true }, 3000);
+      if (!confirmed.ok) throw new Error(confirmed.error || 'Discord did not confirm media state');
+      logMediaEvent('info', 'media.ready', { account: name, guildId, channelId: session.channelId, mediaKind, durationMs: Date.now() - startedAt, attempt });
+      return { ok: true };
+    } catch (error) {
+      lastError = error;
+      try { controller?.abort?.(); } catch {}
+      try { source?.sourceProcess?.kill?.('SIGTERM'); } catch {}
+      try { streamer?.stopStream?.(); } catch {}
+      try { streamer?.leaveVoice?.(); } catch {}
+      if (syntheticStreams.get(name)?.streamer === streamer) syntheticStreams.delete(name);
+      logMediaEvent('error', 'media.attempt_failed', { account: name, guildId, channelId: session.channelId, mediaKind, attempt, error: error?.message || String(error) });
+      if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+  }
+  stopSyntheticStream(name);
+  return { ok: false, error: lastError?.message || `Unable to start ${mediaKind}` };
 }
 async function withAccountLock(name, operation) {
   const key = String(name);
