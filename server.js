@@ -391,9 +391,10 @@ app.post('/api/auth', (req, res) => {
     }
   }
   const value = makeAuthCookie(role, role === 'owner' ? process.env.APP_PASSWORD : process.env.CLIENT_PASSWORD);
-  const secure = req.secure || req.headers['x-forwarded-proto'] === 'https'; const flags = `Path=/; HttpOnly; SameSite=Strict${secure ? '; Secure' : ''}`;
+  const secure = req.secure || req.headers['x-forwarded-proto'] === 'https'; const flags = `Path=/; HttpOnly; SameSite=Lax${secure ? '; Secure' : ''}`;
   const cookies = [`${AUTH_COOKIE}=${encodeURIComponent(value)}; Max-Age=${Math.floor(AUTH_TTL_MS / 1000)}; ${flags}`];
   if (deviceCookie) cookies.push(`${CLIENT_DEVICE_COOKIE}=${encodeURIComponent(deviceCookie)}; Max-Age=${Math.floor(AUTH_TTL_MS / 1000)}; ${flags}`);
+  res.setHeader('Cache-Control', 'no-store');
   res.setHeader('Set-Cookie', cookies);
   return ok(res, { authenticated: true, required: true, role });
 });
