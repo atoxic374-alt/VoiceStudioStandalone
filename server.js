@@ -942,7 +942,7 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
     const current = voiceSessions.get(sessionKey(name, task.guildId));
     const client = getClient(name);
     if (!current || !client) return { name, ok: false, error: 'Account is not currently in a voice channel' };
-    const next = { ...current, ...normalizeVoiceState(task.states[0]) };
+    const next = { ...current, ...normalizeVoiceState(task.states[0]), selfMute: task.states[0].selfMute === undefined ? !!current.selfMute : !!task.states[0].selfMute };
     if (next.selfDeaf && (next.selfVideo || next.selfStream)) return { name, ok: false, error: 'Invalid deafened media state' };
     const result = (next.selfStream || next.selfVideo)
       ? await startSyntheticStream(name, task.guildId, next.selfStream ? 'go-live' : 'camera')
@@ -962,7 +962,7 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
         if (!current) return;
         const client = getClient(name);
         if (!client) return;
-        const next = { ...current, ...normalizeVoiceState(state) };
+        const next = { ...current, ...normalizeVoiceState(state), selfMute: state.selfMute === undefined ? !!current.selfMute : !!state.selfMute };
         if (next.selfDeaf && (next.selfVideo || next.selfStream)) return;
         let result;
         if (next.selfStream || next.selfVideo) result = await startSyntheticStream(name, task.guildId, next.selfStream ? 'go-live' : 'camera');
