@@ -369,12 +369,14 @@ function sendVoiceOpConfirmed(client, guildId, channelId, opts = {}, timeoutMs =
     let settled = false;
     let timer = null;
     let retryTimer = null;
+    let verifyTimer = null;
     let attempts = 0;
     const cleanup = () => {
       try { client.ws?.off?.('VOICE_STATE_UPDATE', onWsState); } catch {}
       try { client.off?.('voiceStateUpdate', onJsState); } catch {}
       if (timer) clearTimeout(timer);
       if (retryTimer) clearTimeout(retryTimer);
+      if (verifyTimer) clearTimeout(verifyTimer);
       timer = null;
       retryTimer = null;
     };
@@ -392,6 +394,11 @@ function sendVoiceOpConfirmed(client, guildId, channelId, opts = {}, timeoutMs =
         ['self_mute', 'selfMute'], ['self_deaf', 'selfDeaf'], ['self_video', 'selfVideo'], ['self_stream', 'selfStream'],
       ];
       return flags.every(([wire, local]) => opts[local] === undefined || (data[wire] !== undefined && !!data[wire] === !!opts[local]));
+    };
+    const cachedStateMatches = () => {
+      const state = readGatewayVoiceState(client, guildId);
+      if (!state || (channelId != null && String(state.channelId) !== String(channelId))) return false;
+      return Object.entries(opts).every(([key, value]) => !['selfMute', 'selfDeaf', 'selfVideo', 'selfStream'].includes(key) || (state[key] !== undefined && !!state[key] === !!value));
     };
     const onWsState = (packet) => {
       const data = packet?.d || packet;
@@ -418,13 +425,17 @@ function sendVoiceOpConfirmed(client, guildId, channelId, opts = {}, timeoutMs =
 
     try { client.ws?.on?.('VOICE_STATE_UPDATE', onWsState); } catch {}
     try { client.on?.('voiceStateUpdate', onJsState); } catch {}
-    timer = setTimeout(() => finish({ ok: false, error: 'Discord did not confirm the voice state in time' }), timeoutMs);
+    timer = setTimeout(() => {
+      if (cachedStateMatches()) finish({ ok: true, confirmed: true, source: 'gateway-cache' });
+      else finish({ ok: false, error: 'Discord did not confirm the voice state in time' });
+    }, timeoutMs);
 
     const send = () => {
       if (settled) return;
       attempts += 1;
       const sent = sendVoiceOp(client, guildId, channelId, opts);
       if (!sent.ok) return finish(sent);
+      verifyTimer = setTimeout(() => { if (cachedStateMatches()) finish({ ok: true, confirmed: true, source: 'gateway-cache' }); }, 150);
       if (attempts < 3) retryTimer = setTimeout(send, Math.min(900, Math.floor(timeoutMs / 3)));
     };
     send();
@@ -835,7 +846,7 @@ app.post('/api/voice/state', async (req, res) => {
     let result;
     if (next.selfStream && !syntheticStreams.has(name)) result = await startSyntheticStream(name, guildId, 'go-live');
     else if (next.selfVideo && !syntheticStreams.has(name)) result = await startSyntheticStream(name, guildId, 'camera');
-    else result = await sendVoiceOpConfirmed(client, guildId, current.channelId, next, 9000);
+    else result = await sendVoiceOpConfirmed(client, guildId, current.channelId, next, 3000);
     if (result.ok) {
       if (!next.selfStream && !next.selfVideo && (current.selfStream || current.selfVideo)) stopSyntheticStream(name);
       const actual = readGatewayVoiceState(client, guildId);
