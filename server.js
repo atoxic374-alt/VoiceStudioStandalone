@@ -31,6 +31,10 @@ function cleanAccounts(accounts) {
   const values = Array.isArray(accounts) ? accounts : [accounts];
   return [...new Set(values.map((value) => String(value || '').trim()).filter(Boolean))];
 }
+function cleanChannelIds(channelIds) {
+  if (!Array.isArray(channelIds)) return [];
+  return [...new Set(channelIds.map((value) => String(value || '').trim()).filter(Boolean))];
+}
 function summary(results) {
   const okCount = results.filter((item) => item.ok).length;
   return { total: results.length, ok: okCount, failed: results.length - okCount };
@@ -111,9 +115,16 @@ function sendVoiceOpConfirmed(client, guildId, channelId, opts = {}, timeoutMs =
     };
     const matches = (guild, channel) => String(guild) === String(guildId)
       && (channelId == null ? channel == null : String(channel) === String(channelId));
-    const onWsState = (data) => {
-      if (!data || String(data.user_id) !== String(userId)) return;
-      if (matches(data.guild_id, data.channel_id)) finish({ ok: true });
+    const stateMatches = (data) => {
+      if (!data || String(data.user_id) !== String(userId) || !matches(data.guild_id, data.channel_id)) return false;
+      const flags = [
+        ['self_mute', 'selfMute'], ['self_deaf', 'selfDeaf'], ['self_video', 'selfVideo'], ['self_stream', 'selfStream'],
+      ];
+      return flags.every(([wire, local]) => opts[local] === undefined || data[wire] === undefined || !!data[wire] === !!opts[local]);
+    };
+    const onWsState = (packet) => {
+      const data = packet?.d || packet;
+      if (stateMatches(data)) finish({ ok: true });
     };
     const onJsState = (_oldState, newState) => {
       const id = newState?.member?.id || newState?.id || newState?.userId;
@@ -370,7 +381,8 @@ app.post('/api/voice/distribute-random', async (req, res) => {
 
 app.post('/api/voice/rotation/start', async (req, res) => {
   const accounts = cleanAccounts(req.body?.accounts);
-  const { guildId, guildName, channelIds, intervalMs, randomOrder = false } = req.body || {};
+  const { guildId, guildName, intervalMs, randomOrder = false } = req.body || {};
+  const channelIds = cleanChannelIds(req.body?.channelIds);
   const delay = Math.max(5000, Number(intervalMs || 60000));
   if (!accounts.length || !guildId || !Array.isArray(channelIds) || channelIds.length < 2) return fail(res, new Error('At least two channels and one account are required'), 400);
   const initial = await Promise.all(accounts.map((name) => moveAccount(name, guildId, channelIds[0])));
@@ -378,11 +390,16 @@ app.post('/api/voice/rotation/start', async (req, res) => {
   if (!readyAccounts.length) return ok(res, { id: null, started: false, initial, summary: summary(initial) });
   const id = crypto.randomUUID();
   const task = { id, accounts: readyAccounts, guildId, guildName: guildName || guildId, channels: channelIds, intervalMs: delay, randomOrder: !!randomOrder, currentIdx: 0, nextAt: Date.now() + delay };
+  task.running = false;
   task.timer = setInterval(async () => {
+    if (task.running) return;
+    task.running = true;
     task.currentIdx = (task.currentIdx + 1) % task.channels.length;
     const ids = task.randomOrder ? [...task.channels].sort(() => Math.random() - 0.5) : task.channels;
-    await Promise.all(task.accounts.map((name, index) => moveAccount(name, task.guildId, ids[(task.currentIdx + index) % ids.length])));
-    task.nextAt = Date.now() + task.intervalMs;
+    try {
+      await Promise.all(task.accounts.map((name, index) => moveAccount(name, task.guildId, ids[(task.currentIdx + index) % ids.length])));
+      task.nextAt = Date.now() + task.intervalMs;
+    } finally { task.running = false; }
   }, delay);
   rotations.set(id, task);
   return ok(res, { id, started: true, initial, summary: summary(initial) });
@@ -398,20 +415,31 @@ app.post('/api/voice/state-cycle/start', (req, res) => {
   const { guildId, states, intervalMs } = req.body || {};
   const delay = Math.max(5000, Number(intervalMs || 60000));
   if (!accounts.length || !guildId || !Array.isArray(states) || states.length < 2) return fail(res, new Error('At least two states and one account are required'), 400);
+  const validStates = states.every((item) => item && typeof item === 'object'
+    && ['selfMute', 'selfDeaf', 'selfVideo', 'selfStream'].every((key) => item[key] === undefined || typeof item[key] === 'boolean')
+    && !(item.selfDeaf === true && (item.selfVideo === true || item.selfStream === true)));
+  if (!validStates) return fail(res, new Error('State cycle contains an invalid voice state'), 400);
   const id = crypto.randomUUID();
   const task = { id, accounts, guildId, states, intervalMs: delay, currentIdx: 0, nextAt: Date.now() + delay };
+  task.running = false;
   task.timer = setInterval(async () => {
+    if (task.running) return;
+    task.running = true;
     task.currentIdx = (task.currentIdx + 1) % task.states.length;
     const state = task.states[task.currentIdx];
-    await Promise.all(task.accounts.map(async (name) => {
-      const current = voiceSessions.get(sessionKey(name, task.guildId));
-      if (!current) return;
-      const client = getClient(name);
-      if (!client) return;
-      const result = await sendVoiceOpConfirmed(client, task.guildId, current.channelId, state, 3000);
-      if (result.ok) { Object.assign(current, state); persistSessions(); }
-    }));
-    task.nextAt = Date.now() + task.intervalMs;
+    try {
+      await Promise.all(task.accounts.map(async (name) => {
+        const current = voiceSessions.get(sessionKey(name, task.guildId));
+        if (!current) return;
+        const client = getClient(name);
+        if (!client) return;
+        const next = { ...current, ...state };
+        if (next.selfDeaf && (next.selfVideo || next.selfStream)) return;
+        const result = await sendVoiceOpConfirmed(client, task.guildId, current.channelId, next, 3000);
+        if (result.ok) { Object.assign(current, next); persistSessions(); }
+      }));
+      task.nextAt = Date.now() + task.intervalMs;
+    } finally { task.running = false; }
   }, delay);
   stateCycles.set(id, task);
   return ok(res, { id });

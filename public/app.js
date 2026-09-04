@@ -9,6 +9,9 @@ const state = {
   mediaKind: null,
   mediaStartedAt: 0,
   mediaTimer: null,
+  rotationRoomFilter: '',
+  rotationRoomPage: 0,
+  rotationRoomSelection: new Set(),
   busy: new Set(),
 };
 
@@ -91,19 +94,42 @@ async function loadAutomationCatalog() {
   } catch (error) { console.warn('[voice] automation catalog failed', error); }
 }
 function selectedAutomationAccounts() { return [...document.querySelectorAll('#automationAccounts input[type="checkbox"]:checked')].map((input) => input.value); }
-function selectedRotationChannels() { return [...document.querySelectorAll('#rotationChannels input[type="checkbox"]:checked')].map((input) => input.value); }
+function selectedRotationChannels() { return [...state.rotationRoomSelection]; }
 function selectedAutomationStates() { return [...document.querySelectorAll('#statePicker input[type="checkbox"]:checked')].map((input) => input.value); }
 function selectedAutomationChannel() { return $('#automationChannel')?.value || ''; }
 function renderAutomationChannels() {
   const guildId = $('#automationGuild')?.value;
   const channelSelect = $('#automationChannel');
-  const rotationWrapper = $('#rotationChannels');
   const groups = state.allGroups.filter((group) => group.guildId === guildId);
   const channels = [...new Map(groups.flatMap((group) => group.voiceChannels || []).map((channel) => [channel.id, channel])).values()];
-  if (!guildId) { channelSelect.innerHTML = '<option value="">اختر السيرفر أولًا</option>'; rotationWrapper.innerHTML = '<div class="task-empty">اختر سيرفرًا لعرض رومات التنقل</div>'; renderTargetAccounts(); return; }
+  state.rotationRoomPage = 0;
+  state.rotationRoomSelection.clear();
+  if (!guildId) { channelSelect.innerHTML = '<option value="">اختر السيرفر أولًا</option>'; renderRotationRooms([]); renderTargetAccounts(); return; }
   channelSelect.innerHTML = channels.length ? `<option value="">اختر الروم</option>${channels.map((channel) => `<option value="${escapeHTML(channel.id)}">${escapeHTML(channel.name)} · ${channel.members || 0} متصل</option>`).join('')}` : '<option value="">لا توجد رومات متاحة</option>';
-  rotationWrapper.innerHTML = channels.length ? channels.map((channel) => `<label class="channel-check"><input type="checkbox" value="${escapeHTML(channel.id)}" /><span><strong>${escapeHTML(channel.name)}</strong><small>${channel.members || 0} متصل · ${channel.bitrate || 64} kbps</small></span></label>`).join('') : '<div class="task-empty">لا توجد رومات متاحة</div>';
+  renderRotationRooms(channels);
   renderTargetAccounts();
+}
+function rotationRooms() {
+  const guildId = $('#automationGuild')?.value;
+  return [...new Map(state.allGroups.filter((group) => group.guildId === guildId).flatMap((group) => group.voiceChannels || []).map((channel) => [channel.id, channel])).values()];
+}
+function renderRotationRooms(channels = rotationRooms()) {
+  const wrapper = $('#rotationChannels');
+  const filter = state.rotationRoomFilter.trim().toLocaleLowerCase();
+  const filtered = channels.filter((channel) => channel.name.toLocaleLowerCase().includes(filter));
+  const pageSize = 60;
+  const pages = Math.max(1, Math.ceil(filtered.length / pageSize));
+  state.rotationRoomPage = Math.min(state.rotationRoomPage, pages - 1);
+  const visible = filtered.slice(state.rotationRoomPage * pageSize, (state.rotationRoomPage + 1) * pageSize);
+  wrapper.innerHTML = visible.length ? visible.map((channel) => `<label class="channel-check"><input type="checkbox" value="${escapeHTML(channel.id)}" ${state.rotationRoomSelection.has(channel.id) ? 'checked' : ''} /><span><strong>${escapeHTML(channel.name)}</strong><small>${channel.members || 0} متصل · ${channel.bitrate || 64} kbps</small></span></label>`).join('') : '<div class="task-empty">لا توجد رومات مطابقة</div>';
+  wrapper.querySelectorAll('input[type="checkbox"]').forEach((input) => input.addEventListener('change', () => { if (input.checked) state.rotationRoomSelection.add(input.value); else state.rotationRoomSelection.delete(input.value); updateRotationPager(filtered.length, pages); }));
+  updateRotationPager(filtered.length, pages);
+}
+function updateRotationPager(filteredCount, pages) {
+  $('#rotationRoomCount').textContent = `${state.rotationRoomSelection.size} selected · ${filteredCount} rooms`;
+  $('#rotationPageLabel').textContent = `Page ${state.rotationRoomPage + 1} / ${pages}`;
+  $('#rotationPrevButton').disabled = state.rotationRoomPage === 0;
+  $('#rotationNextButton').disabled = state.rotationRoomPage >= pages - 1;
 }
 async function renderTargetAccounts() {
   const wrapper = $('#automationAccounts');
@@ -185,8 +211,8 @@ async function connect() {
     feedback('#connectFeedback', `تم الاتصال باسم ${data.username || data.name}.`, 'success');
     addActivity('تم الاتصال', data.username || data.name, 'success');
     toast('تم الاتصال بالحساب بنجاح', 'success');
-    await loadClients(data.name);
-    await refreshSessions();
+    try { await loadClients(data.name); await refreshSessions(); }
+    catch (refreshError) { console.warn('[voice] connected, but post-connect refresh failed', refreshError); addActivity('تم الاتصال', 'نجح الاتصال، حدّث القنوات يدويًا إذا لم تظهر بعد', 'success'); }
   } catch (error) {
     feedback('#connectFeedback', error.message, 'error');
     addActivity('تعذر الاتصال', error.message, 'error');
@@ -208,7 +234,8 @@ async function bulkConnect() {
     addActivity('استيراد جماعي', `${result.summary.ok} حساب متصل`, failed.length ? 'error' : 'success');
     toast(`تم اتصال ${result.summary.ok} حساب`, failed.length ? 'error' : 'success');
     $('#bulkTokensInput').value = '';
-    await loadClients(); await refreshSessions();
+    try { await loadClients(); await refreshSessions(); }
+    catch (refreshError) { console.warn('[voice] bulk connection completed, but refresh failed', refreshError); }
   } catch (error) { feedback('#bulkFeedback', error.message, 'error'); toast(error.message, 'error'); }
   finally { $('#bulkConnectButton').disabled = false; }
 }
@@ -293,12 +320,18 @@ async function applyState(kind) {
     await toggleCamera();
     return;
   }
+  if (kind === 'stream') {
+    await toggleScreen();
+    return;
+  }
   if (!state.selectedTarget) { toast('ادخل غرفة أولًا لتغيير الحالة', 'error'); return; }
   try {
     const result = await post('/api/voice/state', { accounts: selectedAccounts(), guildId: state.selectedTarget.guildId, ...next });
     if (!result.summary?.ok) throw new Error(result.results?.find((item) => !item.ok)?.error || 'تعذر تحديث الحالة');
     document.querySelectorAll('.state-button').forEach((button) => button.classList.toggle('is-active', button.dataset.state === kind));
-    feedback('#stateFeedback', next.label, 'success'); addActivity('تحديث الحالة', next.label, 'success'); toast(next.label, 'success'); await refreshSessions();
+    const failed = result.summary.failed || 0;
+    const message = failed ? `${next.label}: ${result.summary.ok} succeeded, ${failed} failed` : next.label;
+    feedback('#stateFeedback', message, failed ? 'error' : 'success'); addActivity('تحديث الحالة', message, failed ? 'error' : 'success'); toast(message, failed ? 'error' : 'success'); await refreshSessions();
   } catch (error) { feedback('#stateFeedback', error.message, 'error'); toast(error.message, 'error'); }
 }
 
@@ -386,6 +419,22 @@ async function quickLeave(name, guildId) {
   catch (error) { toast(error.message, 'error'); }
 }
 
+async function syncMediaVoiceState(next, kind) {
+  if (!state.selectedTarget || !state.selectedAccount) {
+    $('#mediaNotice').textContent = 'Local preview is active. Join a voice room first to request a Discord voice-state update.';
+    return { synced: false };
+  }
+  try {
+    const result = await post('/api/voice/state', { accounts: selectedAccounts(), guildId: state.selectedTarget.guildId, ...next });
+    if (!result.summary?.ok) throw new Error(result.results?.find((item) => !item.ok)?.error || 'Discord did not apply the media state');
+    $('#mediaNotice').textContent = `${kind} preview is local. Discord confirmed the matching voice-state flag; this app does not publish browser video or audio frames.`;
+    return { synced: true };
+  } catch (error) {
+    $('#mediaNotice').textContent = `Local preview is active, but Discord was not updated: ${error.message}`;
+    toast(`تعذر تحديث حالة Discord: ${error.message}`, 'error');
+    return { synced: false, error };
+  }
+}
 function stopCurrentStream({ updateDiscord = true } = {}) {
   const previousKind = state.mediaKind;
   if (state.mediaStream) state.mediaStream.getTracks().forEach((track) => track.stop());
@@ -399,8 +448,9 @@ function stopCurrentStream({ updateDiscord = true } = {}) {
   $('#cameraButton').classList.remove('is-active'); $('#screenButton').classList.remove('is-active');
   $('#cameraState').textContent = 'Off'; $('#screenState').textContent = 'Off';
   $('#mediaStatus').classList.remove('is-live'); $('#mediaStatus').innerHTML = '<span></span> Offline';
+  $('#mediaNotice').textContent = 'Preview runs locally in your browser. A source starts only after permission.';
   if (updateDiscord && previousKind && state.selectedTarget && state.selectedAccount) {
-    post('/api/voice/state', { accounts: selectedAccounts(), guildId: state.selectedTarget.guildId, selfVideo: false, selfStream: false }).catch(() => {});
+    syncMediaVoiceState({ selfVideo: false, selfStream: false }, 'Media').catch(() => {});
   }
 }
 function bindMediaEnded(stream) { stream.getVideoTracks().forEach((track) => track.addEventListener('ended', () => { if (state.mediaStream === stream) stopCurrentStream(); })); }
@@ -419,7 +469,7 @@ async function toggleCamera() {
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' }, audio: false });
     showMediaStream(stream, 'camera');
-    if (state.selectedTarget && state.selectedAccount) post('/api/voice/state', { accounts: selectedAccounts(), guildId: state.selectedTarget.guildId, selfVideo: true }).catch(() => {});
+    await syncMediaVoiceState({ selfVideo: true, selfStream: false }, 'Camera');
   } catch (error) { toast(error.name === 'NotAllowedError' ? 'تم رفض إذن الكاميرا' : `تعذر تشغيل الكاميرا: ${error.message}`, 'error'); addActivity('فشل تشغيل الكاميرا', error.message, 'error'); }
 }
 async function toggleScreen() {
@@ -429,7 +479,7 @@ async function toggleScreen() {
     const stream = await navigator.mediaDevices.getDisplayMedia({ video: { cursor: 'always', frameRate: { ideal: 30, max: 60 } }, audio: false });
     showMediaStream(stream, 'screen');
     $('#cameraPreview').style.transform = 'none';
-    if (state.selectedTarget && state.selectedAccount) post('/api/voice/state', { accounts: selectedAccounts(), guildId: state.selectedTarget.guildId, selfStream: true }).catch(() => {});
+    await syncMediaVoiceState({ selfVideo: false, selfStream: true }, 'Screen share');
   } catch (error) {
     if (error.name !== 'NotAllowedError' && error.name !== 'AbortError') toast(`تعذرت مشاركة الشاشة: ${error.message}`, 'error');
   }
@@ -453,7 +503,7 @@ function initLanguage() {
 function initNavigation() { document.querySelectorAll('[data-section]').forEach((button) => button.addEventListener('click', () => { const section = button.dataset.section; document.querySelectorAll('.side-nav-item').forEach((item) => item.classList.toggle('is-active', item === button)); const breadcrumb = document.querySelector('.breadcrumb strong'); if (breadcrumb) breadcrumb.textContent = section[0].toUpperCase() + section.slice(1); document.querySelectorAll('[data-panel]').forEach((panel) => { const panels = panel.dataset.panel.split(/\s+/); panel.hidden = !panels.includes(section); }); })); document.querySelector('[data-section="dashboard"]')?.click(); }
 function init() {
   initTheme(); initLanguage(); initNavigation();
-  $('#connectButton').addEventListener('click', connect); $('#bulkConnectButton').addEventListener('click', bulkConnect); $('#disconnectButton').addEventListener('click', disconnect); $('#refreshButton').addEventListener('click', refreshChannels); $('#accountSelect').addEventListener('change', async (event) => { state.selectedAccount = event.target.value; await loadGuilds(); await loadAutomationCatalog(); }); $('#automationGuild').addEventListener('change', renderAutomationChannels); $('#automationChannel').addEventListener('change', renderTargetAccounts); $('#bulkJoinButton').addEventListener('click', bulkJoinSelected); $('#channelSelect').addEventListener('change', handleChannelChange); $('#joinButton').addEventListener('click', join); $('#joinAllButton').addEventListener('click', joinAll); $('#leaveButton').addEventListener('click', leave); $('#cameraButton').addEventListener('click', toggleCamera); $('#screenButton').addEventListener('click', toggleScreen); $('#startRotationButton').addEventListener('click', startRotation); $('#startCycleButton').addEventListener('click', startCycle); $('#stopMediaButton').addEventListener('click', () => stopCurrentStream()); document.querySelectorAll('.state-button').forEach((button) => button.addEventListener('click', () => applyState(button.dataset.state))); document.querySelectorAll('#statePicker input').forEach((input) => input.addEventListener('change', () => input.closest('.state-option')?.classList.toggle('is-selected', input.checked)));
+  $('#connectButton').addEventListener('click', connect); $('#bulkConnectButton').addEventListener('click', bulkConnect); $('#disconnectButton').addEventListener('click', disconnect); $('#refreshButton').addEventListener('click', refreshChannels); $('#accountSelect').addEventListener('change', async (event) => { state.selectedAccount = event.target.value; await loadGuilds(); await loadAutomationCatalog(); }); $('#automationGuild').addEventListener('change', renderAutomationChannels); $('#automationChannel').addEventListener('change', renderTargetAccounts); $('#rotationRoomFilter').addEventListener('input', (event) => { state.rotationRoomFilter = event.target.value; state.rotationRoomPage = 0; renderRotationRooms(); }); $('#rotationPrevButton').addEventListener('click', () => { state.rotationRoomPage -= 1; renderRotationRooms(); }); $('#rotationNextButton').addEventListener('click', () => { state.rotationRoomPage += 1; renderRotationRooms(); }); $('#bulkJoinButton').addEventListener('click', bulkJoinSelected); $('#channelSelect').addEventListener('change', handleChannelChange); $('#joinButton').addEventListener('click', join); $('#joinAllButton').addEventListener('click', joinAll); $('#leaveButton').addEventListener('click', leave); $('#cameraButton').addEventListener('click', toggleCamera); $('#screenButton').addEventListener('click', toggleScreen); $('#startRotationButton').addEventListener('click', startRotation); $('#startCycleButton').addEventListener('click', startCycle); $('#stopMediaButton').addEventListener('click', () => stopCurrentStream()); document.querySelectorAll('.state-button').forEach((button) => button.addEventListener('click', () => applyState(button.dataset.state))); document.querySelectorAll('#statePicker input').forEach((input) => input.addEventListener('change', () => input.closest('.state-option')?.classList.toggle('is-selected', input.checked)));
   $('#operationClose').addEventListener('click', () => { $('#operationModal').hidden = true; $('.operation-loader')?.classList.remove('is-done', 'is-error'); }); window.addEventListener('beforeunload', () => stopCurrentStream({ updateDiscord: false }));
   loadClients().catch(() => {}); refreshSessions(); setInterval(refreshSessions, 8000);
 }
