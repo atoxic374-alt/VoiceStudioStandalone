@@ -27,3 +27,8 @@ The sidebar now uses English product categories: Dashboard, Accounts, Voice, Aut
 ## Final information architecture check
 
 Dashboard now shows only the live overview. Accounts shows connection and bulk-import controls. Automation shows only the automation form. The browser check confirmed the English sidebar categories and that switching to Automation hides unrelated cards, reducing visual overload. The shared operation modal is wired to POST actions and includes account identity rows plus success/failure states.
+
+
+## Final language and status-panel verification
+
+The final browser check confirmed the sidebar and breadcrumb remain English, the hero uses neutral product wording (`VOICE CONTROL CENTER` / `Voice Control`), and Automation displays a larger visual States panel with `Unmute`, `Mute`, `Deafen`, `Video`, and `Stream`. The website is currently open at `http://localhost:5050` for manual testing.
