@@ -202,7 +202,8 @@ async function startSyntheticStream(name, guildId) {
         }
         if (!dispatcher) { try { streamConnection.disconnect?.(); } catch {} throw playError || new Error('Unable to create video dispatcher'); }
         syntheticStreams.set(name, { connection, streamConnection, dispatcher, guildId, channelId: session.channelId });
-        sendVoiceOp(client, guildId, session.channelId, { selfMute: !!session.selfMute, selfDeaf: false, selfVideo: false, selfStream: true });
+        const confirmed = await sendVoiceOpConfirmed(client, guildId, session.channelId, { selfMute: !!session.selfMute, selfDeaf: false, selfVideo: false, selfStream: true }, 7000);
+        if (!confirmed.ok) throw new Error(confirmed.error || 'Discord did not confirm screen share state');
         dispatcher.on?.('error', (error) => logMediaEvent('error', 'stream.runtime_failed', { account: name, guildId, channelId: session.channelId, error: error?.message || String(error) }));
         dispatcher.once?.('finish', () => { if (syntheticStreams.get(name)?.dispatcher === dispatcher) stopSyntheticStream(name); });
         logMediaEvent('info', 'stream.ready', { account: name, guildId, channelId: session.channelId, durationMs: Date.now() - startedAt, attempt });
@@ -281,6 +282,7 @@ function sendVoiceOpConfirmed(client, guildId, channelId, opts = {}, timeoutMs =
     let settled = false;
     let timer = null;
     let retryTimer = null;
+    let attempts = 0;
     const cleanup = () => {
       try { client.ws?.off?.('VOICE_STATE_UPDATE', onWsState); } catch {}
       try { client.off?.('voiceStateUpdate', onJsState); } catch {}
@@ -302,7 +304,7 @@ function sendVoiceOpConfirmed(client, guildId, channelId, opts = {}, timeoutMs =
       const flags = [
         ['self_mute', 'selfMute'], ['self_deaf', 'selfDeaf'], ['self_video', 'selfVideo'], ['self_stream', 'selfStream'],
       ];
-      return flags.every(([wire, local]) => opts[local] === undefined || data[wire] === undefined || !!data[wire] === !!opts[local]);
+      return flags.every(([wire, local]) => opts[local] === undefined || (data[wire] !== undefined && !!data[wire] === !!opts[local]));
     };
     const onWsState = (packet) => {
       const data = packet?.d || packet;
@@ -313,16 +315,32 @@ function sendVoiceOpConfirmed(client, guildId, channelId, opts = {}, timeoutMs =
       if (String(id) !== String(userId)) return;
       const guild = newState?.guild?.id || newState?.guildId;
       const channel = newState?.channelId ?? newState?.channel_id;
-      if (matches(guild, channel)) finish({ ok: true, confirmed: true });
+      if (!matches(guild, channel)) return;
+      const observed = {
+        selfMute: newState?.selfMute ?? newState?.self_mute,
+        selfDeaf: newState?.selfDeaf ?? newState?.self_deaf,
+        selfVideo: newState?.selfVideo ?? newState?.self_video,
+        selfStream: newState?.streaming ?? newState?.selfStream ?? newState?.self_stream,
+      };
+      const flagsMatch = Object.entries(opts).every(([key, value]) => {
+        if (!['selfMute', 'selfDeaf', 'selfVideo', 'selfStream'].includes(key)) return true;
+        return observed[key] !== undefined && !!observed[key] === !!value;
+      });
+      if (flagsMatch) finish({ ok: true, confirmed: true });
     };
 
     try { client.ws?.on?.('VOICE_STATE_UPDATE', onWsState); } catch {}
     try { client.on?.('voiceStateUpdate', onJsState); } catch {}
     timer = setTimeout(() => finish({ ok: false, error: 'Discord did not confirm the voice state in time' }), timeoutMs);
 
-    const sent = sendVoiceOp(client, guildId, channelId, opts);
-    if (!sent.ok) finish(sent);
-    else retryTimer = setTimeout(() => { if (!settled) sendVoiceOp(client, guildId, channelId, opts); }, Math.min(750, Math.floor(timeoutMs / 3)));
+    const send = () => {
+      if (settled) return;
+      attempts += 1;
+      const sent = sendVoiceOp(client, guildId, channelId, opts);
+      if (!sent.ok) return finish(sent);
+      if (attempts < 3) retryTimer = setTimeout(send, Math.min(900, Math.floor(timeoutMs / 3)));
+    };
+    send();
   });
 }
 
@@ -698,7 +716,7 @@ app.post('/api/voice/state', async (req, res) => {
     const operationStartedAt = Date.now();
     const mediaKind = selfStream !== undefined ? 'stream' : selfVideo !== undefined ? 'camera' : 'voice-state';
     const client = getClient(name);
-    const current = voiceSessions.get(sessionKey(name, guildId));
+    const current = readGatewayVoiceState(client, guildId) || voiceSessions.get(sessionKey(name, guildId));
     if (!client) return { name, ok: false, error: 'Account is not connected' };
     if (!current?.channelId) return { name, ok: false, error: 'Account is not in a voice channel' };
     const next = {

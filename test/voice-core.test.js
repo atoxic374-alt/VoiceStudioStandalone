@@ -10,7 +10,11 @@ function fakeClient({ ready = true, confirms = true } = {}) {
     status: ready ? 0 : 1,
     send(payload) {
       sent = payload;
-      if (confirms) setImmediate(() => ws.emit('VOICE_STATE_UPDATE', { user_id: 'user-1', guild_id: 'guild-1', channel_id: payload.d.channel_id }));
+      if (confirms) setImmediate(() => ws.emit('VOICE_STATE_UPDATE', {
+        user_id: 'user-1', guild_id: 'guild-1', channel_id: payload.d.channel_id,
+        self_mute: payload.d.self_mute, self_deaf: payload.d.self_deaf,
+        self_video: payload.d.self_video, self_stream: payload.d.self_stream,
+      }));
     },
   };
   ws.shards = { first: () => shard };
@@ -52,4 +56,13 @@ test('does not hang when a client has no active shard', async () => {
   const client = { user: { id: 'user-1' }, ws: { shards: { first: () => null } } };
   const result = await sendVoiceOpConfirmed(client, 'guild-1', 'channel-1', {}, 250);
   assert.deepEqual(result, { ok: false, error: 'No active gateway shard' });
+});
+
+test('does not accept a voice event that omits requested state flags', async () => {
+  const { client } = fakeClient({ confirms: false });
+  const pending = sendVoiceOpConfirmed(client, 'guild-1', 'channel-1', { selfMute: true }, 80);
+  client.ws.emit('VOICE_STATE_UPDATE', { user_id: 'user-1', guild_id: 'guild-1', channel_id: 'channel-1' });
+  const result = await pending;
+  assert.equal(result.ok, false);
+  assert.match(result.error, /did not confirm/);
 });
