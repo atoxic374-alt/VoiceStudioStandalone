@@ -854,9 +854,7 @@ app.post('/api/discord/disconnect', async (req, res) => {
 app.post('/api/discord/disconnect-bulk', async (req, res) => {
   const names = cleanAccounts(req.body?.accounts);
   if (!names.length) return fail(res, new Error('Select at least one account'), 400);
-  const results = [];
-  for (const name of names) {
-    results.push(await withResultRetry(async () => {
+  const results = await mapWithConcurrency(names, 8, (name) => withResultRetry(async () => {
       const entry = clients.get(name);
       if (!entry) return { name, ok: false, error: 'Account is not connected' };
       stopTasksForAccount(name);
@@ -867,7 +865,6 @@ app.post('/api/discord/disconnect-bulk', async (req, res) => {
       emitLive('account.disconnected', { name });
       return { name, ok: true };
     }));
-  }
   persistConnectedAccounts();
   return ok(res, { results, summary: summary(results) });
 });
