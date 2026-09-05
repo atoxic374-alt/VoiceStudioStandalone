@@ -261,6 +261,30 @@ async function loadGuilds() {
   } catch (error) {
     feedback('#connectFeedback', error.message, 'error');
   }
+  updateQuickStateButtons();
+}
+async function syncSelectedAccountVoice() {
+  const client = state.clients.find((item) => item.name === state.selectedAccount);
+  const voice = client?.voice;
+  if (!voice?.guildId || !voice.channelId) {
+    state.selectedTarget = null;
+    updateChannelSummary();
+    updateQuickStateButtons();
+    return;
+  }
+  if (!state.groups.some((group) => group.guildId === voice.guildId)) await loadGuilds();
+  state.selectedGuildId = voice.guildId;
+  renderServers();
+  renderChannels();
+  const value = `${voice.guildId}::${voice.channelId}`;
+  if ([...$('#channelSelect').options].some((option) => option.value === value)) {
+    $('#channelSelect').value = value;
+    handleChannelChange();
+  } else {
+    state.selectedTarget = { guildId: voice.guildId, channelId: voice.channelId, guildName: voice.guildName || voice.guildId, channelName: voice.channelName || voice.channelId };
+    updateChannelSummary();
+  }
+  updateQuickStateButtons();
 }
 function renderServers() {
   const select = $('#serverSelect'); if (!select) return;
@@ -498,6 +522,7 @@ async function refreshSessions() {
       const clients = await api('/api/discord/clients');
       state.clients = clients.clients || state.clients;
       renderProfiles(state.clients);
+      await syncSelectedAccountVoice();
       const data = await api('/api/voice/sessions');
       renderSessions(data.sessions || []);
       await loadTasks();
