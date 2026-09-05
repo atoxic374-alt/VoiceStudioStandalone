@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
-const { sendVoiceOp, sendVoiceOpConfirmed, rotations, rotationControlledAccounts } = require('../server');
+const { sendVoiceOp, sendVoiceOpConfirmed, rotations, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation } = require('../server');
 
 function fakeClient({ ready = true, confirms = true } = {}) {
   const ws = new EventEmitter();
@@ -73,6 +73,21 @@ test('isolates bulk voice control from accounts managed by rotation in the same 
   try {
     assert.deepEqual([...rotationControlledAccounts('guild-1')], ['rotating-account']);
     assert.deepEqual([...rotationControlledAccounts('guild-2')], []);
+  } finally {
+    rotations.delete(taskId);
+  }
+});
+
+test('detects duplicate task ownership and supersedes stale account operations', () => {
+  const taskId = 'test-duplicate-rotation';
+  rotations.set(taskId, { id: taskId, guildId: 'guild-1', accounts: ['account-a'] });
+  try {
+    assert.deepEqual(taskConflict(['account-a', 'account-b'], 'guild-1', 'rotation'), [{ id: taskId, accounts: ['account-a'] }]);
+    const first = beginAccountOperation('account-a', 'guild-1', 'state');
+    const second = beginAccountOperation('account-a', 'guild-1', 'move');
+    assert.equal(operationIsCurrent(first), false);
+    assert.equal(operationIsCurrent(second), true);
+    endAccountOperation(second);
   } finally {
     rotations.delete(taskId);
   }

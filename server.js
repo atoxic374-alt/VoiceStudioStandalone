@@ -76,6 +76,7 @@ const rotations = new Map();
 const stateCycles = new Map();
 const syntheticStreams = new Map();
 const mediaStreamers = new Map();
+const accountOperations = new Map();
 let videoStreamModulePromise;
 const liveEvents = new EventEmitter();
 liveEvents.setMaxListeners(0);
@@ -400,6 +401,28 @@ function rotationControlledAccounts(guildId) {
   }
   return controlled;
 }
+function operationKey(name, guildId) { return `${String(name)}__${String(guildId)}`; }
+function beginAccountOperation(name, guildId, kind) {
+  const key = operationKey(name, guildId);
+  const previous = accountOperations.get(key);
+  const operation = { key, name: String(name), guildId: String(guildId), kind, generation: (previous?.generation || 0) + 1, cancelled: false, startedAt: Date.now() };
+  if (previous) previous.cancelled = true;
+  accountOperations.set(key, operation);
+  return operation;
+}
+function operationIsCurrent(operation) { return accountOperations.get(operation.key) === operation && !operation.cancelled; }
+function endAccountOperation(operation) { if (accountOperations.get(operation.key) === operation) accountOperations.delete(operation.key); }
+function taskConflict(accounts, guildId, type) {
+  const conflicts = [];
+  const activeTasks = type === 'rotation' ? rotations : stateCycles;
+  for (const task of activeTasks.values()) {
+    if (String(task.guildId) !== String(guildId)) continue;
+    const overlap = accounts.filter((name) => (task.accounts || []).includes(name));
+    if (overlap.length) conflicts.push({ id: task.id, accounts: overlap });
+  }
+  return conflicts;
+}
+function taskAccountConflicts(accounts, guildId, type) { return taskConflict(accounts, guildId, type).flatMap((item) => item.accounts); }
 function getClient(name) {
   const entry = clients.get(String(name || ''));
   return entry?.client || null;
@@ -608,8 +631,9 @@ async function moveAccount(name, guildId, channelId, opts = {}) {
   return withAccountLock(name, async () => {
     const client = getClient(name);
     if (!client) return { name, ok: false, error: 'Account is not connected' };
+    const operation = beginAccountOperation(name, guildId, 'move');
     const target = validateTarget(client, guildId, channelId);
-    if (!target.ok) return { name, ok: false, error: target.error };
+    if (!target.ok) { endAccountOperation(operation); return { name, ok: false, error: target.error }; }
     const saved = voiceSessions.get(sessionKey(name, guildId));
     const observed = readGatewayVoiceState(client, guildId);
     const current = { ...(saved || {}), ...(observed || {}) };
@@ -618,15 +642,17 @@ async function moveAccount(name, guildId, channelId, opts = {}) {
     const desired = normalizeVoiceState({ ...(current || {}), ...opts });
     if (syntheticStreams.has(name) || mediaStreamers.has(name)) stopSyntheticStream(name, { leaveVoice: true });
     const result = await sendVoiceOpConfirmed(client, guildId, channelId, { ...desired, selfVideo: false, selfStream: false });
+    if (!operationIsCurrent(operation)) { endAccountOperation(operation); return { name, ok: false, stale: true, error: 'Voice move was superseded by a newer request' }; }
     if (result.ok) {
       for (const key of [...voiceSessions.keys()]) if (key.startsWith(`${name}__`) && key !== sessionKey(name, guildId)) voiceSessions.delete(key);
       const actual = readGatewayVoiceState(client, guildId);
       upsertSession(name, guildId, channelId, { ...desired, ...(actual || {}), selfVideo: desired.selfVideo, selfStream: desired.selfStream });
       if (desired.selfStream || desired.selfVideo) {
         const media = await startSyntheticStream(name, guildId, desired.selfStream ? 'go-live' : 'camera');
-        if (!media.ok) return { name, ok: false, error: media.error, channelId };
+        if (!media.ok) { endAccountOperation(operation); return { name, ok: false, error: media.error, channelId }; }
       }
     }
+    endAccountOperation(operation);
     return { name, ok: result.ok, error: result.ok ? null : result.error, channelId };
   });
 }
@@ -943,6 +969,7 @@ app.post('/api/voice/state', async (req, res) => {
   const rotationAccounts = rotationControlledAccounts(guildId);
   const results = await mapWithConcurrency(accounts, 8, (name) => withAccountLock(name, async () => {
     if (rotationAccounts.has(name)) return { name, ok: true, skipped: true, reason: 'Account is controlled by an active rotation' };
+    const operation = beginAccountOperation(name, guildId, 'state');
     const operationStartedAt = Date.now();
     const mediaKind = selfStream !== undefined ? 'stream' : selfVideo !== undefined ? 'camera' : 'voice-state';
     const client = getClient(name);
@@ -952,8 +979,8 @@ app.post('/api/voice/state', async (req, res) => {
       selfStream: syntheticStreams.has(name) || !!observed?.selfStream,
       selfVideo: syntheticStreams.get(name)?.mediaKind === 'camera' || !!observed?.selfVideo,
     };
-    if (!client) return { name, ok: false, error: 'Account is not connected' };
-    if (!current?.channelId) return { name, ok: false, error: 'Account is not in a voice channel' };
+    if (!client) { endAccountOperation(operation); return { name, ok: false, error: 'Account is not connected' }; }
+    if (!current?.channelId) { endAccountOperation(operation); return { name, ok: false, error: 'Account is not in a voice channel' }; }
     const enablingMedia = selfVideo === true || selfStream === true;
     const next = {
       selfMute: selfMute !== undefined ? selfMute : !!current.selfMute,
@@ -961,11 +988,12 @@ app.post('/api/voice/state', async (req, res) => {
       selfVideo: selfVideo !== undefined ? selfVideo : !!current.selfVideo,
       selfStream: selfStream !== undefined ? selfStream : !!current.selfStream,
     };
-    if (next.selfDeaf && (next.selfVideo || next.selfStream)) return { name, ok: false, error: 'Video or screen share cannot be enabled while deafened' };
+    if (next.selfDeaf && (next.selfVideo || next.selfStream)) { endAccountOperation(operation); return { name, ok: false, error: 'Video or screen share cannot be enabled while deafened' }; }
     let result;
     if (next.selfStream && !syntheticStreams.has(name)) result = await startSyntheticStream(name, guildId, 'go-live');
     else if (next.selfVideo && !syntheticStreams.has(name)) result = await startSyntheticStream(name, guildId, 'camera');
     else result = await sendVoiceOpConfirmed(client, guildId, current.channelId, next, 6000);
+    if (!operationIsCurrent(operation)) { endAccountOperation(operation); return { name, ok: false, stale: true, error: 'Voice operation was superseded by a newer request' }; }
     if (result.ok) {
       if (!next.selfStream && !next.selfVideo && (current.selfStream || current.selfVideo)) stopSyntheticStream(name);
       const actual = readGatewayVoiceState(client, guildId);
@@ -974,6 +1002,7 @@ app.post('/api/voice/state', async (req, res) => {
     }
     const output = { name, ok: result.ok, error: result.ok ? null : result.error };
     logMediaEvent(result.ok ? 'info' : 'error', `${mediaKind}.${result.ok ? 'confirmed' : 'failed'}`, { account: name, guildId, channelId: current.channelId, durationMs: Date.now() - operationStartedAt, error: output.error || undefined });
+    endAccountOperation(operation);
     return output;
   }));
   emitLive('operation.completed', { operation: 'state', results, summary: summary(results) });
@@ -1003,6 +1032,8 @@ app.post('/api/voice/rotation/start', async (req, res) => {
   const channelIds = cleanChannelIds(req.body?.channelIds);
   const delay = Math.max(1000, Number(intervalMs || 60000));
   if (!accounts.length || !guildId || !Array.isArray(channelIds) || channelIds.length < 2) return fail(res, new Error('At least two channels and one account are required'), 400);
+  const conflicts = taskAccountConflicts(accounts, guildId, 'rotation');
+  if (conflicts.length) return fail(res, new Error(`These accounts already have a room rotation: ${conflicts.join(', ')}`), 409);
   const initial = await Promise.all(accounts.map((name, index) => {
     const current = voiceSessions.get(sessionKey(name, guildId));
     const currentIndex = channelIds.indexOf(current?.channelId);
@@ -1013,10 +1044,10 @@ app.post('/api/voice/rotation/start', async (req, res) => {
   if (!readyAccounts.length) return ok(res, { id: null, started: false, initial, summary: summary(initial) });
   const id = crypto.randomUUID();
   const task = { id, accounts: readyAccounts, guildId, guildName: guildName || guildId, channels: channelIds, intervalMs: delay, randomOrder: !!randomOrder, currentIdx: 0, startedAt: Date.now(), nextAt: Date.now() + delay };
-  task.running = false;
+  task.running = false; task.active = true;
   task.lastResults = initial;
   task.timer = setInterval(async () => {
-    if (task.running) return;
+    if (!task.active || task.running) return;
     task.running = true;
     task.currentIdx = (task.currentIdx + 1) % task.channels.length;
     const ids = task.randomOrder ? [...task.channels].sort(() => Math.random() - 0.5) : task.channels;
@@ -1038,34 +1069,39 @@ app.post('/api/voice/rotation/stop', (req, res) => {
   const id = String(req.body?.id || '');
   const task = rotations.get(id);
   if (!task) return fail(res, new Error('Rotation not found'), 404);
-  clearInterval(task.timer); rotations.delete(id); persistAutomationTasks(); return ok(res);
+  task.active = false; clearInterval(task.timer); rotations.delete(id); persistAutomationTasks(); return ok(res);
 });
 app.post('/api/voice/state-cycle/start', async (req, res) => {
   const accounts = cleanAccounts(req.body?.accounts);
   const { guildId, states, intervalMs } = req.body || {};
   const delay = Math.max(1000, Number(intervalMs || 60000));
   if (!accounts.length || !guildId || !Array.isArray(states) || states.length < 2) return fail(res, new Error('At least two states and one account are required'), 400);
+  const conflicts = taskAccountConflicts(accounts, guildId, 'cycle');
+  if (conflicts.length) return fail(res, new Error(`These accounts already have a state rotation: ${conflicts.join(', ')}`), 409);
   const validStates = states.every((item) => item && typeof item === 'object'
     && ['selfMute', 'selfDeaf', 'selfVideo', 'selfStream'].every((key) => item[key] === undefined || typeof item[key] === 'boolean')
     && !(item.selfDeaf === true && (item.selfVideo === true || item.selfStream === true)));
   if (!validStates) return fail(res, new Error('State cycle contains an invalid voice state'), 400);
   const id = crypto.randomUUID();
   const task = { id, accounts, guildId, states, intervalMs: delay, currentIdx: 0, startedAt: Date.now(), nextAt: Date.now() + delay };
-  task.running = false;
-  task.lastResults = await Promise.all(task.accounts.map(async (name) => {
+  task.running = false; task.active = true;
+  task.lastResults = await Promise.all(task.accounts.map((name) => withAccountLock(name, async () => {
     const current = voiceSessions.get(sessionKey(name, task.guildId));
     const client = getClient(name);
     if (!current || !client) return { name, ok: false, error: 'Account is not currently in a voice channel' };
+    const operation = beginAccountOperation(name, task.guildId, 'cycle');
     const next = { ...current, ...normalizeVoiceState(task.states[0]), selfMute: task.states[0].selfMute === undefined ? !!current.selfMute : !!task.states[0].selfMute };
-    if (next.selfDeaf && (next.selfVideo || next.selfStream)) return { name, ok: false, error: 'Invalid deafened media state' };
+    if (next.selfDeaf && (next.selfVideo || next.selfStream)) { endAccountOperation(operation); return { name, ok: false, error: 'Invalid deafened media state' }; }
     const result = (next.selfStream || next.selfVideo)
       ? await startSyntheticStream(name, task.guildId, next.selfStream ? 'go-live' : 'camera')
       : await sendVoiceOpConfirmed(client, task.guildId, current.channelId, next, 6000);
+    if (!operationIsCurrent(operation)) { endAccountOperation(operation); return { name, ok: false, stale: true, error: 'State operation was superseded by a newer request' }; }
     if (result.ok) { Object.assign(current, next, { selfStream: !!next.selfStream, updatedAt: Date.now() }); persistSessions(); }
+    endAccountOperation(operation);
     return { name, ok: result.ok, error: result.ok ? null : result.error };
-  }));
+  })));
   task.timer = setInterval(async () => {
-    if (task.running) return;
+    if (!task.active || task.running) return;
     task.running = true;
     task.currentIdx = (task.currentIdx + 1) % task.states.length;
     const state = task.states[task.currentIdx];
@@ -1076,16 +1112,19 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
         if (!current) return;
         const client = getClient(name);
         if (!client) return;
+        const operation = beginAccountOperation(name, task.guildId, 'cycle');
         const next = { ...current, ...normalizeVoiceState(state), selfMute: state.selfMute === undefined ? !!current.selfMute : !!state.selfMute };
-        if (next.selfDeaf && (next.selfVideo || next.selfStream)) return;
+        if (next.selfDeaf && (next.selfVideo || next.selfStream)) { endAccountOperation(operation); return; }
         let result;
         if (next.selfStream || next.selfVideo) result = await startSyntheticStream(name, task.guildId, next.selfStream ? 'go-live' : 'camera');
         else {
           if (current.selfStream || current.selfVideo) stopSyntheticStream(name);
           result = await sendVoiceOpConfirmed(client, task.guildId, current.channelId, next, 6000);
         }
+        if (!operationIsCurrent(operation)) { endAccountOperation(operation); task.lastResults.push({ name, ok: false, stale: true, error: 'State operation was superseded by a newer request' }); return; }
         if (result.ok) { Object.assign(current, next, { selfStream: !!next.selfStream, updatedAt: Date.now() }); persistSessions(); }
         task.lastResults.push({ name, ok: result.ok, error: result.ok ? null : result.error });
+        endAccountOperation(operation);
       })));
       task.nextAt = Date.now() + task.intervalMs;
     } finally { task.running = false; }
@@ -1098,7 +1137,7 @@ app.post('/api/voice/state-cycle/stop', (req, res) => {
   const id = String(req.body?.id || '');
   const task = stateCycles.get(id);
   if (!task) return fail(res, new Error('State cycle not found'), 404);
-  clearInterval(task.timer); stateCycles.delete(id); persistAutomationTasks(); return ok(res);
+  task.active = false; clearInterval(task.timer); stateCycles.delete(id); persistAutomationTasks(); return ok(res);
 });
 
 async function restoreSavedAccounts() {
@@ -1114,9 +1153,11 @@ async function restoreAutomationTasks() {
   const saved = loadAutomationTasks();
   for (const item of Array.isArray(saved.rotations) ? saved.rotations : []) {
     if (!item.id || !item.guildId || !Array.isArray(item.channels) || item.channels.length < 2) continue;
-    const task = { ...item, accounts: cleanAccounts(item.accounts), running: false };
+    const accounts = cleanAccounts(item.accounts);
+    if (taskAccountConflicts(accounts, item.guildId, 'rotation').length) continue;
+    const task = { ...item, accounts, running: false, active: true };
     task.timer = setInterval(async () => {
-      if (task.running) return;
+      if (!task.active || task.running) return;
       task.running = true;
       task.currentIdx = (task.currentIdx + 1) % task.channels.length;
       const ids = task.randomOrder ? [...task.channels].sort(() => Math.random() - 0.5) : task.channels;
@@ -1135,9 +1176,11 @@ async function restoreAutomationTasks() {
   }
   for (const item of Array.isArray(saved.stateCycles) ? saved.stateCycles : []) {
     if (!item.id || !item.guildId || !Array.isArray(item.states) || item.states.length < 2) continue;
-    const task = { ...item, accounts: cleanAccounts(item.accounts), running: false };
+    const accounts = cleanAccounts(item.accounts);
+    if (taskAccountConflicts(accounts, item.guildId, 'cycle').length) continue;
+    const task = { ...item, accounts, running: false, active: true };
     task.timer = setInterval(async () => {
-      if (task.running) return;
+      if (!task.active || task.running) return;
       task.running = true;
       task.currentIdx = (task.currentIdx + 1) % task.states.length;
       const state = normalizeVoiceState(task.states[task.currentIdx]);
@@ -1165,4 +1208,4 @@ if (require.main === module) {
   app.listen(PORT, '0.0.0.0', () => { console.log(`Voice Studio listening on http://localhost:${PORT}`); setInterval(() => { try { reconcileVoiceSessions(); } catch (error) { console.warn('[voice] session reconciliation failed:', error.message); } }, 3000).unref?.(); restoreSavedAccounts().then(() => restoreAutomationTasks()).catch((error) => console.warn('[restore] restore failed:', error.message)); });
 }
 
-module.exports = { app, clients, voiceSessions, rotations, rotationControlledAccounts, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, saveAccounts, loadAccounts };
+module.exports = { app, clients, voiceSessions, rotations, stateCycles, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, saveAccounts, loadAccounts };
