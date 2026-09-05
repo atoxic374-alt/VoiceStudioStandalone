@@ -1012,7 +1012,7 @@ app.post('/api/voice/rotation/start', async (req, res) => {
   const readyAccounts = initial.filter((result) => result.ok).map((result) => result.name);
   if (!readyAccounts.length) return ok(res, { id: null, started: false, initial, summary: summary(initial) });
   const id = crypto.randomUUID();
-  const task = { id, accounts: readyAccounts, guildId, guildName: guildName || guildId, channels: channelIds, intervalMs: delay, randomOrder: !!randomOrder, currentIdx: 0, nextAt: Date.now() + delay };
+  const task = { id, accounts: readyAccounts, guildId, guildName: guildName || guildId, channels: channelIds, intervalMs: delay, randomOrder: !!randomOrder, currentIdx: 0, startedAt: Date.now(), nextAt: Date.now() + delay };
   task.running = false;
   task.lastResults = initial;
   task.timer = setInterval(async () => {
@@ -1050,7 +1050,7 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
     && !(item.selfDeaf === true && (item.selfVideo === true || item.selfStream === true)));
   if (!validStates) return fail(res, new Error('State cycle contains an invalid voice state'), 400);
   const id = crypto.randomUUID();
-  const task = { id, accounts, guildId, states, intervalMs: delay, currentIdx: 0, nextAt: Date.now() + delay };
+  const task = { id, accounts, guildId, states, intervalMs: delay, currentIdx: 0, startedAt: Date.now(), nextAt: Date.now() + delay };
   task.running = false;
   task.lastResults = await Promise.all(task.accounts.map(async (name) => {
     const current = voiceSessions.get(sessionKey(name, task.guildId));

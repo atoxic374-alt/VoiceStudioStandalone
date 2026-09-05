@@ -513,13 +513,38 @@ async function loadTasks() {
     renderTasks(state.tasks); renderProfiles(state.clients);
   } catch (error) { console.warn('[voice] tasks refresh failed', error); }
 }
+function taskTime(value) { if (!value) return 'غير متوفر'; try { return new Date(value).toLocaleString('ar-SA', { dateStyle: 'medium', timeStyle: 'short' }); } catch { return 'غير متوفر'; } }
+function taskStateLabel(state = {}) { return [['selfMute', 'Mute'], ['selfDeaf', 'Deafen'], ['selfVideo', 'Camera'], ['selfStream', 'Stream']].filter(([key]) => state[key]).map(([, label]) => label).join(' · ') || 'Voice on'; }
+function taskChannelName(task, channelId) { return task.channels?.includes(channelId) ? `Room ${task.channels.indexOf(channelId) + 1} · ${channelId}` : (channelId || 'غير محدد'); }
+function openTaskDetails(taskId) {
+  const task = state.tasks.find((item) => item.id === taskId);
+  if (!task) return;
+  const modal = $('#taskDetailsModal');
+  const cycleState = task.type === 'cycle' ? (task.states?.[task.currentIdx] || {}) : null;
+  const currentRoom = task.type === 'rotation' ? task.channels?.[task.currentIdx % (task.channels?.length || 1)] : null;
+  $('#taskDetailsTitle').textContent = task.title;
+  $('#taskDetailsSubtitle').textContent = `${task.guildName || task.guildId} · ${task.accounts?.length || 0} حساب`;
+  $('#taskDetailsSummary').innerHTML = `<div><span>السيرفر</span><strong>${escapeHTML(task.guildName || task.guildId || 'غير محدد')}</strong></div><div><span>بدأت</span><strong>${escapeHTML(taskTime(task.startedAt))}</strong></div><div><span>الفترة</span><strong>${escapeHTML(`${Math.round((task.intervalMs || 0) / 60000)} دقيقة`)}</strong></div><div><span>التنفيذ التالي</span><strong>${escapeHTML(taskTime(task.nextAt))}</strong></div><div><span>الحالة الحالية</span><strong>${escapeHTML(task.type === 'cycle' ? taskStateLabel(cycleState) : taskChannelName(task, currentRoom))}</strong></div><div><span>التسلسل</span><strong>${escapeHTML(task.type === 'rotation' ? (task.randomOrder ? 'عشوائي' : 'تسلسلي') : `${task.states?.length || 0} حالات`)}</strong></div>`;
+  $('#taskDetailsAccounts').innerHTML = (task.accounts || []).map((name) => {
+    const client = state.clients.find((item) => item.name === name);
+    const voice = client?.voice;
+    const result = (task.lastResults || []).find((item) => item.name === name);
+    const liveState = voice ? taskStateLabel(voice) : 'ليس داخل روم';
+    const detail = task.type === 'rotation' ? `${voice?.channelName || voice?.channelId || 'لا يوجد روم'} · الحالة: ${liveState}` : `الحالة الحالية: ${liveState} · الهدف: ${taskStateLabel(cycleState)}`;
+    return `<div class="task-detail-account"><div class="task-detail-account-main"><span class="task-detail-avatar">${escapeHTML((client?.nickname || name || '?')[0])}</span><div><strong>${escapeHTML(client?.nickname || name)}</strong><small>${escapeHTML(name)}</small></div></div><div class="task-detail-account-state"><span>${escapeHTML(detail)}</span><small class="${result?.ok === false ? 'is-error' : 'is-ok'}">${result?.ok === false ? escapeHTML(result.error || 'فشل آخر تنفيذ') : 'آخر تنفيذ ناجح أو قيد المتابعة'}</small></div></div>`;
+  }).join('') || '<div class="task-empty">لا توجد حسابات في هذه المهمة</div>';
+  modal.hidden = false;
+}
 function renderTasks(tasks) {
   const list = $('#tasksList');
   if (!list) return;
   if (!tasks.length) { list.innerHTML = '<div class="task-empty">لا توجد مهام قيد التشغيل</div>'; return; }
-  list.innerHTML = tasks.map((task) => { const names = (task.accounts || []).map((name) => state.clients.find((client) => client.name === name)?.nickname || name).join('، '); return `<div class="task-row"><div><strong>${escapeHTML(task.title)}</strong><small>${escapeHTML(names || `${task.accounts?.length || 0} حساب`)} · كل ${Math.round((task.intervalMs || 0) / 60000)} دقيقة · Active</small></div><button type="button" class="task-stop" data-task-type="${task.type}" data-task-id="${escapeHTML(task.id)}">إيقاف</button></div>`; }).join('');
+  list.innerHTML = tasks.map((task) => { const names = (task.accounts || []).map((name) => state.clients.find((client) => client.name === name)?.nickname || name).join('، '); return `<div class="task-row"><div class="task-row-copy"><strong>${escapeHTML(task.title)}</strong><small>${escapeHTML(names || `${task.accounts?.length || 0} حساب`)} · كل ${Math.round((task.intervalMs || 0) / 60000)} دقيقة · ${escapeHTML(taskTime(task.nextAt))}</small></div><button type="button" class="task-details-button" data-task-details="${escapeHTML(task.id)}">عرض التفاصيل</button><button type="button" class="task-stop" data-task-type="${task.type}" data-task-id="${escapeHTML(task.id)}">إيقاف</button></div>`; }).join('');
+  list.querySelectorAll('[data-task-details]').forEach((button) => button.addEventListener('click', () => openTaskDetails(button.dataset.taskDetails)));
   list.querySelectorAll('.task-stop').forEach((button) => button.addEventListener('click', () => stopTask(button.dataset.taskType, button.dataset.taskId)));
 }
+$('#taskDetailsClose')?.addEventListener('click', () => { $('#taskDetailsModal').hidden = true; });
+$('#taskDetailsModal')?.addEventListener('click', (event) => { if (event.target.id === 'taskDetailsModal') event.currentTarget.hidden = true; });
 async function bulkJoinSelected() {
   const accounts = selectedAutomationAccounts();
   const guildId = $('#automationGuild').value;
