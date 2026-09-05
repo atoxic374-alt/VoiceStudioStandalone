@@ -81,6 +81,7 @@ let videoStreamModulePromise;
 const liveEvents = new EventEmitter();
 liveEvents.setMaxListeners(0);
 const accountLocks = new Map();
+const MEDIA_SETTLE_DELAY_MS = 4000;
 const SYNTHETIC_VIDEO_FILE = path.join(DATA_DIR, 'synthetic-stream-black-v2.mp4');
 
 function ok(res, payload = {}) { return res.json({ success: true, ...payload }); }
@@ -151,16 +152,22 @@ function summary(results) {
 }
 function retryableError(error) {
   const text = String(error?.error || error?.message || '').toLowerCase();
-  return /timeout|timed out|did not confirm|gateway not ready|no active gateway|web.?rtc|temporar|rate.?limit|connection|socket|network/.test(text);
+  return /timeout|timed out|did not confirm|gateway not ready|no active gateway|web.?rtc|media transport|temporar|rate.?limit|connection|socket|network/.test(text);
 }
 async function withResultRetry(worker, maxRetries = 2) {
   let last = null;
   for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
     try { last = await worker(attempt); } catch (error) { last = { ok: false, error: error?.message || String(error) }; }
     if (last?.ok === true || !retryableError(last)) return { ...last, attempts: attempt + 1, retries: attempt };
-    if (attempt < maxRetries) await new Promise((resolve) => setTimeout(resolve, 250 * (2 ** attempt)));
+    if (attempt < maxRetries) {
+      const retryDelay = retryableError(last) && /web.?rtc|media transport/i.test(String(last?.error || '')) ? 1000 * (2 ** attempt) : 250 * (2 ** attempt);
+      await new Promise((resolve) => setTimeout(resolve, retryDelay));
+    }
   }
   return { ...last, attempts: maxRetries + 1, retries: maxRetries };
+}
+async function waitForMediaSettle(next, current) {
+  if ((next?.selfStream || next?.selfVideo) && current?.channelId) await new Promise((resolve) => setTimeout(resolve, MEDIA_SETTLE_DELAY_MS));
 }
 function readPersistedSessions() {
   try {
@@ -1103,6 +1110,7 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
     const operation = beginAccountOperation(name, task.guildId, 'cycle');
     const next = { ...current, ...normalizeVoiceState(task.states[0]), selfMute: task.states[0].selfMute === undefined ? !!current.selfMute : !!task.states[0].selfMute };
     if (next.selfDeaf && (next.selfVideo || next.selfStream)) { endAccountOperation(operation); return { name, ok: false, error: 'Invalid deafened media state' }; }
+    await waitForMediaSettle(next, current);
     const result = (next.selfStream || next.selfVideo)
       ? await startSyntheticStream(name, task.guildId, next.selfStream ? 'go-live' : 'camera')
       : await sendVoiceOpConfirmed(client, task.guildId, current.channelId, next, 6000);
@@ -1127,6 +1135,7 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
         const next = { ...current, ...normalizeVoiceState(state), selfMute: state.selfMute === undefined ? !!current.selfMute : !!state.selfMute };
         if (next.selfDeaf && (next.selfVideo || next.selfStream)) { endAccountOperation(operation); return; }
         let result;
+        await waitForMediaSettle(next, current);
         if (next.selfStream || next.selfVideo) result = await startSyntheticStream(name, task.guildId, next.selfStream ? 'go-live' : 'camera');
         else {
           if (current.selfStream || current.selfVideo) stopSyntheticStream(name);
@@ -1202,6 +1211,7 @@ async function restoreAutomationTasks() {
           const next = { ...current, ...normalizeVoiceState(state), selfMute: state.selfMute === undefined ? !!current.selfMute : !!state.selfMute };
           if (next.selfDeaf && (next.selfVideo || next.selfStream)) return { name, ok: false, error: 'Invalid deafened media state' };
           let result;
+          await waitForMediaSettle(next, current);
           if (next.selfStream || next.selfVideo) result = await startSyntheticStream(name, task.guildId, next.selfStream ? 'go-live' : 'camera');
           else { if (current.selfStream || current.selfVideo) stopSyntheticStream(name); result = await sendVoiceOpConfirmed(client, task.guildId, current.channelId, next, 6000); }
           if (result.ok) { Object.assign(current, next, { updatedAt: Date.now() }); persistSessions(); }
