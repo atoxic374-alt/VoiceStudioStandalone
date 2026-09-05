@@ -257,3 +257,19 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .task-detail-account-state .is-ok { color: var(--green); }
 .task-detail-account-state .is-error { color: var(--red); }
 @media (max-width: 650px) { .task-details-dialog { padding: 17px; }.task-details-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }.task-detail-account { align-items: flex-start; flex-direction: column; }.task-detail-account-state { width: 100%; text-align: right; }.task-row { grid-template-columns: minmax(0, 1fr) auto; }.task-details-button { grid-column: 2; grid-row: 1; }.task-stop { grid-column: 2; grid-row: 2; justify-self: end; } }
+
+.task-details-cycle { margin: 0 0 18px; padding: 14px; border: 1px solid rgba(140,124,255,.28); border-radius: 15px; background: rgba(140,124,255,.06); }
+.task-cycle-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; margin-bottom: 11px; }
+.task-cycle-head strong, .task-cycle-head small { display: block; }
+.task-cycle-head strong { margin-top: 5px; font-size: 12px; }
+.task-cycle-head small { color: var(--muted); font-size: 9px; }
+.task-cycle-states { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.task-cycle-state { display: flex; align-items: center; gap: 9px; min-width: 0; padding: 9px; border: 1px solid var(--line); border-radius: 11px; background: rgba(255,255,255,.035); }
+.task-cycle-state.is-current { border-color: rgba(72,217,210,.6); background: rgba(72,217,210,.09); }
+.task-cycle-index { display: grid; width: 24px; height: 24px; flex: 0 0 24px; place-items: center; border-radius: 8px; background: rgba(140,124,255,.2); color: var(--violet-bright); font-size: 10px; font-weight: 800; }
+.task-cycle-state > div { min-width: 0; flex: 1; }
+.task-cycle-state strong, .task-cycle-state small, .task-cycle-state time { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.task-cycle-state strong { font-size: 10px; }
+.task-cycle-state small, .task-cycle-state time { color: var(--muted); font-size: 8px; }
+.task-cycle-state time { flex: 0 0 auto; text-align: left; }
+@media (max-width: 650px) { .task-cycle-head { align-items: flex-start; flex-direction: column; }.task-cycle-states { grid-template-columns: 1fr; }.task-cycle-state time { display: none; } }
