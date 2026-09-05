@@ -146,7 +146,21 @@ function summary(results) {
   const okCount = results.filter((item) => item?.ok === true && !item?.skipped).length;
   const skipped = results.filter((item) => item?.skipped === true).length;
   const failed = results.filter((item) => item?.ok !== true && !item?.skipped).length;
-  return { total: results.length, ok: okCount, skipped, failed };
+  const retries = results.reduce((total, item) => total + Number(item?.retries || 0), 0);
+  return { total: results.length, ok: okCount, skipped, failed, retries };
+}
+function retryableError(error) {
+  const text = String(error?.error || error?.message || '').toLowerCase();
+  return /timeout|timed out|did not confirm|gateway not ready|no active gateway|web.?rtc|temporar|rate.?limit|connection|socket|network/.test(text);
+}
+async function withResultRetry(worker, maxRetries = 2) {
+  let last = null;
+  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+    try { last = await worker(attempt); } catch (error) { last = { ok: false, error: error?.message || String(error) }; }
+    if (last?.ok === true || !retryableError(last)) return { ...last, attempts: attempt + 1, retries: attempt };
+    if (attempt < maxRetries) await new Promise((resolve) => setTimeout(resolve, 250 * (2 ** attempt)));
+  }
+  return { ...last, attempts: maxRetries + 1, retries: maxRetries };
 }
 function readPersistedSessions() {
   try {
@@ -816,12 +830,10 @@ app.post('/api/discord/connect-bulk', async (req, res) => {
     while (cursor < items.length) {
       const index = cursor++;
       const item = items[index] || {};
-      try {
-        const info = await connectOne(item.token, item.name || `account-${index + 1}`);
-        results[index] = { ok: true, ...info };
-      } catch (error) {
-        results[index] = { ok: false, name: item.name || `account-${index + 1}`, error: error.message };
-      }
+      results[index] = await withResultRetry(async () => {
+        try { return { ok: true, ...(await connectOne(item.token, item.name || `account-${index + 1}`)) }; }
+        catch (error) { return { ok: false, name: item.name || `account-${index + 1}`, error: error.message }; }
+      });
     }
   };
   await Promise.all(Array.from({ length: Math.min(3, items.length) }, worker));
@@ -938,7 +950,7 @@ app.post('/api/voice/join', async (req, res) => {
   const { guildId, channelId, selfMute = false, selfDeaf = false } = req.body || {};
   if (!accounts.length || !guildId || !channelId) return fail(res, new Error('accounts, guildId and channelId are required'), 400);
   if (typeof selfMute !== 'boolean' || typeof selfDeaf !== 'boolean') return fail(res, new Error('Mute values must be boolean'), 400);
-  const results = await mapWithConcurrency(accounts, 8, (name) => moveAccount(name, guildId, channelId, { selfMute, selfDeaf }));
+  const results = await mapWithConcurrency(accounts, 8, (name) => withResultRetry(() => moveAccount(name, guildId, channelId, { selfMute, selfDeaf })));
   emitLive('operation.completed', { operation: 'join', results, summary: summary(results) });
   return ok(res, { results, summary: summary(results) });
 });
@@ -946,7 +958,7 @@ app.post('/api/voice/leave', async (req, res) => {
   const accounts = cleanAccounts(req.body?.accounts);
   const guildId = String(req.body?.guildId || '');
   if (!accounts.length || !guildId) return fail(res, new Error('accounts and guildId are required'), 400);
-  const results = await mapWithConcurrency(accounts, 8, (name) => withAccountLock(name, async () => {
+  const results = await mapWithConcurrency(accounts, 8, (name) => withResultRetry(() => withAccountLock(name, async () => {
     const client = getClient(name);
     if (!client) return { name, ok: false, error: 'Account is not connected' };
     const current = readGatewayVoiceState(client, guildId) || voiceSessions.get(sessionKey(name, guildId));
@@ -956,7 +968,7 @@ app.post('/api/voice/leave', async (req, res) => {
     const result = await sendVoiceOpConfirmed(client, guildId, null, {}, 5000);
     if (result.ok) removeSessionsForAccount(name, guildId);
     return { name, ok: result.ok, error: result.ok ? null : result.error };
-  }));
+  })));
   emitLive('operation.completed', { operation: 'leave', results, summary: summary(results) });
   return ok(res, { results, summary: summary(results) });
 });
@@ -967,7 +979,7 @@ app.post('/api/voice/state', async (req, res) => {
   for (const value of [selfMute, selfDeaf, selfVideo, selfStream]) if (value !== undefined && typeof value !== 'boolean') return fail(res, new Error('Voice state values must be boolean'), 400);
   if (selfDeaf === true && (selfVideo === true || selfStream === true)) return fail(res, new Error('Video or screen share cannot be enabled while deafened'), 400);
   const rotationAccounts = rotationControlledAccounts(guildId);
-  const results = await mapWithConcurrency(accounts, 8, (name) => withAccountLock(name, async () => {
+  const results = await mapWithConcurrency(accounts, 8, (name) => withResultRetry(() => withAccountLock(name, async () => {
     if (rotationAccounts.has(name)) return { name, ok: true, skipped: true, reason: 'Account is controlled by an active rotation' };
     const operation = beginAccountOperation(name, guildId, 'state');
     const operationStartedAt = Date.now();
@@ -1004,7 +1016,7 @@ app.post('/api/voice/state', async (req, res) => {
     logMediaEvent(result.ok ? 'info' : 'error', `${mediaKind}.${result.ok ? 'confirmed' : 'failed'}`, { account: name, guildId, channelId: current.channelId, durationMs: Date.now() - operationStartedAt, error: output.error || undefined });
     endAccountOperation(operation);
     return output;
-  }));
+  })));
   emitLive('operation.completed', { operation: 'state', results, summary: summary(results) });
   return ok(res, { results, summary: summary(results) });
 });
@@ -1012,7 +1024,7 @@ app.post('/api/voice/join-all', async (req, res) => {
   const { guildId, channelId, selfMute = false, selfDeaf = false } = req.body || {};
   const accounts = [...clients.keys()];
   if (!guildId || !channelId) return fail(res, new Error('guildId and channelId are required'), 400);
-  const results = await mapWithConcurrency(accounts, 8, (name) => moveAccount(name, guildId, channelId, { selfMute, selfDeaf }));
+  const results = await mapWithConcurrency(accounts, 8, (name) => withResultRetry(() => moveAccount(name, guildId, channelId, { selfMute, selfDeaf })));
   emitLive('operation.completed', { operation: 'join-all', results, summary: summary(results) });
   return ok(res, { results, summary: summary(results) });
 });
@@ -1034,7 +1046,7 @@ app.post('/api/voice/rotation/start', async (req, res) => {
   if (!accounts.length || !guildId || !Array.isArray(channelIds) || channelIds.length < 2) return fail(res, new Error('At least two channels and one account are required'), 400);
   const conflicts = taskAccountConflicts(accounts, guildId, 'rotation');
   if (conflicts.length) return fail(res, new Error(`These accounts already have a room rotation: ${conflicts.join(', ')}`), 409);
-  const initial = await Promise.all(accounts.map((name, index) => {
+  const initial = await mapWithConcurrency(accounts, 8, (name, index) => withResultRetry(() => {
     const current = voiceSessions.get(sessionKey(name, guildId));
     const currentIndex = channelIds.indexOf(current?.channelId);
     const targetIndex = currentIndex >= 0 ? (currentIndex + 1) % channelIds.length : index % channelIds.length;
@@ -1052,7 +1064,7 @@ app.post('/api/voice/rotation/start', async (req, res) => {
     task.currentIdx = (task.currentIdx + 1) % task.channels.length;
     const ids = task.randomOrder ? [...task.channels].sort(() => Math.random() - 0.5) : task.channels;
     try {
-      task.lastResults = await Promise.all(task.accounts.map((name, index) => {
+      task.lastResults = await mapWithConcurrency(task.accounts, 8, (name, index) => withResultRetry(() => {
         const current = voiceSessions.get(sessionKey(name, task.guildId));
         const currentIndex = ids.indexOf(current?.channelId);
         const targetIndex = currentIndex >= 0 ? (currentIndex + 1) % ids.length : (task.currentIdx + index) % ids.length;
@@ -1085,7 +1097,7 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
   const id = crypto.randomUUID();
   const task = { id, accounts, guildId, states, intervalMs: delay, currentIdx: 0, startedAt: Date.now(), nextAt: Date.now() + delay };
   task.running = false; task.active = true;
-  task.lastResults = await Promise.all(task.accounts.map((name) => withAccountLock(name, async () => {
+  task.lastResults = await mapWithConcurrency(task.accounts, 8, (name) => withResultRetry(() => withAccountLock(name, async () => {
     const current = voiceSessions.get(sessionKey(name, task.guildId));
     const client = getClient(name);
     if (!current || !client) return { name, ok: false, error: 'Account is not currently in a voice channel' };
@@ -1107,7 +1119,7 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
     const state = task.states[task.currentIdx];
     try {
       task.lastResults = [];
-      await Promise.all(task.accounts.map((name) => withAccountLock(name, async () => {
+      await mapWithConcurrency(task.accounts, 8, (name) => withResultRetry(() => withAccountLock(name, async () => {
         const current = voiceSessions.get(sessionKey(name, task.guildId));
         if (!current) return;
         const client = getClient(name);
@@ -1162,7 +1174,7 @@ async function restoreAutomationTasks() {
       task.currentIdx = (task.currentIdx + 1) % task.channels.length;
       const ids = task.randomOrder ? [...task.channels].sort(() => Math.random() - 0.5) : task.channels;
       try {
-        task.lastResults = await Promise.all(task.accounts.map((name, index) => {
+        task.lastResults = await mapWithConcurrency(task.accounts, 8, (name, index) => withResultRetry(() => {
           const current = voiceSessions.get(sessionKey(name, task.guildId));
           const currentIndex = ids.indexOf(current?.channelId);
           const targetIndex = currentIndex >= 0 ? (currentIndex + 1) % ids.length : (task.currentIdx + index) % ids.length;
@@ -1185,7 +1197,7 @@ async function restoreAutomationTasks() {
       task.currentIdx = (task.currentIdx + 1) % task.states.length;
       const state = normalizeVoiceState(task.states[task.currentIdx]);
       try {
-        task.lastResults = await Promise.all(task.accounts.map((name) => withAccountLock(name, async () => {
+        task.lastResults = await mapWithConcurrency(task.accounts, 8, (name) => withResultRetry(() => withAccountLock(name, async () => {
           const current = voiceSessions.get(sessionKey(name, task.guildId)); const client = getClient(name);
           if (!current || !client) return { name, ok: false, error: 'Account is not currently in a voice channel' };
           const next = { ...current, ...normalizeVoiceState(state), selfMute: state.selfMute === undefined ? !!current.selfMute : !!state.selfMute };
