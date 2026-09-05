@@ -856,15 +856,17 @@ app.post('/api/discord/disconnect-bulk', async (req, res) => {
   if (!names.length) return fail(res, new Error('Select at least one account'), 400);
   const results = [];
   for (const name of names) {
-    const entry = clients.get(name);
-    if (!entry) { results.push({ name, ok: false, error: 'Account is not connected' }); continue; }
-    stopTasksForAccount(name);
-    stopSyntheticStream(name, { leaveVoice: true });
-    removeSessionsForAccount(name);
-    try { await entry.client.destroy(); } catch (error) { results.push({ name, ok: false, error: error.message }); continue; }
-    clients.delete(name);
-    emitLive('account.disconnected', { name });
-    results.push({ name, ok: true });
+    results.push(await withResultRetry(async () => {
+      const entry = clients.get(name);
+      if (!entry) return { name, ok: false, error: 'Account is not connected' };
+      stopTasksForAccount(name);
+      stopSyntheticStream(name, { leaveVoice: true });
+      removeSessionsForAccount(name);
+      try { await entry.client.destroy(); } catch (error) { return { name, ok: false, error: error.message }; }
+      clients.delete(name);
+      emitLive('account.disconnected', { name });
+      return { name, ok: true };
+    }));
   }
   persistConnectedAccounts();
   return ok(res, { results, summary: summary(results) });
