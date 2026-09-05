@@ -269,6 +269,8 @@ async function loadVideoStreamModule() {
 }
 async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live') {
   const client = getClient(name);
+  const target = validateMediaTarget(client, guildId, session.channelId);
+  if (!target.ok) return { ok: false, error: target.error };
   const connection = client?.voice?.connection;
   if (!connection || connection.channel?.id !== session.channelId) return { ok: false, error: 'The account has no active voice connection' };
   const source = createBlackMediaSource();
@@ -585,6 +587,14 @@ function validateTarget(client, guildId, channelId) {
   const alreadyIn = guild.voiceStates?.cache?.get?.(client.user?.id)?.channelId === channelId;
   if (!alreadyIn && limit > 0 && current >= limit) return { ok: false, error: 'Voice channel is full' };
   return { ok: true, guild, channel };
+}
+function validateMediaTarget(client, guildId, channelId) {
+  const target = validateTarget(client, guildId, channelId);
+  if (!target.ok) return target;
+  const me = target.guild.members?.me || target.guild.members?.cache?.get?.(client.user?.id) || client.user?.id;
+  const permissions = target.channel?.permissionsFor?.(me);
+  if (permissions?.has?.('STREAM') === false) return { ok: false, error: 'Missing Stream permission for Camera or Screen Share in this voice channel' };
+  return target;
 }
 function readGatewayVoiceState(client, guildId) {
   const state = client?.guilds?.cache?.get?.(guildId)?.voiceStates?.cache?.get?.(client.user?.id)
@@ -1246,4 +1256,4 @@ if (require.main === module) {
   app.listen(PORT, '0.0.0.0', () => { console.log(`Voice Studio listening on http://localhost:${PORT}`); setInterval(() => { try { reconcileVoiceSessions(); } catch (error) { console.warn('[voice] session reconciliation failed:', error.message); } }, 3000).unref?.(); restoreSavedAccounts().then(() => restoreAutomationTasks()).catch((error) => console.warn('[restore] restore failed:', error.message)); });
 }
 
-module.exports = { app, clients, voiceSessions, rotations, stateCycles, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, saveAccounts, loadAccounts };
+module.exports = { app, clients, voiceSessions, rotations, stateCycles, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, saveAccounts, loadAccounts };
