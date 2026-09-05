@@ -493,10 +493,11 @@ async function applyState(kind) {
   const buttons = [...document.querySelectorAll('.state-button')]; buttons.forEach((button) => { button.disabled = true; button.classList.add('is-pending'); });
   try {
     const result = await post('/api/voice/state', { accounts, guildId: target.guildId, ...next });
-    if (!result.summary?.ok) throw new Error(result.results?.find((item) => !item.ok)?.error || 'تعذر تحديث الحالة');
+    if (!result.summary?.ok) throw new Error(result.results?.find((item) => item.skipped)?.reason || result.results?.find((item) => !item.ok)?.error || 'تعذر تحديث الحالة');
     updateQuickStateButtons();
     const failed = result.summary.failed || 0;
-    const message = failed ? `${next.label}: ${result.summary.ok} succeeded, ${failed} failed` : next.label;
+    const skipped = result.summary.skipped || 0;
+    const message = failed ? `${next.label}: ${result.summary.ok} succeeded, ${failed} failed` : skipped ? `${next.label}: ${skipped} skipped because of Room Rotation` : next.label;
     feedback('#stateFeedback', message, failed ? 'error' : 'success'); addActivity('تحديث حالة صوتية', `${state.clients.find((client) => client.name === state.selectedAccount)?.nickname || state.selectedAccount} · ${message}`, failed ? 'error' : 'success', state.selectedAccount); toast(message, failed ? 'error' : 'success'); await refreshSessions();
   } catch (error) { feedback('#stateFeedback', error.message, 'error'); toast(error.message, 'error'); } finally { buttons.forEach((button) => { button.disabled = false; button.classList.remove('is-pending'); }); updateQuickStateButtons(); }
 }
