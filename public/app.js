@@ -10,7 +10,7 @@ const state = {
   mediaKind: null,
   mediaStartedAt: 0,
   mediaTimer: null,
-  rotationRoomFilter: '',
+  rotationRoomFilter: '', profilesPage: 0,
   rotationRoomPage: 0,
   rotationRoomSelection: new Set(),
   busy: new Set(),
@@ -385,8 +385,13 @@ async function bulkConnect() {
 function renderProfiles(clients = []) {
   const list = $('#profilesList');
   if (!list) return;
-  if (!clients.length) { list.innerHTML = '<div class="task-empty">لا توجد حسابات متصلة</div>'; return; }
-  list.innerHTML = clients.map((client) => {
+  const pager = $('#profilesPager');
+  const pageSize = 5;
+  const pages = Math.max(1, Math.ceil(clients.length / pageSize));
+  state.profilesPage = Math.min(state.profilesPage, pages - 1);
+  if (!clients.length) { list.innerHTML = '<div class="task-empty">لا توجد حسابات متصلة</div>'; if (pager) pager.hidden = true; return; }
+  const visibleClients = clients.slice(state.profilesPage * pageSize, (state.profilesPage + 1) * pageSize);
+  list.innerHTML = visibleClients.map((client) => {
     const voice = client.voice;
     const avatar = client.avatar ? `<img src="${escapeHTML(client.avatar)}" alt="" />` : escapeHTML((client.nickname || client.name || '?')[0].toUpperCase());
     const rotation = state.tasks.find((task) => task.type === 'rotation' && task.accounts?.includes(client.name));
@@ -396,6 +401,7 @@ function renderProfiles(clients = []) {
   }).join('');
   list.querySelectorAll('[data-profile-leave]').forEach((button) => button.addEventListener('click', () => quickLeave(button.dataset.profileLeave, button.dataset.profileGuild)));
   list.querySelectorAll('[data-rotation-info]').forEach((button) => button.addEventListener('click', () => showRotationDetails(button.dataset.rotationInfo)));
+  if (pager) { pager.hidden = clients.length <= pageSize; $('#profilesPageLabel').textContent = `Page ${state.profilesPage + 1} / ${pages}`; $('#profilesPrevButton').disabled = state.profilesPage === 0; $('#profilesNextButton').disabled = state.profilesPage >= pages - 1; }
   updateQuickStateButtons();
 }
 function showRotationDetails(id) { const task = state.tasks.find((item) => item.id === id); if (!task) return; const rooms = (task.channels || []).join(' · '); toast(`Rotation · every ${Math.round((task.intervalMs || 0) / 60000)} min · ${task.accounts?.length || 0} accounts · ${rooms}`, 'success'); }
@@ -755,6 +761,8 @@ function initCustomSelects() {
 }
 function init() {
   initTheme(); initLanguage(); initNavigation(); initActivity(); initCustomSelects();
+  $('#profilesPrevButton')?.addEventListener('click', () => { state.profilesPage -= 1; renderProfiles(state.clients); });
+  $('#profilesNextButton')?.addEventListener('click', () => { state.profilesPage += 1; renderProfiles(state.clients); });
   $('#serverSelect')?.addEventListener('change', (event) => { state.selectedGuildId = event.target.value; state.selectedTarget = null; renderChannels(); }); $('#roomSearch')?.addEventListener('input', () => { state.selectedTarget = null; renderChannels(); });
   $('#connectButton').addEventListener('click', connect); $('#bulkConnectButton').addEventListener('click', bulkConnect); $('#disconnectButton').addEventListener('click', openDisconnect); $('#refreshButton').addEventListener('click', refreshChannels); $('#accountSelect').addEventListener('change', async (event) => { state.selectedAccount = event.target.value; await loadGuilds(); await loadAutomationCatalog(); }); $('#automationGuild').addEventListener('change', renderAutomationChannels); $('#automationChannel').addEventListener('change', renderTargetAccounts); $('#rotationRoomFilter').addEventListener('input', (event) => { state.rotationRoomFilter = event.target.value; state.rotationRoomPage = 0; renderRotationRooms(); }); $('#rotationPrevButton').addEventListener('click', () => { state.rotationRoomPage -= 1; renderRotationRooms(); }); $('#rotationNextButton').addEventListener('click', () => { state.rotationRoomPage += 1; renderRotationRooms(); }); $('#bulkJoinButton').addEventListener('click', bulkJoinSelected); $('#channelSelect').addEventListener('change', handleChannelChange); $('#joinButton').addEventListener('click', join); $('#joinAllButton').addEventListener('click', joinAll); $('#leaveButton').addEventListener('click', leave); $('#cameraButton')?.addEventListener('click', toggleCamera); $('#screenButton')?.addEventListener('click', toggleScreen); $('#startRotationButton').addEventListener('click', startRotation); $('#startCycleButton').addEventListener('click', startCycle); $('#stopMediaButton')?.addEventListener('click', () => stopCurrentStream()); $('#applyBulkStateButton')?.addEventListener('click', applyBulkState); $('#overviewFilter')?.addEventListener('input', (event) => { state.overviewFilter = event.target.value; refreshSessions(); }); $('#overviewSort')?.addEventListener('change', (event) => { state.overviewSort = event.target.value; refreshSessions(); }); document.querySelectorAll('.state-button').forEach((button) => button.addEventListener('click', () => applyState(button.dataset.state))); document.querySelectorAll('#statePicker input').forEach((input) => input.addEventListener('change', () => input.closest('.state-option')?.classList.toggle('is-selected', input.checked)));
   $('#operationClose').addEventListener('click', () => { $('#operationModal').hidden = true; $('.operation-loader')?.classList.remove('is-done', 'is-error'); }); $('#leaveAllButton')?.addEventListener('click', openLeaveAll); $('#confirmLeaveButton')?.addEventListener('click', leaveAllSelected); $('#cancelLeaveButton')?.addEventListener('click', () => { $('#leaveModal').hidden = true; }); $('#confirmDisconnectButton')?.addEventListener('click', disconnectSelected); $('#cancelDisconnectButton')?.addEventListener('click', () => { $('#disconnectModal').hidden = true; }); $('#disconnectModalClose')?.addEventListener('click', () => { $('#disconnectModal').hidden = true; }); window.addEventListener('beforeunload', () => stopCurrentStream({ updateDiscord: false }));

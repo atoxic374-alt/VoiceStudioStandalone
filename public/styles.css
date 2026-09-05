@@ -276,3 +276,8 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .task-cycle-state small, .task-cycle-state time { color: var(--muted); font-size: 8px; }
 .task-cycle-state time { flex: 0 0 auto; text-align: left; }
 @media (max-width: 650px) { .task-cycle-head { align-items: flex-start; flex-direction: column; }.task-cycle-states { grid-template-columns: 1fr; }.task-cycle-state time { display: none; } }
+
+.profiles-pager { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 0 25px 16px; padding-top: 11px; border-top: 1px solid rgba(173,184,255,.1); }
+.profiles-pager[hidden] { display: none; }
+.profiles-pager span { color: var(--muted); font-size: 9px; }
+.profiles-pager .room-page-button { min-width: 72px; }
