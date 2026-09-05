@@ -1084,6 +1084,12 @@ app.post('/api/voice/rotation/start', async (req, res) => {
     } finally { task.running = false; }
   }, delay);
   rotations.set(id, task);
+  for (const stateTask of stateCycles.values()) {
+    if (String(stateTask.guildId) !== String(guildId) || !(stateTask.accounts || []).some((name) => readyAccounts.includes(name))) continue;
+    stateTask.phaseRoomId = id;
+    stateTask.phaseGapMs = ROTATION_PHASE_GAP_MS;
+    stateTask.nextAt = Number(task.nextAt || Date.now() + delay) + ROTATION_PHASE_GAP_MS;
+  }
   persistAutomationTasks();
   return ok(res, { id, started: true, initial, summary: summary(initial) });
 });
@@ -1128,6 +1134,7 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
     return { name, ok: result.ok, error: result.ok ? null : result.error };
   })));
   const runStateCycle = async () => {
+    if (task.nextAt > Date.now()) { if (task.active) task.timer = setTimeout(runStateCycle, task.nextAt - Date.now()); return; }
     if (!task.active || task.running) return;
     task.running = true;
     task.currentIdx = (task.currentIdx + 1) % task.states.length;
