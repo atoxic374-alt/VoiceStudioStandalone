@@ -82,6 +82,7 @@ const liveEvents = new EventEmitter();
 liveEvents.setMaxListeners(0);
 const accountLocks = new Map();
 const MEDIA_SETTLE_DELAY_MS = 4000;
+const ROTATION_PHASE_GAP_MS = 120000;
 const SYNTHETIC_VIDEO_FILE = path.join(DATA_DIR, 'synthetic-stream-black-v2.mp4');
 
 function ok(res, payload = {}) { return res.json({ success: true, ...payload }); }
@@ -444,6 +445,9 @@ function taskConflict(accounts, guildId, type) {
   return conflicts;
 }
 function taskAccountConflicts(accounts, guildId, type) { return taskConflict(accounts, guildId, type).flatMap((item) => item.accounts); }
+function linkedRoomRotation(accounts, guildId) {
+  return [...rotations.values()].find((task) => String(task.guildId) === String(guildId) && (task.accounts || []).some((name) => accounts.includes(name))) || null;
+}
 function getClient(name) {
   const entry = clients.get(String(name || ''));
   return entry?.client || null;
@@ -1103,7 +1107,11 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
   const id = crypto.randomUUID();
   const task = { id, accounts, guildId, states, intervalMs: delay, currentIdx: 0, startedAt: Date.now(), nextAt: Date.now() + delay };
   task.running = false; task.active = true;
-  task.lastResults = await mapWithConcurrency(task.accounts, 8, (name) => withResultRetry(() => withAccountLock(name, async () => {
+  const linkedRoom = linkedRoomRotation(accounts, guildId);
+  if (linkedRoom) { task.phaseRoomId = linkedRoom.id; task.phaseGapMs = ROTATION_PHASE_GAP_MS; task.nextAt = Number(linkedRoom.nextAt || Date.now() + delay) + ROTATION_PHASE_GAP_MS; }
+  task.lastResults = linkedRoom
+    ? task.accounts.map((name) => ({ name, ok: true, scheduled: true, reason: 'State rotation scheduled after room rotation' }))
+    : await mapWithConcurrency(task.accounts, 8, (name) => withResultRetry(() => withAccountLock(name, async () => {
     const current = voiceSessions.get(sessionKey(name, task.guildId));
     const client = getClient(name);
     if (!current || !client) return { name, ok: false, error: 'Account is not currently in a voice channel' };
@@ -1119,7 +1127,7 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
     endAccountOperation(operation);
     return { name, ok: result.ok, error: result.ok ? null : result.error };
   })));
-  task.timer = setInterval(async () => {
+  const runStateCycle = async () => {
     if (!task.active || task.running) return;
     task.running = true;
     task.currentIdx = (task.currentIdx + 1) % task.states.length;
@@ -1146,9 +1154,11 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
         task.lastResults.push({ name, ok: result.ok, error: result.ok ? null : result.error });
         endAccountOperation(operation);
       })));
-      task.nextAt = Date.now() + task.intervalMs;
-    } finally { task.running = false; }
-  }, delay);
+      const roomTask = task.phaseRoomId ? rotations.get(task.phaseRoomId) : null;
+      task.nextAt = roomTask ? Number(roomTask.nextAt || Date.now() + task.intervalMs) + Number(task.phaseGapMs || 0) : Date.now() + task.intervalMs;
+    } finally { task.running = false; if (task.active) task.timer = setTimeout(runStateCycle, Math.max(1000, task.nextAt - Date.now())); }
+  };
+  task.timer = setTimeout(runStateCycle, Math.max(1000, task.nextAt - Date.now()));
   stateCycles.set(id, task);
   persistAutomationTasks();
   return ok(res, { id });
