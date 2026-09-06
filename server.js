@@ -10,6 +10,9 @@ const helmet = require('helmet');
 const AUTH_COOKIE = 'voice_studio_auth';
 const CLIENT_DEVICE_COOKIE = 'voice_studio_client_device';
 const AUTH_TTL_MS = 12 * 60 * 60 * 1000;
+// The auth session intentionally expires after 12 hours, but the device
+// binding must survive that expiry so the same client can log in again.
+const CLIENT_DEVICE_TTL_MS = 365 * 24 * 60 * 60 * 1000;
 // Fail closed: a production deployment without an owner password must not expose the API.
 const AUTH_ENABLED = true;
 const ACCOUNT_FILE = path.join(__dirname, 'data', 'accounts.enc');
@@ -649,6 +652,9 @@ function reconcileVoiceSessions() {
           continue;
         }
         stopSyntheticStream(name, { leaveVoice: true });
+        // The account may have been dragged/kicked by another user. Remove
+        // only the stale session; an active room rotation must keep ownership
+        // so its next tick can join the account to the next configured room.
         removeSessionsForAccount(name, session.guildId);
         continue;
       }
@@ -772,7 +778,7 @@ app.post('/api/auth', (req, res) => {
   const value = makeAuthCookie(role, role === 'owner' ? process.env.APP_PASSWORD : process.env.CLIENT_PASSWORD);
   const secure = req.secure || req.headers['x-forwarded-proto'] === 'https'; const flags = `Path=/; HttpOnly; SameSite=Strict${secure ? '; Secure' : ''}`;
   const cookies = [`${AUTH_COOKIE}=${encodeURIComponent(value)}; Max-Age=${Math.floor(AUTH_TTL_MS / 1000)}; ${flags}`];
-  if (deviceCookie) cookies.push(`${CLIENT_DEVICE_COOKIE}=${encodeURIComponent(deviceCookie)}; Max-Age=${Math.floor(AUTH_TTL_MS / 1000)}; ${flags}`);
+  if (deviceCookie) cookies.push(`${CLIENT_DEVICE_COOKIE}=${encodeURIComponent(deviceCookie)}; Max-Age=${Math.floor(CLIENT_DEVICE_TTL_MS / 1000)}; ${flags}`);
   res.setHeader('Cache-Control', 'no-store');
   res.setHeader('Set-Cookie', cookies);
   return ok(res, { authenticated: true, required: true, role });
@@ -982,8 +988,9 @@ app.post('/api/voice/leave', async (req, res) => {
     const client = getClient(name);
     if (!client) return { name, ok: false, error: 'Account is not connected' };
     const current = readGatewayVoiceState(client, guildId) || voiceSessions.get(sessionKey(name, guildId));
-    if (!current?.channelId) { stopTasksForAccount(name); removeSessionsForAccount(name, guildId); return { name, ok: true, alreadyLeft: true }; }
-    stopTasksForAccount(name);
+    // A manual leave only removes the current room session. Keep the account
+    // in its active rotation so the next tick can join it again.
+    if (!current?.channelId) { removeSessionsForAccount(name, guildId); return { name, ok: true, alreadyLeft: true }; }
     stopSyntheticStream(name, { leaveVoice: true });
     const result = await sendVoiceOpConfirmed(client, guildId, null, {}, 5000);
     if (result.ok) removeSessionsForAccount(name, guildId);
