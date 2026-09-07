@@ -1051,6 +1051,22 @@ app.get('/api/voice/target-accounts', (req, res) => {
 app.get('/api/voice/rotations', (_req, res) => ok(res, { rotations: [...rotations.values()].map(({ timer, ...item }) => item) }));
 app.get('/api/voice/state-cycles', (_req, res) => ok(res, { cycles: [...stateCycles.values()].map(({ timer, ...item }) => item) }));
 app.get('/api/playing/sessions', (_req, res) => ok(res, { sessions: [...playingSessions.values()].map(({ timer, ...item }) => item), active: [...playingSessions.values()].filter((item) => item.active).length }));
+app.get('/api/playing/channels', (_req, res) => {
+  const channels = new Map();
+  for (const [account, entry] of clients.entries()) {
+    for (const guild of entry.client.guilds?.cache?.values?.() || []) {
+      for (const channel of guild.channels?.cache?.values?.() || []) {
+        const isText = channel?.isText?.() || [0, 5, 10, 11, 12, 15].includes(Number(channel?.type));
+        if (!isText || !channel.id || channel.isThread?.()) continue;
+        const key = String(channel.id); const permissions = channel.permissionsFor?.(entry.client.user?.id);
+        if (permissions?.has?.('VIEW_CHANNEL') === false || permissions?.has?.('READ_MESSAGE_HISTORY') === false) continue;
+        if (!channels.has(key)) channels.set(key, { id: key, name: channel.name || key, guildId: guild.id, guildName: guild.name, accounts: [] });
+        channels.get(key).accounts.push(account);
+      }
+    }
+  }
+  return ok(res, { channels: [...channels.values()].sort((a, b) => `${a.guildName}/${a.name}`.localeCompare(`${b.guildName}/${b.name}`)) });
+});
 app.get('/api/playing/events', (_req, res) => ok(res, { events: readPlayingEvents() }));
 app.post('/api/playing/preview', (req, res) => { const steps = cleanPlayingSteps(req.body?.steps); if (!steps.length) return fail(res, new Error('At least one complete action is required'), 400); return ok(res, { preview: steps.map((step, index) => ({ order: index + 1, button: step.button, phrase: step.phrase || null, messageId: step.messageId || 'auto-detect', customId: step.customId || 'auto-detect' })) }); });
 app.post('/api/playing/save', (req, res) => {
