@@ -6,6 +6,7 @@
   <meta name="theme-color" content="#080b18" />
   <title>Voice Studio — مساحة التحكم الصوتي</title>
   <link rel="stylesheet" href="/styles.css" />
+  <link rel="stylesheet" href="/playing.css" />
 </head>
 <body>
   <div class="ambient ambient-one"></div>
@@ -24,6 +25,7 @@
         <button class="side-nav-item" type="button" data-section="accounts"><span class="nav-glyph">◎</span><span>Accounts</span><span id="navAccountCount" class="nav-count">0</span></button>
         <button class="side-nav-item" type="button" data-section="voice"><span class="nav-glyph">♫</span><span>Voice</span></button>
         <button class="side-nav-item" type="button" data-section="automation"><span class="nav-glyph">↻</span><span>Automation</span></button>
+        <button class="side-nav-item" type="button" data-section="playing"><span class="nav-glyph">▶</span><span>Playing</span><span id="navPlayingCount" class="nav-count">0</span></button>
         <button class="side-nav-item" type="button" data-section="activity"><span class="nav-glyph">≋</span><span>Activity</span><span id="navSessionCount" class="nav-count">0</span></button>
       </nav>
       <div class="sidebar-footer">
@@ -81,6 +83,16 @@
                 <button id="joinAllButton" class="action-button action-secondary" type="button">Join all</button>
                 <button id="leaveButton" class="action-button action-danger" type="button">Leave</button><button id="leaveAllButton" class="action-button action-danger" type="button">Leave all</button>
               </div>
+            </article>
+
+            <article class="card playing-card" data-panel="playing">
+              <div class="card-heading compact"><div><span class="card-kicker">PLAYING / WORKSPACE</span><h2>Playbook studio</h2></div><span id="playingStatus" class="soft-badge accent">0 active</span></div>
+              <p class="playing-intro">أنشئ خطوات اللعبة مرة واحدة، راجعها، ثم شغّلها على الحسابات المحددة. الخيارات المتقدمة مخفية حتى تحتاجها.</p>
+              <div class="playing-tabs" role="tablist"><button class="playing-tab is-active" data-playing-tab="setup" type="button">1 · Setup</button><button class="playing-tab" data-playing-tab="accounts" type="button">2 · Accounts</button><button class="playing-tab" data-playing-tab="review" type="button">3 · Review & run</button><button class="playing-tab" data-playing-tab="activity" type="button">Activity</button></div>
+              <section class="playing-pane is-active" data-playing-pane="setup"><div class="playing-grid"><label class="field"><span>Scenario name</span><input id="playingScenarioName" type="text" placeholder="مثال: دخول اللعبة" /></label><label class="field"><span>Text channel ID</span><input id="playingChannelId" type="text" placeholder="مثال: 123456789012345678" autocomplete="off" /></label><label class="field"><span>Channel name (optional)</span><input id="playingChannelName" type="text" placeholder="Lobby / Game room" autocomplete="off" /></label><label class="field"><span>Delay between actions (seconds)</span><input id="playingInterval" type="number" min="1.5" max="86400" step="0.5" value="5" /></label></div><details class="playing-advanced"><summary>Advanced timing</summary><label class="field"><span>Delay between accounts (seconds)</span><input id="playingAccountDelay" type="number" min="0" max="600" step="0.5" value="0" /></label><small>يبدأ كل حساب بعد الفاصل المحدد عن الحساب السابق.</small></details><div class="playing-section-head"><div><strong>Button sequence</strong><small>اكتب اسم الزر كما يظهر في رسالة اللعبة · البدائل بـ |</small></div><button id="playingAddStep" class="ghost-button" type="button">＋ Add action</button></div><div id="playingSteps" class="playing-steps"></div><div class="playing-account-hint">الكلمات اختيارية. مثال: هلا | مرحبًا | أهلين — يختار النظام واحدة عشوائيًا.</div></section>
+              <section class="playing-pane" data-playing-pane="accounts"><div class="playing-section-head"><div><strong>Choose accounts</strong><small><span id="playingSelectionCount">0</span> selected · التخصيص الفردي اختياري</small></div><button id="playingSelectAll" class="ghost-button" type="button">Select all</button></div><div id="playingAccounts" class="playing-accounts"><div class="task-empty">لا توجد حسابات متصلة</div></div><div class="playing-account-hint">اضغط تخصيص لإظهار كلمات خاصة للحساب. اتركه مغلقًا لاستخدام الإعداد العام.</div></section>
+              <section class="playing-pane" data-playing-pane="review"><div id="playingPreview" class="playing-preview"><div class="task-empty">أضف إجراءات لرؤية المعاينة</div></div><div class="playing-actions"><button id="playingPreviewButton" class="action-button action-secondary" type="button">Preview</button><button id="playingSave" class="action-button action-secondary" type="button">Save setup</button><button id="playingStart" class="action-button action-join" type="button">Start selected</button><button id="playingStop" class="action-button action-danger" type="button">Stop selected</button><button id="playingEmergency" class="action-button action-danger" type="button">Emergency stop all</button></div><div id="playingFeedback" class="inline-feedback" role="status" aria-live="polite"></div><div class="playing-section-head"><div><strong>Sessions</strong><small>حالة مستقلة لكل حساب</small></div></div><div id="playingSessions" class="playing-sessions"><div class="task-empty">لا توجد جلسات محفوظة</div></div></section>
+              <section class="playing-pane" data-playing-pane="activity"><div class="playing-section-head"><div><strong>Detailed activity</strong><small>آخر 500 عملية مع الحساب والزر والنتيجة</small></div><button id="playingRefreshEvents" class="ghost-button" type="button">Refresh</button></div><div id="playingEvents" class="playing-events"><div class="task-empty">لا يوجد نشاط بعد</div></div></section>
             </article>
 
             <article class="card automation-card" data-panel="automation">

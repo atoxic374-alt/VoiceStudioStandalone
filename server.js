@@ -22,6 +22,8 @@ const PORT = Number(process.env.PORT || 5050);
 const DATA_DIR = path.join(__dirname, 'data');
 const VOICE_STATE_FILE = path.join(DATA_DIR, 'voice-sessions.json');
 const AUTOMATION_TASKS_FILE = path.join(DATA_DIR, 'automation-tasks.json');
+const PLAYING_FILE = path.join(DATA_DIR, 'playing-sessions.json');
+const PLAYING_LOG_FILE = path.join(DATA_DIR, 'playing-events.log');
 const CLIENT_BIND_FILE = path.join(DATA_DIR, 'client-binding.json');
 const MEDIA_LOG_FILE = path.join(DATA_DIR, 'media-events.log');
 fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -80,6 +82,8 @@ const stateCycles = new Map();
 const syntheticStreams = new Map();
 const mediaStreamers = new Map();
 const accountOperations = new Map();
+const playingSessions = new Map();
+const playingEvents = [];
 let videoStreamModulePromise;
 const liveEvents = new EventEmitter();
 liveEvents.setMaxListeners(0);
@@ -137,6 +141,81 @@ function persistAutomationTasks() {
   try { fs.writeFileSync(temp, JSON.stringify(payload, null, 2), { mode: 0o600 }); fs.renameSync(temp, AUTOMATION_TASKS_FILE); } catch (error) { try { fs.rmSync(temp, { force: true }); } catch {} console.warn('[automation] unable to persist tasks:', error.message); }
 }
 function loadAutomationTasks() { try { const value = JSON.parse(fs.readFileSync(AUTOMATION_TASKS_FILE, 'utf8')); return value && typeof value === 'object' ? value : { rotations: [], stateCycles: [] }; } catch { return { rotations: [], stateCycles: [] }; } }
+function persistPlayingSessions() {
+  const safe = [...playingSessions.values()].map(({ timer, running, ...session }) => session);
+  const temp = `${PLAYING_FILE}.tmp`;
+  try { fs.writeFileSync(temp, JSON.stringify(safe, null, 2), { mode: 0o600 }); fs.renameSync(temp, PLAYING_FILE); } catch (error) { try { fs.rmSync(temp, { force: true }); } catch {} console.warn('[playing] unable to persist sessions:', error.message); }
+}
+function loadPlayingSessions() { try { const value = JSON.parse(fs.readFileSync(PLAYING_FILE, 'utf8')); return Array.isArray(value) ? value : []; } catch { return []; } }
+function logPlayingEvent(event, details = {}) { const record = { time: new Date().toISOString(), event, ...details }; playingEvents.unshift(record); playingEvents.splice(500); try { fs.appendFileSync(PLAYING_LOG_FILE, `${JSON.stringify(record)}\n`, { mode: 0o600 }); } catch {} emitLive(`playing.${event}`, details); }
+function readPlayingEvents() { try { return fs.readFileSync(PLAYING_LOG_FILE, 'utf8').trim().split('\n').filter(Boolean).slice(-500).reverse().map((line) => JSON.parse(line)); } catch { return [...playingEvents]; } }
+function cleanPlayingSteps(steps) {
+  if (!Array.isArray(steps)) return [];
+  return steps.map((step) => ({ button: String(step?.button || '').trim().slice(0, 80), messageId: String(step?.messageId || '').trim().slice(0, 40), customId: String(step?.customId || '').trim().slice(0, 100), phrase: String(step?.phrase || '').trim().slice(0, 500) })).filter((step) => step.button).slice(0, 30);
+}
+function playingKey(account) { return String(account || ''); }
+function pickPlayingPhrase(value) {
+  const choices = String(value || '').split('|').map((item) => item.trim()).filter(Boolean);
+  return choices.length ? choices[Math.floor(Math.random() * choices.length)] : '';
+}
+function componentLabel(component) { return String(component?.label || component?.data?.label || '').trim(); }
+function messageButtons(message) { return (message?.components || []).flatMap((row) => row?.components || []).filter((component) => String(component?.type || '').toUpperCase() === 'BUTTON' || component?.type === 2); }
+async function findPlayingButton(channel, session, step) {
+  const messages = await channel.messages.fetch({ limit: 50 }).catch(() => null);
+  if (!messages) return null;
+  const entries = [...messages.values()].sort((a, b) => Number(b.createdTimestamp || 0) - Number(a.createdTimestamp || 0));
+  for (const message of entries) {
+    if (session.lastActionAt && Number(message.createdTimestamp || 0) <= Number(session.lastActionAt)) continue;
+    if (step.messageId && String(message.id) !== step.messageId) continue;
+    for (const component of messageButtons(message)) {
+      const customId = String(component.customId ?? component.custom_id ?? '').trim();
+      if (step.customId && customId !== step.customId) continue;
+      if (!step.customId && componentLabel(component) !== step.button) continue;
+      if (component.disabled || !customId) continue;
+      const key = `${message.id}:${customId}`;
+      if ((session.clickedButtons || []).includes(key)) continue;
+      return { message, customId, key };
+    }
+  }
+  return null;
+}
+function stopPlayingSession(account, reason = 'manual') { const session = playingSessions.get(playingKey(account)); if (!session) return false; session.active = false; session.status = 'stopped'; session.startDelayMs = 0; clearTimeout(session.timer); session.timer = null; persistPlayingSessions(); logPlayingEvent('stopped', { account, reason }); return true; }
+async function sendPlayingPhrase(session) {
+  const entry = clients.get(session.account); const client = entry?.client;
+  if (!client) return { ok: false, error: 'Account is not connected' };
+  const step = session.steps[session.currentIndex % session.steps.length];
+  const channel = await client.channels?.fetch?.(session.channelId).catch?.(() => null);
+  if (!channel?.messages?.fetch) return { ok: false, error: 'Text channel is not available for this account' };
+  const found = await findPlayingButton(channel, session, step);
+  if (!found) return { ok: false, waiting: true, error: `Waiting for a fresh enabled button named "${step.button}"` };
+  try { await found.message.clickButton(found.customId); }
+  catch (error) { return { ok: false, fatal: true, error: `Button "${step.button}" click failed: ${error.message || error}` }; }
+  session.clickedButtons = [...new Set([...(session.clickedButtons || []), found.key])].slice(-500);
+  session.lastActionAt = Date.now();
+  const phrase = pickPlayingPhrase(step.phrase);
+  if (!phrase) {
+    session.currentIndex = (session.currentIndex + 1) % session.steps.length;
+    session.lastAction = { button: step.button, phrase: null, skipped: true, at: Date.now() };
+    return { ok: true, button: step.button, skipped: true };
+  }
+  await channel.send(phrase);
+  session.currentIndex = (session.currentIndex + 1) % session.steps.length;
+  session.lastAction = { button: step.button, phrase, at: Date.now() };
+  return { ok: true, button: step.button, phrase };
+}
+function schedulePlaying(session) {
+  const run = async () => {
+    if (!session.active || !playingSessions.has(session.account)) return;
+    session.running = true;
+    try { session.status = 'running'; session.lastResult = await withAccountLock(session.account, () => sendPlayingPhrase(session)); logPlayingEvent(session.lastResult.ok ? 'action.completed' : session.lastResult.waiting ? 'action.waiting' : 'action.failed', { account: session.account, result: session.lastResult, step: session.steps[session.currentIndex % session.steps.length]?.button }); }
+    catch (error) { session.lastResult = { ok: false, error: error.message || String(error) }; }
+    finally { session.running = false; if (session.lastResult?.fatal) { session.active = false; session.status = 'error'; logPlayingEvent('paused', { account: session.account, reason: session.lastResult.error }); } else if (session.lastResult?.waiting) session.status = 'waiting'; session.nextAt = Date.now() + session.intervalMs; if (session.active) session.timer = setTimeout(run, session.intervalMs); persistPlayingSessions(); }
+  };
+  session.timer = setTimeout(run, Math.max(0, Number(session.startDelayMs || 250)));
+}
+for (const saved of loadPlayingSessions()) {
+  if (saved?.account && saved?.channelId && Array.isArray(saved.steps) && saved.steps.length) { const session = { ...saved, active: true, running: false }; playingSessions.set(playingKey(session.account), session); schedulePlaying(session); }
+}
 function cleanChannelIds(channelIds) {
   if (!Array.isArray(channelIds)) return [];
   return [...new Set(channelIds.map((value) => String(value || '').trim()).filter(Boolean))].slice(0, 500);
@@ -405,6 +484,7 @@ async function withAccountLock(name, operation) {
   finally { release(); if (accountLocks.get(key) === current) accountLocks.delete(key); }
 }
 function stopTasksForAccount(name) {
+  stopPlayingSession(name);
   let changed = false;
   for (const [id, task] of rotations.entries()) {
     const before = task.accounts.length;
@@ -970,6 +1050,42 @@ app.get('/api/voice/target-accounts', (req, res) => {
 });
 app.get('/api/voice/rotations', (_req, res) => ok(res, { rotations: [...rotations.values()].map(({ timer, ...item }) => item) }));
 app.get('/api/voice/state-cycles', (_req, res) => ok(res, { cycles: [...stateCycles.values()].map(({ timer, ...item }) => item) }));
+app.get('/api/playing/sessions', (_req, res) => ok(res, { sessions: [...playingSessions.values()].map(({ timer, ...item }) => item), active: [...playingSessions.values()].filter((item) => item.active).length }));
+app.get('/api/playing/events', (_req, res) => ok(res, { events: readPlayingEvents() }));
+app.post('/api/playing/preview', (req, res) => { const steps = cleanPlayingSteps(req.body?.steps); if (!steps.length) return fail(res, new Error('At least one complete action is required'), 400); return ok(res, { preview: steps.map((step, index) => ({ order: index + 1, button: step.button, phrase: step.phrase || null, messageId: step.messageId || 'auto-detect', customId: step.customId || 'auto-detect' })) }); });
+app.post('/api/playing/save', (req, res) => {
+  const account = String(req.body?.account || '').trim();
+  const channelId = String(req.body?.channelId || '').trim();
+  const channelName = String(req.body?.channelName || '').trim().slice(0, 120);
+  const scenarioName = String(req.body?.scenarioName || 'Playing scenario').trim().slice(0, 100) || 'Playing scenario';
+  const steps = cleanPlayingSteps(req.body?.steps);
+  const intervalMs = Math.max(1500, Math.min(24 * 60 * 60 * 1000, Number(req.body?.intervalMs || 5000)));
+  if (!account || !channelId || steps.length < 1) return fail(res, new Error('account, channelId and at least one button action are required'), 400);
+  if (!clients.has(account)) return fail(res, new Error('Account is not connected'), 400);
+  const existing = playingSessions.get(account);
+  const session = { account, scenarioName, channelId, channelName: channelName || channelId, steps, intervalMs, currentIndex: existing?.currentIndex || 0, active: existing?.active || false, status: existing?.status || 'saved', createdAt: existing?.createdAt || Date.now(), updatedAt: Date.now() };
+  if (existing) { clearTimeout(existing.timer); session.lastAction = existing.lastAction; }
+  playingSessions.set(account, session); if (session.active) schedulePlaying(session); persistPlayingSessions();
+  return ok(res, { session: { ...session, timer: undefined } });
+});
+app.post('/api/playing/start', (req, res) => {
+  const accounts = cleanAccounts(req.body?.accounts);
+  const accountDelayMs = Math.max(0, Math.min(600000, Number(req.body?.accountDelayMs || 0)));
+  if (!accounts.length) return fail(res, new Error('Select at least one account'), 400);
+  const results = accounts.map((account, index) => { const session = playingSessions.get(account); if (!session) return { account, ok: false, error: 'Save a Playing setup for this account first' }; if (session.active) return { account, ok: true, alreadyActive: true }; session.active = true; session.startDelayMs = accountDelayMs * index; session.updatedAt = Date.now(); schedulePlaying(session); return { account, ok: true, startDelayMs: session.startDelayMs }; });
+  persistPlayingSessions(); return ok(res, { results, sessions: [...playingSessions.values()].map(({ timer, ...item }) => item) });
+});
+app.post('/api/playing/stop', (req, res) => {
+  const accounts = cleanAccounts(req.body?.accounts);
+  if (!accounts.length) return fail(res, new Error('Select at least one account'), 400);
+  return ok(res, { results: accounts.map((account) => ({ account, ok: stopPlayingSession(account), alreadyStopped: !playingSessions.has(account) })) });
+});
+app.post('/api/playing/emergency-stop', (_req, res) => { const accounts = [...playingSessions.keys()]; accounts.forEach((account) => stopPlayingSession(account, 'emergency-stop')); logPlayingEvent('emergency-stop', { accounts }); return ok(res, { stopped: accounts.length }); });
+app.post('/api/playing/delete', (req, res) => {
+  const account = String(req.body?.account || '').trim();
+  if (!account) return fail(res, new Error('account is required'), 400);
+  stopPlayingSession(account); playingSessions.delete(account); persistPlayingSessions(); return ok(res);
+});
 
 app.post('/api/voice/join', async (req, res) => {
   const accounts = cleanAccounts(req.body?.accounts);
@@ -1263,4 +1379,4 @@ if (require.main === module) {
   app.listen(PORT, '0.0.0.0', () => { console.log(`Voice Studio listening on http://localhost:${PORT}`); setInterval(() => { try { reconcileVoiceSessions(); } catch (error) { console.warn('[voice] session reconciliation failed:', error.message); } }, 3000).unref?.(); restoreSavedAccounts().then(() => restoreAutomationTasks()).catch((error) => console.warn('[restore] restore failed:', error.message)); });
 }
 
-module.exports = { app, clients, voiceSessions, rotations, stateCycles, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, saveAccounts, loadAccounts };
+module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, saveAccounts, loadAccounts, cleanPlayingSteps };
