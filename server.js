@@ -1076,6 +1076,7 @@ app.post('/api/playing/save', async (req, res) => {
   const account = String(req.body?.account || '').trim();
   const channelId = String(req.body?.channelId || '').trim();
   const channelName = String(req.body?.channelName || '').trim().slice(0, 120);
+  const guildId = String(req.body?.guildId || '').trim().slice(0, 40);
   const scenarioName = String(req.body?.scenarioName || 'Playing scenario').trim().slice(0, 100) || 'Playing scenario';
   const steps = cleanPlayingSteps(req.body?.steps);
   const intervalMs = Math.max(1500, Math.min(24 * 60 * 60 * 1000, Number(req.body?.intervalMs || 5000)));
@@ -1085,7 +1086,7 @@ app.post('/api/playing/save', async (req, res) => {
   const channel = await entry.client.channels?.fetch?.(channelId).catch?.(() => null);
   if (!channel?.messages?.fetch) return fail(res, new Error(`Account "${account}" cannot access the selected text room`), 400);
   const existing = playingSessions.get(account);
-  const session = { account, scenarioName, channelId, channelName: channelName || channelId, steps, intervalMs, currentIndex: existing?.currentIndex || 0, active: existing?.active || false, status: existing?.status || 'saved', createdAt: existing?.createdAt || Date.now(), updatedAt: Date.now() };
+  const session = { account, scenarioName, guildId: guildId || existing?.guildId || '', channelId, channelName: channelName || channelId, steps, intervalMs, currentIndex: existing?.currentIndex || 0, active: existing?.active || false, status: existing?.status || 'saved', createdAt: existing?.createdAt || Date.now(), updatedAt: Date.now() };
   if (existing) { clearTimeout(existing.timer); session.lastAction = existing.lastAction; }
   playingSessions.set(account, session); if (session.active) schedulePlaying(session); persistPlayingSessions();
   return ok(res, { session: { ...session, timer: undefined } });
