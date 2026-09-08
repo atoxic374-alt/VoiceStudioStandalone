@@ -182,8 +182,8 @@ async function findPlayingButton(channel, session, step) {
   const candidates = entries.filter((message) => !session.lastActionAt || Number(message.createdTimestamp || 0) > Number(session.lastActionAt));
   const sameMessage = session.lastMessageId ? entries.filter((message) => String(message.id) === String(session.lastMessageId)) : [];
   const requestedButtons = (step.buttons || [step.button]).map(normalizePlayingButton).filter(Boolean);
-  // "عشوائي" is a real button label in many game messages. Treat it as an
-  // explicit target; never reinterpret it as permission to click any button.
+  // Every configured value is an explicit target. Never reinterpret a label
+  // as permission to click an unrelated button.
   const explicitButtons = requestedButtons;
   for (const message of [...candidates, ...sameMessage.filter((message) => !candidates.includes(message))]) {
     if (step.messageId && String(message.id) !== step.messageId) continue;
