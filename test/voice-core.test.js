@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
-const { sendVoiceOp, sendVoiceOpConfirmed, rotations, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase } = require('../server');
+const { sendVoiceOp, sendVoiceOpConfirmed, rotations, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession } = require('../server');
 
 function fakeClient({ ready = true, confirms = true } = {}) {
   const ws = new EventEmitter();
@@ -165,5 +165,21 @@ test('treats any configured label as an exact target instead of selecting any bu
     assert.deepEqual(clicked, ['explicit']);
   } finally {
     clients.delete(account);
+  }
+});
+
+test('stopping a Playing session invalidates its pending run', () => {
+  const account = 'playing-stop-token';
+  const timer = setTimeout(() => {}, 10000);
+  playingSessions.set(account, { account, active: true, status: 'running', runToken: 4, timer });
+  try {
+    assert.equal(stopPlayingSession(account, 'test'), true);
+    const session = playingSessions.get(account);
+    assert.equal(session.active, false);
+    assert.equal(session.status, 'stopped');
+    assert.equal(session.runToken, 5);
+    assert.equal(session.timer, null);
+  } finally {
+    playingSessions.delete(account);
   }
 });
