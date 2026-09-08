@@ -206,6 +206,35 @@ async function findPlayingButton(channel, session, step) {
   }
   return null;
 }
+async function findAnyPlayingButton(channel, session) {
+  const messages = await channel.messages.fetch({ limit: 50 }).catch(() => null);
+  if (!messages) return null;
+  const entries = [...messages.values()].sort((a, b) => Number(b.createdTimestamp || 0) - Number(a.createdTimestamp || 0));
+  session.lastScan = entries.slice(0, 10).map((message) => ({ messageId: String(message.id), labels: messageButtons(message).map(componentLabel).filter(Boolean) }));
+  const candidates = entries.filter((message) => !session.lastActionAt || Number(message.createdTimestamp || 0) > Number(session.lastActionAt));
+  const sameMessage = session.lastMessageId ? entries.filter((message) => String(message.id) === String(session.lastMessageId)) : [];
+  const orderedMessages = [...candidates, ...sameMessage.filter((message) => !candidates.includes(message))];
+  for (const message of orderedMessages) {
+    for (const component of messageButtons(message)) {
+      const customId = String(component.customId ?? component.custom_id ?? '').trim();
+      if (component.disabled || !customId) continue;
+      const key = `${message.id}:${customId}`;
+      if (key === session.lastActionKey) continue;
+      const label = componentLabel(component);
+      const rawLabel = component?.label || component?.data?.label || '';
+      const normalizedLabel = normalizePlayingButton(label);
+      const normalizedRawLabel = normalizePlayingButton(rawLabel);
+      const labelWithoutLeadingEmoji = normalizedRawLabel.replace(/^(?:[\p{Extended_Pictographic}\p{Emoji_Presentation}\uFE0F\u200D]\s*)+/u, '').trim();
+      const stepIndex = session.steps.findIndex((step) => {
+        if (step.customId) return customId === step.customId;
+        const requested = (step.buttons || [step.button]).map(normalizePlayingButton).filter(Boolean);
+        return requested.some((wanted) => normalizedRawLabel === wanted || normalizedLabel === wanted || labelWithoutLeadingEmoji === wanted);
+      });
+      if (stepIndex >= 0) return { message, customId, key, label, step: session.steps[stepIndex], stepIndex };
+    }
+  }
+  return null;
+}
 function stopPlayingSession(account, reason = 'manual') { const session = playingSessions.get(playingKey(account)); if (!session) return false; session.active = false; session.status = 'stopped'; session.startDelayMs = 0; clearTimeout(session.timer); session.timer = null; persistPlayingSessions(); logPlayingEvent('stopped', { account, reason }); return true; }
 function skipPlayingStep(session, step, stepIndex, found, details = {}) { session.lastActionAt = Date.now(); if (found?.message?.id) session.lastMessageId = String(found.message.id); session.currentIndex = (stepIndex + 1) % session.steps.length; session.lastAction = { button: step.button, phrase: null, skipped: true, clickFailed: true, error: details.error || '', at: Date.now() }; return { ok: true, skipped: true, clickFailed: true, button: step.button, error: details.error || '' }; }
 async function sendPlayingPhrase(session) {
@@ -214,12 +243,13 @@ async function sendPlayingPhrase(session) {
   const safety = playingSafety.get(session.account) || 0; if (Date.now() < safety) { const waitMs = safety - Date.now(); logPlayingEvent('safety.cooldown', { account: session.account, waitMs }); return { ok: false, waiting: true, safety: true, error: `Safety cooldown ${Math.ceil(waitMs / 1000)}s` }; }
   const channel = await client.channels?.fetch?.(session.channelId).catch?.(() => null);
   if (!channel?.messages?.fetch) return { ok: false, error: 'Text channel is not available for this account' };
-  const stepIndex = Math.max(0, Number(session.currentIndex || 0)) % session.steps.length;
-  const step = session.steps[stepIndex];
-  const found = await findPlayingButton(channel, session, step);
-  if (!found) { const available = session.lastScan?.flatMap((item) => item.labels).filter(Boolean).slice(0, 20) || []; logPlayingEvent('button.waiting', { account: session.account, requested: step.button, available }); return { ok: false, waiting: true, error: `Waiting for configured button: ${step.button}`, available }; }
+  const found = await findAnyPlayingButton(channel, session);
+  const step = found?.step;
+  const stepIndex = found?.stepIndex ?? 0;
+  if (!found) { const available = session.lastScan?.flatMap((item) => item.labels).filter(Boolean).slice(0, 20) || []; logPlayingEvent('button.waiting', { account: session.account, requested: session.steps.map((item) => item.button), available }); return { ok: false, waiting: true, error: 'Waiting for any configured button', available }; }
   logPlayingEvent('button.click.started', { account: session.account, requested: step.button, label: found.label, messageId: String(found.message.id), customId: found.customId });
   const click = await dispatchPlayingButton(found.message, found.customId, { account: session.account, requested: step.button, label: found.label, messageId: String(found.message.id), customId: found.customId });
+  session.lastActionKey = found.key;
   playingSafety.set(session.account, Date.now() + (click.rateLimited ? 15000 : PLAYING_MIN_INTERACTION_GAP_MS));
   if (!click.ok) return skipPlayingStep(session, step, stepIndex, found, { error: `Button "${step.button}" click failed: ${click.error}` });
   if (click.noResponse) return skipPlayingStep(session, step, stepIndex, found, { error: 'No response from Application' });
