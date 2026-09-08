@@ -117,3 +117,27 @@ test('continues Playing when the optional follow-up message cannot be sent', asy
     clients.delete(account);
   }
 });
+
+test('uses the current step and exact button label when several buttons are present', async () => {
+  const account = 'playing-exact-button';
+  const sent = [];
+  const messages = [
+    { id: 'message-many-buttons', createdTimestamp: Date.now(), components: [{ components: [{ type: 2, customId: 'join', label: 'Join' }, { type: 2, customId: 'join-now', label: 'Join now' }] }], clickButton: async () => {} },
+  ];
+  const channel = {
+    messages: { fetch: async () => new Map(messages.map((message) => [message.id, message])) },
+    send: async (phrase) => { sent.push(phrase); },
+  };
+  clients.set(account, { client: { channels: { fetch: async () => channel } } });
+  const session = { account, channelId: 'text-2', steps: [{ button: 'Join', phrase: 'first' }, { button: 'Join now', phrase: 'second' }], currentIndex: 0 };
+  try {
+    const first = await sendPlayingPhrase(session);
+    await new Promise((resolve) => setTimeout(resolve, 2600));
+    const second = await sendPlayingPhrase(session);
+    assert.equal(first.button, 'Join');
+    assert.equal(second.button, 'Join now');
+    assert.deepEqual(sent, ['first', 'second']);
+  } finally {
+    clients.delete(account);
+  }
+});

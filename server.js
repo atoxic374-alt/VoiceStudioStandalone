@@ -191,9 +191,13 @@ async function findPlayingButton(channel, session, step) {
     for (const component of messageButtons(message)) {
       const customId = String(component.customId ?? component.custom_id ?? '').trim();
       if (step.customId && customId !== step.customId) continue;
-      const label = componentLabel(component); const wanted = normalizePlayingButton(step.button);
+      const label = componentLabel(component);
+      const rawLabel = component?.label || component?.data?.label || '';
       const normalizedLabel = normalizePlayingButton(label);
-      const explicitMatch = explicitButtons.some((wanted) => normalizedLabel === wanted || normalizedLabel.includes(wanted) || wanted.includes(normalizedLabel));
+      const normalizedRawLabel = normalizePlayingButton(rawLabel);
+      // Never use substring matching here: with buttons such as "Join",
+      // "Join now", and "Re-join", a partial match can click the wrong one.
+      const explicitMatch = explicitButtons.some((wanted) => normalizedRawLabel === wanted || normalizedLabel === wanted);
       if (!randomButton && !step.customId && !explicitMatch) continue;
       if (component.disabled || !customId) continue;
       const key = `${message.id}:${customId}`;
@@ -210,10 +214,10 @@ async function sendPlayingPhrase(session) {
   const safety = playingSafety.get(session.account) || 0; if (Date.now() < safety) { const waitMs = safety - Date.now(); logPlayingEvent('safety.cooldown', { account: session.account, waitMs }); return { ok: false, waiting: true, safety: true, error: `Safety cooldown ${Math.ceil(waitMs / 1000)}s` }; }
   const channel = await client.channels?.fetch?.(session.channelId).catch?.(() => null);
   if (!channel?.messages?.fetch) return { ok: false, error: 'Text channel is not available for this account' };
-  const entries = session.steps.map((step, index) => ({ step, index })).sort(() => Math.random() - 0.5);
-  let step = entries[0]?.step; let stepIndex = entries[0]?.index || 0; let found = null;
-  for (const entry of entries) { const candidate = await findPlayingButton(channel, session, entry.step); if (candidate) { step = entry.step; stepIndex = entry.index; found = candidate; break; } }
-  if (!found) { const available = session.lastScan?.flatMap((item) => item.labels).filter(Boolean).slice(0, 20) || []; logPlayingEvent('button.waiting', { account: session.account, requested: entries.map((entry) => entry.step.button), available }); return { ok: false, waiting: true, error: `Waiting for any configured button: ${entries.map((entry) => entry.step.button).join(' / ')}`, available }; }
+  const stepIndex = Math.max(0, Number(session.currentIndex || 0)) % session.steps.length;
+  const step = session.steps[stepIndex];
+  const found = await findPlayingButton(channel, session, step);
+  if (!found) { const available = session.lastScan?.flatMap((item) => item.labels).filter(Boolean).slice(0, 20) || []; logPlayingEvent('button.waiting', { account: session.account, requested: step.button, available }); return { ok: false, waiting: true, error: `Waiting for configured button: ${step.button}`, available }; }
   logPlayingEvent('button.click.started', { account: session.account, requested: step.button, label: found.label, messageId: String(found.message.id), customId: found.customId });
   const click = await dispatchPlayingButton(found.message, found.customId, { account: session.account, requested: step.button, label: found.label, messageId: String(found.message.id), customId: found.customId });
   playingSafety.set(session.account, Date.now() + (click.rateLimited ? 15000 : PLAYING_MIN_INTERACTION_GAP_MS));
