@@ -158,7 +158,7 @@ function pickPlayingPhrase(value) {
   const choices = String(value || '').split('|').map((item) => item.trim()).filter(Boolean);
   return choices.length ? choices[Math.floor(Math.random() * choices.length)] : '';
 }
-function componentLabel(component) { return String(component?.label || component?.data?.label || '').trim(); }
+function componentLabel(component) { const label = component?.label || component?.data?.label || ''; const emoji = component?.emoji || component?.data?.emoji; const emojiName = typeof emoji === 'string' ? emoji : emoji?.name || emoji?.id || ''; return `${String(label).trim()} ${String(emojiName).trim()}`.trim(); }
 function messageButtons(message) { return (message?.components || []).flatMap((row) => row?.components || []).filter((component) => String(component?.type || '').toUpperCase() === 'BUTTON' || component?.type === 2); }
 function normalizePlayingButton(value) { return String(value || '').normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').replace(/\s+/g, ' ').trim().toLocaleLowerCase(); }
 async function findPlayingButton(channel, session, step) {
