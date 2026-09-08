@@ -151,7 +151,7 @@ function logPlayingEvent(event, details = {}) { const record = { time: new Date(
 function readPlayingEvents() { try { return fs.readFileSync(PLAYING_LOG_FILE, 'utf8').trim().split('\n').filter(Boolean).slice(-500).reverse().map((line) => JSON.parse(line)); } catch { return [...playingEvents]; } }
 function cleanPlayingSteps(steps) {
   if (!Array.isArray(steps)) return [];
-  return steps.map((step) => ({ button: String(step?.button || '').trim().slice(0, 80), messageId: String(step?.messageId || '').trim().slice(0, 40), customId: String(step?.customId || '').trim().slice(0, 100), phrase: String(step?.phrase || '').trim().slice(0, 500) })).filter((step) => step.button).slice(0, 30);
+  return steps.map((step) => { const button = String(step?.button || '').trim().slice(0, 80); return { button, buttons: button.split(/[|,]/).map((item) => item.trim()).filter(Boolean).slice(0, 10), messageId: String(step?.messageId || '').trim().slice(0, 40), customId: String(step?.customId || '').trim().slice(0, 100), phrase: String(step?.phrase || '').trim().slice(0, 500) }; }).filter((step) => step.button).slice(0, 30);
 }
 function playingKey(account) { return String(account || ''); }
 function pickPlayingPhrase(value) {
@@ -179,24 +179,29 @@ async function findPlayingButton(channel, session, step) {
   session.lastScan = entries.slice(0, 10).map((message) => ({ messageId: String(message.id), labels: messageButtons(message).map(componentLabel).filter(Boolean) }));
   const candidates = entries.filter((message) => !session.lastActionAt || Number(message.createdTimestamp || 0) > Number(session.lastActionAt));
   const sameMessage = session.lastMessageId ? entries.filter((message) => String(message.id) === String(session.lastMessageId)) : [];
-  const randomButton = !step.customId && ['عشوائي', 'random', 'any', 'أي زر'].includes(normalizePlayingButton(step.button));
-  const reservedLabels = randomButton ? new Set(session.steps.filter((item) => !['عشوائي', 'random', 'any', 'أي زر'].includes(normalizePlayingButton(item.button))).map((item) => normalizePlayingButton(item.button))) : new Set();
-  const matches = [];
+  const requestedButtons = (step.buttons || [step.button]).map(normalizePlayingButton).filter(Boolean);
+  const randomNames = new Set(['عشوائي', 'random', 'any', 'أي زر']);
+  const randomButton = !step.customId && requestedButtons.some((name) => randomNames.has(name));
+  const explicitButtons = requestedButtons.filter((name) => !randomNames.has(name));
+  const reservedLabels = randomButton ? new Set(session.steps.flatMap((item) => item.buttons || [item.button]).map(normalizePlayingButton).filter((name) => !randomNames.has(name))) : new Set();
   const fallbackMatches = [];
+  const explicitMatches = [];
   for (const message of [...candidates, ...sameMessage.filter((message) => !candidates.includes(message))]) {
     if (step.messageId && String(message.id) !== step.messageId) continue;
     for (const component of messageButtons(message)) {
       const customId = String(component.customId ?? component.custom_id ?? '').trim();
       if (step.customId && customId !== step.customId) continue;
       const label = componentLabel(component); const wanted = normalizePlayingButton(step.button);
-      if (!randomButton && !step.customId && normalizePlayingButton(label) !== wanted && !normalizePlayingButton(label).includes(wanted)) continue;
+      const normalizedLabel = normalizePlayingButton(label);
+      const explicitMatch = explicitButtons.some((wanted) => normalizedLabel === wanted || normalizedLabel.includes(wanted) || wanted.includes(normalizedLabel));
+      if (!randomButton && !step.customId && !explicitMatch) continue;
       if (component.disabled || !customId) continue;
       const key = `${message.id}:${customId}`;
       if ((session.clickedButtons || []).includes(key)) continue;
-      if (randomButton) { const candidate = { message, customId, key, label }; fallbackMatches.push(candidate); const normalizedLabel = normalizePlayingButton(label); if (![...reservedLabels].some((reserved) => normalizedLabel === reserved || normalizedLabel.includes(reserved) || reserved.includes(normalizedLabel))) matches.push(candidate); } else return { message, customId, key, label };
+      if (randomButton) { const candidate = { message, customId, key, label }; if (explicitMatch) explicitMatches.push(candidate); else if (![...reservedLabels].some((reserved) => normalizedLabel === reserved || normalizedLabel.includes(reserved) || reserved.includes(normalizedLabel))) fallbackMatches.push(candidate); } else return { message, customId, key, label };
     }
   }
-  const pool = matches.length ? matches : fallbackMatches;
+  const pool = explicitMatches.length ? explicitMatches : fallbackMatches;
   return pool.length ? pool[Math.floor(Math.random() * pool.length)] : null;
 }
 function stopPlayingSession(account, reason = 'manual') { const session = playingSessions.get(playingKey(account)); if (!session) return false; session.active = false; session.status = 'stopped'; session.startDelayMs = 0; clearTimeout(session.timer); session.timer = null; persistPlayingSessions(); logPlayingEvent('stopped', { account, reason }); return true; }
