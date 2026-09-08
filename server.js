@@ -163,13 +163,13 @@ function messageButtons(message) { return (message?.components || []).flatMap((r
 function normalizePlayingButton(value) { return String(value || '').normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').replace(/\s+/g, ' ').trim().toLocaleLowerCase(); }
 async function dispatchPlayingButton(message, customId, details) {
   let interaction;
-  try { interaction = message.clickButton(customId); } catch (error) { logPlayingEvent('button.click.failed', { ...details, error: error.message || String(error) }); return { ok: false, fatal: true, error: error.message || String(error) }; }
+  try { interaction = message.clickButton(customId); } catch (error) { logPlayingEvent('button.click.failed', { ...details, error: error.message || String(error) }); return { ok: false, skip: true, error: error.message || String(error) }; }
   const response = await Promise.race([
     Promise.resolve(interaction).then(() => ({ responded: true })).catch((error) => ({ error })),
     new Promise((resolve) => setTimeout(() => resolve({ timedOut: true }), 1500)),
   ]);
   if (response.timedOut) { logPlayingEvent('button.click.no-response', { ...details, error: 'No response from Application; interaction was dispatched' }); return { ok: true, noResponse: true }; }
-  if (response.error) { logPlayingEvent('button.click.failed', { ...details, error: response.error.message || String(response.error) }); return { ok: false, fatal: true, error: response.error.message || String(response.error) }; }
+  if (response.error) { logPlayingEvent('button.click.failed', { ...details, error: response.error.message || String(response.error) }); return { ok: false, skip: true, error: response.error.message || String(response.error) }; }
   return { ok: true, responded: true };
 }
 async function findPlayingButton(channel, session, step) {
@@ -195,6 +195,7 @@ async function findPlayingButton(channel, session, step) {
   return null;
 }
 function stopPlayingSession(account, reason = 'manual') { const session = playingSessions.get(playingKey(account)); if (!session) return false; session.active = false; session.status = 'stopped'; session.startDelayMs = 0; clearTimeout(session.timer); session.timer = null; persistPlayingSessions(); logPlayingEvent('stopped', { account, reason }); return true; }
+function skipPlayingStep(session, step, found, details = {}) { if (found?.key) session.clickedButtons = [...new Set([...(session.clickedButtons || []), found.key])].slice(-500); session.lastActionAt = Date.now(); if (found?.message?.id) session.lastMessageId = String(found.message.id); session.currentIndex = (session.currentIndex + 1) % session.steps.length; session.lastAction = { button: step.button, phrase: null, skipped: true, clickFailed: true, error: details.error || '', at: Date.now() }; return { ok: true, skipped: true, clickFailed: true, button: step.button, error: details.error || '' }; }
 async function sendPlayingPhrase(session) {
   const entry = clients.get(session.account); const client = entry?.client;
   if (!client) return { ok: false, error: 'Account is not connected' };
@@ -205,7 +206,8 @@ async function sendPlayingPhrase(session) {
   if (!found) { const available = session.lastScan?.flatMap((item) => item.labels).filter(Boolean).slice(0, 20) || []; logPlayingEvent('button.waiting', { account: session.account, requested: step.button, available }); return { ok: false, waiting: true, error: `Waiting for an enabled button named "${step.button}"`, available }; }
   logPlayingEvent('button.click.started', { account: session.account, requested: step.button, label: found.label, messageId: String(found.message.id), customId: found.customId });
   const click = await dispatchPlayingButton(found.message, found.customId, { account: session.account, requested: step.button, label: found.label, messageId: String(found.message.id), customId: found.customId });
-  if (!click.ok) return { ok: false, fatal: true, error: `Button "${step.button}" click failed: ${click.error}` };
+  if (!click.ok) return skipPlayingStep(session, step, found, { error: `Button "${step.button}" click failed: ${click.error}` });
+  if (click.noResponse) return skipPlayingStep(session, step, found, { error: 'No response from Application' });
   logPlayingEvent('button.click.completed', { account: session.account, requested: step.button, label: found.label, messageId: String(found.message.id), customId: found.customId });
   session.clickedButtons = [...new Set([...(session.clickedButtons || []), found.key])].slice(-500);
   session.lastActionAt = Date.now(); session.lastMessageId = String(found.message.id);
@@ -213,8 +215,8 @@ async function sendPlayingPhrase(session) {
   const phrase = pickPlayingPhrase(step.phrase);
   if (!phrase) {
     session.currentIndex = (session.currentIndex + 1) % session.steps.length;
-    session.lastAction = { button: step.button, phrase: null, skipped: true, noResponse: !!click.noResponse, at: Date.now() };
-    return { ok: true, button: step.button, skipped: true, noResponse: !!click.noResponse };
+    session.lastAction = { button: step.button, phrase: null, skipped: true, at: Date.now() };
+    return { ok: true, button: step.button, skipped: true };
   }
   logPlayingEvent('phrase.send.started', { account: session.account, phrase, button: step.button });
   try { await channel.send(phrase); } catch (error) { logPlayingEvent('phrase.send.failed', { account: session.account, phrase, button: step.button, error: error.message || String(error) }); return { ok: false, fatal: true, error: `Message after button failed: ${error.message || error}` }; }
@@ -227,7 +229,7 @@ function schedulePlaying(session) {
   const run = async () => {
     if (!session.active || !playingSessions.has(session.account)) return;
     session.running = true;
-    try { session.status = 'running'; session.lastResult = await withAccountLock(session.account, () => sendPlayingPhrase(session)); logPlayingEvent(session.lastResult.ok ? 'action.completed' : session.lastResult.waiting ? 'action.waiting' : 'action.failed', { account: session.account, result: session.lastResult, step: session.steps[session.currentIndex % session.steps.length]?.button }); }
+    try { session.status = 'running'; session.lastResult = await withAccountLock(session.account, () => sendPlayingPhrase(session)); logPlayingEvent(session.lastResult.skipped ? 'action.skipped' : session.lastResult.ok ? 'action.completed' : session.lastResult.waiting ? 'action.waiting' : 'action.failed', { account: session.account, result: session.lastResult, step: session.steps[session.currentIndex % session.steps.length]?.button }); }
     catch (error) { session.lastResult = { ok: false, error: error.message || String(error) }; }
     finally { session.running = false; if (session.lastResult?.fatal) { session.active = false; session.status = 'error'; logPlayingEvent('paused', { account: session.account, reason: session.lastResult.error }); } else if (session.lastResult?.waiting) session.status = 'waiting'; session.nextAt = Date.now() + session.intervalMs; if (session.active) session.timer = setTimeout(run, session.intervalMs); persistPlayingSessions(); }
   };
