@@ -191,9 +191,11 @@ async function sendPlayingPhrase(session) {
   const channel = await client.channels?.fetch?.(session.channelId).catch?.(() => null);
   if (!channel?.messages?.fetch) return { ok: false, error: 'Text channel is not available for this account' };
   const found = await findPlayingButton(channel, session, step);
-  if (!found) return { ok: false, waiting: true, error: `Waiting for an enabled button named "${step.button}"`, available: session.lastScan?.flatMap((item) => item.labels).filter(Boolean).slice(0, 20) || [] };
+  if (!found) { const available = session.lastScan?.flatMap((item) => item.labels).filter(Boolean).slice(0, 20) || []; logPlayingEvent('button.waiting', { account: session.account, requested: step.button, available }); return { ok: false, waiting: true, error: `Waiting for an enabled button named "${step.button}"`, available }; }
+  logPlayingEvent('button.click.started', { account: session.account, requested: step.button, label: found.label, messageId: String(found.message.id), customId: found.customId });
   try { await found.message.clickButton(found.customId); }
-  catch (error) { return { ok: false, fatal: true, error: `Button "${step.button}" click failed: ${error.message || error}` }; }
+  catch (error) { logPlayingEvent('button.click.failed', { account: session.account, requested: step.button, label: found.label, messageId: String(found.message.id), error: error.message || String(error) }); return { ok: false, fatal: true, error: `Button "${step.button}" click failed: ${error.message || error}` }; }
+  logPlayingEvent('button.click.completed', { account: session.account, requested: step.button, label: found.label, messageId: String(found.message.id), customId: found.customId });
   session.clickedButtons = [...new Set([...(session.clickedButtons || []), found.key])].slice(-500);
   session.lastActionAt = Date.now(); session.lastMessageId = String(found.message.id);
   logPlayingEvent('button.found', { account: session.account, button: step.button, label: found.label, messageId: String(found.message.id) });
@@ -203,7 +205,9 @@ async function sendPlayingPhrase(session) {
     session.lastAction = { button: step.button, phrase: null, skipped: true, at: Date.now() };
     return { ok: true, button: step.button, skipped: true };
   }
-  await channel.send(phrase);
+  logPlayingEvent('phrase.send.started', { account: session.account, phrase, button: step.button });
+  try { await channel.send(phrase); } catch (error) { logPlayingEvent('phrase.send.failed', { account: session.account, phrase, button: step.button, error: error.message || String(error) }); return { ok: false, fatal: true, error: `Message after button failed: ${error.message || error}` }; }
+  logPlayingEvent('phrase.send.completed', { account: session.account, phrase, button: step.button });
   session.currentIndex = (session.currentIndex + 1) % session.steps.length;
   session.lastAction = { button: step.button, phrase, at: Date.now() };
   return { ok: true, button: step.button, phrase };
