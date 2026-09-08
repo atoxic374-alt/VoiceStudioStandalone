@@ -197,7 +197,6 @@ async function findPlayingButton(channel, session, step) {
       if (!randomButton && !step.customId && !explicitMatch) continue;
       if (component.disabled || !customId) continue;
       const key = `${message.id}:${customId}`;
-      if ((session.clickedButtons || []).includes(key)) continue;
       if (randomButton) { const candidate = { message, customId, key, label }; if (explicitMatch) explicitMatches.push(candidate); else if (![...reservedLabels].some((reserved) => normalizedLabel === reserved || normalizedLabel.includes(reserved) || reserved.includes(normalizedLabel))) fallbackMatches.push(candidate); } else return { message, customId, key, label };
     }
   }
@@ -205,7 +204,7 @@ async function findPlayingButton(channel, session, step) {
   return pool.length ? pool[Math.floor(Math.random() * pool.length)] : null;
 }
 function stopPlayingSession(account, reason = 'manual') { const session = playingSessions.get(playingKey(account)); if (!session) return false; session.active = false; session.status = 'stopped'; session.startDelayMs = 0; clearTimeout(session.timer); session.timer = null; persistPlayingSessions(); logPlayingEvent('stopped', { account, reason }); return true; }
-function skipPlayingStep(session, step, found, details = {}) { if (found?.key) session.clickedButtons = [...new Set([...(session.clickedButtons || []), found.key])].slice(-500); session.lastActionAt = Date.now(); if (found?.message?.id) session.lastMessageId = String(found.message.id); session.currentIndex = (session.currentIndex + 1) % session.steps.length; session.lastAction = { button: step.button, phrase: null, skipped: true, clickFailed: true, error: details.error || '', at: Date.now() }; return { ok: true, skipped: true, clickFailed: true, button: step.button, error: details.error || '' }; }
+function skipPlayingStep(session, step, found, details = {}) { session.lastActionAt = Date.now(); if (found?.message?.id) session.lastMessageId = String(found.message.id); session.currentIndex = (session.currentIndex + 1) % session.steps.length; session.lastAction = { button: step.button, phrase: null, skipped: true, clickFailed: true, error: details.error || '', at: Date.now() }; return { ok: true, skipped: true, clickFailed: true, button: step.button, error: details.error || '' }; }
 async function sendPlayingPhrase(session) {
   const entry = clients.get(session.account); const client = entry?.client;
   if (!client) return { ok: false, error: 'Account is not connected' };
@@ -219,7 +218,6 @@ async function sendPlayingPhrase(session) {
   if (!click.ok) return skipPlayingStep(session, step, found, { error: `Button "${step.button}" click failed: ${click.error}` });
   if (click.noResponse) return skipPlayingStep(session, step, found, { error: 'No response from Application' });
   logPlayingEvent('button.click.completed', { account: session.account, requested: step.button, label: found.label, messageId: String(found.message.id), customId: found.customId });
-  session.clickedButtons = [...new Set([...(session.clickedButtons || []), found.key])].slice(-500);
   session.lastActionAt = Date.now(); session.lastMessageId = String(found.message.id);
   logPlayingEvent('button.found', { account: session.account, button: step.button, label: found.label, messageId: String(found.message.id) });
   const phrase = pickPlayingPhrase(step.phrase);
