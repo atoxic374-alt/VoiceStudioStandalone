@@ -161,6 +161,17 @@ function pickPlayingPhrase(value) {
 function componentLabel(component) { const label = component?.label || component?.data?.label || ''; const emoji = component?.emoji || component?.data?.emoji; const emojiName = typeof emoji === 'string' ? emoji : emoji?.name || emoji?.id || ''; return `${String(label).trim()} ${String(emojiName).trim()}`.trim(); }
 function messageButtons(message) { return (message?.components || []).flatMap((row) => row?.components || []).filter((component) => String(component?.type || '').toUpperCase() === 'BUTTON' || component?.type === 2); }
 function normalizePlayingButton(value) { return String(value || '').normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').replace(/\s+/g, ' ').trim().toLocaleLowerCase(); }
+async function dispatchPlayingButton(message, customId, details) {
+  let interaction;
+  try { interaction = message.clickButton(customId); } catch (error) { logPlayingEvent('button.click.failed', { ...details, error: error.message || String(error) }); return { ok: false, fatal: true, error: error.message || String(error) }; }
+  const response = await Promise.race([
+    Promise.resolve(interaction).then(() => ({ responded: true })).catch((error) => ({ error })),
+    new Promise((resolve) => setTimeout(() => resolve({ timedOut: true }), 1500)),
+  ]);
+  if (response.timedOut) { logPlayingEvent('button.click.no-response', { ...details, error: 'No response from Application; interaction was dispatched' }); return { ok: true, noResponse: true }; }
+  if (response.error) { logPlayingEvent('button.click.failed', { ...details, error: response.error.message || String(response.error) }); return { ok: false, fatal: true, error: response.error.message || String(response.error) }; }
+  return { ok: true, responded: true };
+}
 async function findPlayingButton(channel, session, step) {
   const messages = await channel.messages.fetch({ limit: 50 }).catch(() => null);
   if (!messages) return null;
@@ -193,8 +204,8 @@ async function sendPlayingPhrase(session) {
   const found = await findPlayingButton(channel, session, step);
   if (!found) { const available = session.lastScan?.flatMap((item) => item.labels).filter(Boolean).slice(0, 20) || []; logPlayingEvent('button.waiting', { account: session.account, requested: step.button, available }); return { ok: false, waiting: true, error: `Waiting for an enabled button named "${step.button}"`, available }; }
   logPlayingEvent('button.click.started', { account: session.account, requested: step.button, label: found.label, messageId: String(found.message.id), customId: found.customId });
-  try { await found.message.clickButton(found.customId); }
-  catch (error) { logPlayingEvent('button.click.failed', { account: session.account, requested: step.button, label: found.label, messageId: String(found.message.id), error: error.message || String(error) }); return { ok: false, fatal: true, error: `Button "${step.button}" click failed: ${error.message || error}` }; }
+  const click = await dispatchPlayingButton(found.message, found.customId, { account: session.account, requested: step.button, label: found.label, messageId: String(found.message.id), customId: found.customId });
+  if (!click.ok) return { ok: false, fatal: true, error: `Button "${step.button}" click failed: ${click.error}` };
   logPlayingEvent('button.click.completed', { account: session.account, requested: step.button, label: found.label, messageId: String(found.message.id), customId: found.customId });
   session.clickedButtons = [...new Set([...(session.clickedButtons || []), found.key])].slice(-500);
   session.lastActionAt = Date.now(); session.lastMessageId = String(found.message.id);
@@ -202,15 +213,15 @@ async function sendPlayingPhrase(session) {
   const phrase = pickPlayingPhrase(step.phrase);
   if (!phrase) {
     session.currentIndex = (session.currentIndex + 1) % session.steps.length;
-    session.lastAction = { button: step.button, phrase: null, skipped: true, at: Date.now() };
-    return { ok: true, button: step.button, skipped: true };
+    session.lastAction = { button: step.button, phrase: null, skipped: true, noResponse: !!click.noResponse, at: Date.now() };
+    return { ok: true, button: step.button, skipped: true, noResponse: !!click.noResponse };
   }
   logPlayingEvent('phrase.send.started', { account: session.account, phrase, button: step.button });
   try { await channel.send(phrase); } catch (error) { logPlayingEvent('phrase.send.failed', { account: session.account, phrase, button: step.button, error: error.message || String(error) }); return { ok: false, fatal: true, error: `Message after button failed: ${error.message || error}` }; }
   logPlayingEvent('phrase.send.completed', { account: session.account, phrase, button: step.button });
   session.currentIndex = (session.currentIndex + 1) % session.steps.length;
-  session.lastAction = { button: step.button, phrase, at: Date.now() };
-  return { ok: true, button: step.button, phrase };
+  session.lastAction = { button: step.button, phrase, noResponse: !!click.noResponse, at: Date.now() };
+  return { ok: true, button: step.button, phrase, noResponse: !!click.noResponse };
 }
 function schedulePlaying(session) {
   const run = async () => {
