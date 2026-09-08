@@ -83,6 +83,8 @@ const syntheticStreams = new Map();
 const mediaStreamers = new Map();
 const accountOperations = new Map();
 const playingSessions = new Map();
+const playingSafety = new Map();
+const PLAYING_MIN_INTERACTION_GAP_MS = 2500;
 const playingEvents = [];
 let videoStreamModulePromise;
 const liveEvents = new EventEmitter();
@@ -163,13 +165,13 @@ function messageButtons(message) { return (message?.components || []).flatMap((r
 function normalizePlayingButton(value) { return String(value || '').normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').replace(/\s+/g, ' ').trim().toLocaleLowerCase(); }
 async function dispatchPlayingButton(message, customId, details) {
   let interaction;
-  try { interaction = message.clickButton(customId); } catch (error) { logPlayingEvent('button.click.failed', { ...details, error: error.message || String(error) }); return { ok: false, skip: true, error: error.message || String(error) }; }
+  try { interaction = message.clickButton(customId); } catch (error) { const messageText = error.message || String(error); const rateLimited = error.status === 429 || /429|rate.?limit|too many requests/i.test(messageText); logPlayingEvent(rateLimited ? 'safety.rate-limited' : 'button.click.failed', { ...details, error: messageText }); return { ok: false, skip: true, rateLimited, error: messageText }; }
   const response = await Promise.race([
     Promise.resolve(interaction).then(() => ({ responded: true })).catch((error) => ({ error })),
     new Promise((resolve) => setTimeout(() => resolve({ timedOut: true }), 1500)),
   ]);
   if (response.timedOut) { logPlayingEvent('button.click.no-response', { ...details, error: 'No response from Application; interaction was dispatched' }); return { ok: true, noResponse: true }; }
-  if (response.error) { logPlayingEvent('button.click.failed', { ...details, error: response.error.message || String(response.error) }); return { ok: false, skip: true, error: response.error.message || String(response.error) }; }
+  if (response.error) { const error = response.error.message || String(response.error); const rateLimited = response.error.status === 429 || /429|rate.?limit|too many requests/i.test(error); logPlayingEvent(rateLimited ? 'safety.rate-limited' : 'button.click.failed', { ...details, error }); return { ok: false, skip: true, rateLimited, error }; }
   return { ok: true, responded: true };
 }
 async function findPlayingButton(channel, session, step) {
@@ -205,6 +207,7 @@ function skipPlayingStep(session, step, stepIndex, found, details = {}) { sessio
 async function sendPlayingPhrase(session) {
   const entry = clients.get(session.account); const client = entry?.client;
   if (!client) return { ok: false, error: 'Account is not connected' };
+  const safety = playingSafety.get(session.account) || 0; if (Date.now() < safety) { const waitMs = safety - Date.now(); logPlayingEvent('safety.cooldown', { account: session.account, waitMs }); return { ok: false, waiting: true, safety: true, error: `Safety cooldown ${Math.ceil(waitMs / 1000)}s` }; }
   const channel = await client.channels?.fetch?.(session.channelId).catch?.(() => null);
   if (!channel?.messages?.fetch) return { ok: false, error: 'Text channel is not available for this account' };
   const entries = session.steps.map((step, index) => ({ step, index })).sort(() => Math.random() - 0.5);
@@ -213,6 +216,7 @@ async function sendPlayingPhrase(session) {
   if (!found) { const available = session.lastScan?.flatMap((item) => item.labels).filter(Boolean).slice(0, 20) || []; logPlayingEvent('button.waiting', { account: session.account, requested: entries.map((entry) => entry.step.button), available }); return { ok: false, waiting: true, error: `Waiting for any configured button: ${entries.map((entry) => entry.step.button).join(' / ')}`, available }; }
   logPlayingEvent('button.click.started', { account: session.account, requested: step.button, label: found.label, messageId: String(found.message.id), customId: found.customId });
   const click = await dispatchPlayingButton(found.message, found.customId, { account: session.account, requested: step.button, label: found.label, messageId: String(found.message.id), customId: found.customId });
+  playingSafety.set(session.account, Date.now() + (click.rateLimited ? 15000 : PLAYING_MIN_INTERACTION_GAP_MS));
   if (!click.ok) return skipPlayingStep(session, step, stepIndex, found, { error: `Button "${step.button}" click failed: ${click.error}` });
   if (click.noResponse) return skipPlayingStep(session, step, stepIndex, found, { error: 'No response from Application' });
   logPlayingEvent('button.click.completed', { account: session.account, requested: step.button, label: found.label, messageId: String(found.message.id), customId: found.customId });
@@ -225,7 +229,7 @@ async function sendPlayingPhrase(session) {
     return { ok: true, button: step.button, skipped: true };
   }
   logPlayingEvent('phrase.send.started', { account: session.account, phrase, button: step.button });
-  try { await channel.send(phrase); } catch (error) { logPlayingEvent('phrase.send.failed', { account: session.account, phrase, button: step.button, error: error.message || String(error) }); return { ok: false, fatal: true, error: `Message after button failed: ${error.message || error}` }; }
+  try { await channel.send(phrase); } catch (error) { const messageText = error.message || String(error); const rateLimited = error.status === 429 || /429|rate.?limit|too many requests/i.test(messageText); logPlayingEvent(rateLimited ? 'safety.rate-limited' : 'phrase.send.failed', { account: session.account, phrase, button: step.button, error: messageText }); if (rateLimited) { playingSafety.set(session.account, Date.now() + 15000); session.currentIndex = (stepIndex + 1) % session.steps.length; return { ok: true, skipped: true, phraseSkipped: true, button: step.button, error: 'Message skipped after rate limit' }; } return { ok: false, fatal: true, error: `Message after button failed: ${messageText}` }; }
   logPlayingEvent('phrase.send.completed', { account: session.account, phrase, button: step.button });
   session.currentIndex = (stepIndex + 1) % session.steps.length;
   session.lastAction = { button: step.button, phrase, noResponse: !!click.noResponse, at: Date.now() };
