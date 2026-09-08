@@ -1072,7 +1072,7 @@ app.get('/api/playing/channels', (req, res) => {
 });
 app.get('/api/playing/events', (_req, res) => ok(res, { events: readPlayingEvents() }));
 app.post('/api/playing/preview', (req, res) => { const steps = cleanPlayingSteps(req.body?.steps); if (!steps.length) return fail(res, new Error('At least one complete action is required'), 400); return ok(res, { preview: steps.map((step, index) => ({ order: index + 1, button: step.button, phrase: step.phrase || null, messageId: step.messageId || 'auto-detect', customId: step.customId || 'auto-detect' })) }); });
-app.post('/api/playing/save', (req, res) => {
+app.post('/api/playing/save', async (req, res) => {
   const account = String(req.body?.account || '').trim();
   const channelId = String(req.body?.channelId || '').trim();
   const channelName = String(req.body?.channelName || '').trim().slice(0, 120);
@@ -1080,7 +1080,10 @@ app.post('/api/playing/save', (req, res) => {
   const steps = cleanPlayingSteps(req.body?.steps);
   const intervalMs = Math.max(1500, Math.min(24 * 60 * 60 * 1000, Number(req.body?.intervalMs || 5000)));
   if (!account || !channelId || steps.length < 1) return fail(res, new Error('account, channelId and at least one button action are required'), 400);
-  if (!clients.has(account)) return fail(res, new Error('Account is not connected'), 400);
+  const entry = clients.get(account);
+  if (!entry) return fail(res, new Error('Account is not connected'), 400);
+  const channel = await entry.client.channels?.fetch?.(channelId).catch?.(() => null);
+  if (!channel?.messages?.fetch) return fail(res, new Error(`Account "${account}" cannot access the selected text room`), 400);
   const existing = playingSessions.get(account);
   const session = { account, scenarioName, channelId, channelName: channelName || channelId, steps, intervalMs, currentIndex: existing?.currentIndex || 0, active: existing?.active || false, status: existing?.status || 'saved', createdAt: existing?.createdAt || Date.now(), updatedAt: Date.now() };
   if (existing) { clearTimeout(existing.timer); session.lastAction = existing.lastAction; }
