@@ -160,21 +160,25 @@ function pickPlayingPhrase(value) {
 }
 function componentLabel(component) { return String(component?.label || component?.data?.label || '').trim(); }
 function messageButtons(message) { return (message?.components || []).flatMap((row) => row?.components || []).filter((component) => String(component?.type || '').toUpperCase() === 'BUTTON' || component?.type === 2); }
+function normalizePlayingButton(value) { return String(value || '').normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').replace(/\s+/g, ' ').trim().toLocaleLowerCase(); }
 async function findPlayingButton(channel, session, step) {
   const messages = await channel.messages.fetch({ limit: 50 }).catch(() => null);
   if (!messages) return null;
   const entries = [...messages.values()].sort((a, b) => Number(b.createdTimestamp || 0) - Number(a.createdTimestamp || 0));
-  for (const message of entries) {
-    if (session.lastActionAt && Number(message.createdTimestamp || 0) <= Number(session.lastActionAt)) continue;
+  session.lastScan = entries.slice(0, 10).map((message) => ({ messageId: String(message.id), labels: messageButtons(message).map(componentLabel).filter(Boolean) }));
+  const candidates = entries.filter((message) => !session.lastActionAt || Number(message.createdTimestamp || 0) > Number(session.lastActionAt));
+  const sameMessage = session.lastMessageId ? entries.filter((message) => String(message.id) === String(session.lastMessageId)) : [];
+  for (const message of [...candidates, ...sameMessage.filter((message) => !candidates.includes(message))]) {
     if (step.messageId && String(message.id) !== step.messageId) continue;
     for (const component of messageButtons(message)) {
       const customId = String(component.customId ?? component.custom_id ?? '').trim();
       if (step.customId && customId !== step.customId) continue;
-      if (!step.customId && componentLabel(component) !== step.button) continue;
+      const label = componentLabel(component); const wanted = normalizePlayingButton(step.button);
+      if (!step.customId && normalizePlayingButton(label) !== wanted && !normalizePlayingButton(label).includes(wanted)) continue;
       if (component.disabled || !customId) continue;
       const key = `${message.id}:${customId}`;
       if ((session.clickedButtons || []).includes(key)) continue;
-      return { message, customId, key };
+      return { message, customId, key, label };
     }
   }
   return null;
@@ -187,11 +191,12 @@ async function sendPlayingPhrase(session) {
   const channel = await client.channels?.fetch?.(session.channelId).catch?.(() => null);
   if (!channel?.messages?.fetch) return { ok: false, error: 'Text channel is not available for this account' };
   const found = await findPlayingButton(channel, session, step);
-  if (!found) return { ok: false, waiting: true, error: `Waiting for a fresh enabled button named "${step.button}"` };
+  if (!found) return { ok: false, waiting: true, error: `Waiting for an enabled button named "${step.button}"`, available: session.lastScan?.flatMap((item) => item.labels).filter(Boolean).slice(0, 20) || [] };
   try { await found.message.clickButton(found.customId); }
   catch (error) { return { ok: false, fatal: true, error: `Button "${step.button}" click failed: ${error.message || error}` }; }
   session.clickedButtons = [...new Set([...(session.clickedButtons || []), found.key])].slice(-500);
-  session.lastActionAt = Date.now();
+  session.lastActionAt = Date.now(); session.lastMessageId = String(found.message.id);
+  logPlayingEvent('button.found', { account: session.account, button: step.button, label: found.label, messageId: String(found.message.id) });
   const phrase = pickPlayingPhrase(step.phrase);
   if (!phrase) {
     session.currentIndex = (session.currentIndex + 1) % session.steps.length;
