@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
-const { sendVoiceOp, sendVoiceOpConfirmed, rotations, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation } = require('../server');
+const { sendVoiceOp, sendVoiceOpConfirmed, rotations, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase } = require('../server');
 
 function fakeClient({ ready = true, confirms = true } = {}) {
   const ws = new EventEmitter();
@@ -90,5 +90,30 @@ test('detects duplicate task ownership and supersedes stale account operations',
     endAccountOperation(second);
   } finally {
     rotations.delete(taskId);
+  }
+});
+
+test('continues Playing when the optional follow-up message cannot be sent', async () => {
+  const account = 'playing-message-failure';
+  const message = {
+    id: 'message-1',
+    createdTimestamp: Date.now(),
+    components: [{ components: [{ type: 2, customId: 'button-1', label: 'Join' }] }],
+    clickButton: async () => {},
+  };
+  const channel = {
+    messages: { fetch: async () => new Map([[message.id, message]]) },
+    send: async () => { throw new Error('temporary send failure'); },
+  };
+  clients.set(account, { client: { channels: { fetch: async () => channel } } });
+  const session = { account, channelId: 'text-1', steps: [{ button: 'Join', phrase: 'hello' }], currentIndex: 0 };
+  try {
+    const result = await sendPlayingPhrase(session);
+    assert.equal(result.ok, true);
+    assert.equal(result.skipped, true);
+    assert.equal(result.messageFailed, true);
+    assert.equal(session.currentIndex, 0);
+  } finally {
+    clients.delete(account);
   }
 });

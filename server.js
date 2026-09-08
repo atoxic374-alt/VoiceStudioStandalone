@@ -229,7 +229,20 @@ async function sendPlayingPhrase(session) {
     return { ok: true, button: step.button, skipped: true };
   }
   logPlayingEvent('phrase.send.started', { account: session.account, phrase, button: step.button });
-  try { await channel.send(phrase); } catch (error) { const messageText = error.message || String(error); const rateLimited = error.status === 429 || /429|rate.?limit|too many requests/i.test(messageText); logPlayingEvent(rateLimited ? 'safety.rate-limited' : 'phrase.send.failed', { account: session.account, phrase, button: step.button, error: messageText }); if (rateLimited) { playingSafety.set(session.account, Date.now() + 15000); session.currentIndex = (stepIndex + 1) % session.steps.length; return { ok: true, skipped: true, phraseSkipped: true, button: step.button, error: 'Message skipped after rate limit' }; } return { ok: false, fatal: true, error: `Message after button failed: ${messageText}` }; }
+  try {
+    await channel.send(phrase);
+  } catch (error) {
+    // Sending the optional follow-up phrase must never stop the Playing loop.
+    // The button action already happened, so record the failure, advance the
+    // scenario, and let the next scheduled run try the next configured button.
+    const messageText = error.message || String(error);
+    const rateLimited = error.status === 429 || /429|rate.?limit|too many requests/i.test(messageText);
+    logPlayingEvent(rateLimited ? 'safety.rate-limited' : 'phrase.send.failed', { account: session.account, phrase, button: step.button, error: messageText });
+    if (rateLimited) playingSafety.set(session.account, Date.now() + 15000);
+    session.currentIndex = (stepIndex + 1) % session.steps.length;
+    session.lastAction = { button: step.button, phrase, phraseSkipped: true, messageFailed: true, rateLimited, error: messageText, at: Date.now() };
+    return { ok: true, skipped: true, phraseSkipped: true, messageFailed: true, rateLimited, button: step.button, error: `Message skipped: ${messageText}` };
+  }
   logPlayingEvent('phrase.send.completed', { account: session.account, phrase, button: step.button });
   session.currentIndex = (stepIndex + 1) % session.steps.length;
   session.lastAction = { button: step.button, phrase, noResponse: !!click.noResponse, at: Date.now() };
@@ -1434,4 +1447,4 @@ if (require.main === module) {
   app.listen(PORT, '0.0.0.0', () => { console.log(`Voice Studio listening on http://localhost:${PORT}`); setInterval(() => { try { reconcileVoiceSessions(); } catch (error) { console.warn('[voice] session reconciliation failed:', error.message); } }, 3000).unref?.(); restoreSavedAccounts().then(() => restoreAutomationTasks()).catch((error) => console.warn('[restore] restore failed:', error.message)); });
 }
 
-module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, saveAccounts, loadAccounts, cleanPlayingSteps };
+module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase };
