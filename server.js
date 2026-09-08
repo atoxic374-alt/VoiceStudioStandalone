@@ -179,20 +179,22 @@ async function findPlayingButton(channel, session, step) {
   session.lastScan = entries.slice(0, 10).map((message) => ({ messageId: String(message.id), labels: messageButtons(message).map(componentLabel).filter(Boolean) }));
   const candidates = entries.filter((message) => !session.lastActionAt || Number(message.createdTimestamp || 0) > Number(session.lastActionAt));
   const sameMessage = session.lastMessageId ? entries.filter((message) => String(message.id) === String(session.lastMessageId)) : [];
+  const randomButton = !step.customId && ['عشوائي', 'random', 'any', 'أي زر'].includes(normalizePlayingButton(step.button));
+  const matches = [];
   for (const message of [...candidates, ...sameMessage.filter((message) => !candidates.includes(message))]) {
     if (step.messageId && String(message.id) !== step.messageId) continue;
     for (const component of messageButtons(message)) {
       const customId = String(component.customId ?? component.custom_id ?? '').trim();
       if (step.customId && customId !== step.customId) continue;
       const label = componentLabel(component); const wanted = normalizePlayingButton(step.button);
-      if (!step.customId && normalizePlayingButton(label) !== wanted && !normalizePlayingButton(label).includes(wanted)) continue;
+      if (!randomButton && !step.customId && normalizePlayingButton(label) !== wanted && !normalizePlayingButton(label).includes(wanted)) continue;
       if (component.disabled || !customId) continue;
       const key = `${message.id}:${customId}`;
       if ((session.clickedButtons || []).includes(key)) continue;
-      return { message, customId, key, label };
+      if (randomButton) matches.push({ message, customId, key, label }); else return { message, customId, key, label };
     }
   }
-  return null;
+  return matches.length ? matches[Math.floor(Math.random() * matches.length)] : null;
 }
 function stopPlayingSession(account, reason = 'manual') { const session = playingSessions.get(playingKey(account)); if (!session) return false; session.active = false; session.status = 'stopped'; session.startDelayMs = 0; clearTimeout(session.timer); session.timer = null; persistPlayingSessions(); logPlayingEvent('stopped', { account, reason }); return true; }
 function skipPlayingStep(session, step, found, details = {}) { if (found?.key) session.clickedButtons = [...new Set([...(session.clickedButtons || []), found.key])].slice(-500); session.lastActionAt = Date.now(); if (found?.message?.id) session.lastMessageId = String(found.message.id); session.currentIndex = (session.currentIndex + 1) % session.steps.length; session.lastAction = { button: step.button, phrase: null, skipped: true, clickFailed: true, error: details.error || '', at: Date.now() }; return { ok: true, skipped: true, clickFailed: true, button: step.button, error: details.error || '' }; }
