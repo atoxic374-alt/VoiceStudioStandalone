@@ -182,10 +182,9 @@ async function findPlayingButton(channel, session, step) {
   const candidates = entries.filter((message) => !session.lastActionAt || Number(message.createdTimestamp || 0) > Number(session.lastActionAt));
   const sameMessage = session.lastMessageId ? entries.filter((message) => String(message.id) === String(session.lastMessageId)) : [];
   const requestedButtons = (step.buttons || [step.button]).map(normalizePlayingButton).filter(Boolean);
-  const randomNames = new Set(['عشوائي', 'random', 'any', 'أي زر']);
-  const randomButton = !step.customId && requestedButtons.some((name) => randomNames.has(name));
-  const explicitButtons = requestedButtons.filter((name) => !randomNames.has(name));
-  const fallbackMatches = [];
+  // "عشوائي" is a real button label in many game messages. Treat it as an
+  // explicit target; never reinterpret it as permission to click any button.
+  const explicitButtons = requestedButtons;
   for (const message of [...candidates, ...sameMessage.filter((message) => !candidates.includes(message))]) {
     if (step.messageId && String(message.id) !== step.messageId) continue;
     for (const component of messageButtons(message)) {
@@ -195,16 +194,17 @@ async function findPlayingButton(channel, session, step) {
       const rawLabel = component?.label || component?.data?.label || '';
       const normalizedLabel = normalizePlayingButton(label);
       const normalizedRawLabel = normalizePlayingButton(rawLabel);
+      const labelWithoutLeadingEmoji = normalizedRawLabel.replace(/^(?:[\p{Extended_Pictographic}\p{Emoji_Presentation}\uFE0F\u200D]\s*)+/u, '').trim();
       // Never use substring matching here: with buttons such as "Join",
       // "Join now", and "Re-join", a partial match can click the wrong one.
-      const explicitMatch = explicitButtons.some((wanted) => normalizedRawLabel === wanted || normalizedLabel === wanted);
-      if (!randomButton && !step.customId && !explicitMatch) continue;
+      const explicitMatch = explicitButtons.some((wanted) => normalizedRawLabel === wanted || normalizedLabel === wanted || labelWithoutLeadingEmoji === wanted);
+      if (!step.customId && !explicitMatch) continue;
       if (component.disabled || !customId) continue;
       const key = `${message.id}:${customId}`;
-      if (randomButton) { const candidate = { message, customId, key, label }; fallbackMatches.push(candidate); } else return { message, customId, key, label };
+      return { message, customId, key, label };
     }
   }
-  return fallbackMatches.length ? fallbackMatches[Math.floor(Math.random() * fallbackMatches.length)] : null;
+  return null;
 }
 function stopPlayingSession(account, reason = 'manual') { const session = playingSessions.get(playingKey(account)); if (!session) return false; session.active = false; session.status = 'stopped'; session.startDelayMs = 0; clearTimeout(session.timer); session.timer = null; persistPlayingSessions(); logPlayingEvent('stopped', { account, reason }); return true; }
 function skipPlayingStep(session, step, stepIndex, found, details = {}) { session.lastActionAt = Date.now(); if (found?.message?.id) session.lastMessageId = String(found.message.id); session.currentIndex = (stepIndex + 1) % session.steps.length; session.lastAction = { button: step.button, phrase: null, skipped: true, clickFailed: true, error: details.error || '', at: Date.now() }; return { ok: true, skipped: true, clickFailed: true, button: step.button, error: details.error || '' }; }

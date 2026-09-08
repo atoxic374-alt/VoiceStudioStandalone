@@ -141,3 +141,29 @@ test('uses the current step and exact button label when several buttons are pres
     clients.delete(account);
   }
 });
+
+test('treats عشوائي as a real button label instead of selecting any button', async () => {
+  const account = 'playing-random-label';
+  const clicked = [];
+  const message = {
+    id: 'message-random-label',
+    createdTimestamp: Date.now(),
+    components: [{ components: [
+      { type: 2, customId: 'other', label: 'Ahmed.' },
+      { type: 2, customId: 'random', label: '🎲 عشوائي' },
+    ] }],
+    clickButton: async (customId) => { clicked.push(customId); },
+  };
+  const channel = {
+    messages: { fetch: async () => new Map([[message.id, message]]) },
+    send: async () => {},
+  };
+  clients.set(account, { client: { channels: { fetch: async () => channel } } });
+  try {
+    const result = await sendPlayingPhrase({ account, channelId: 'text-3', steps: [{ button: 'عشوائي', phrase: '' }], currentIndex: 0 });
+    assert.equal(result.button, 'عشوائي');
+    assert.deepEqual(clicked, ['random']);
+  } finally {
+    clients.delete(account);
+  }
+});
