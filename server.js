@@ -1360,7 +1360,7 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
     && !(item.selfDeaf === true && (item.selfVideo === true || item.selfStream === true)));
   if (!validStates) return fail(res, new Error('State cycle contains an invalid voice state'), 400);
   const id = crypto.randomUUID();
-  const task = { id, accounts, guildId, states, intervalMs: delay, currentIdx: 0, startedAt: Date.now(), nextAt: Date.now() + delay };
+  const task = { id, accounts, guildId, states, intervalMs: delay, currentIdx: 0, runToken: 0, startedAt: Date.now(), nextAt: Date.now() + delay };
   task.running = false; task.active = true;
   const linkedRoom = linkedRoomRotation(accounts, guildId);
   if (linkedRoom) { task.phaseRoomId = linkedRoom.id; task.phaseGapMs = ROTATION_PHASE_GAP_MS; task.nextAt = Number(linkedRoom.nextAt || Date.now() + delay) + ROTATION_PHASE_GAP_MS; }
@@ -1386,6 +1386,7 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
     if (task.nextAt > Date.now()) { if (task.active) task.timer = setTimeout(runStateCycle, task.nextAt - Date.now()); return; }
     if (!task.active || task.running) return;
     task.running = true;
+    const runToken = task.runToken;
     task.currentIdx = (task.currentIdx + 1) % task.states.length;
     const state = task.states[task.currentIdx];
     try {
@@ -1406,7 +1407,7 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
           result = await sendVoiceOpConfirmed(client, task.guildId, current.channelId, next, 6000);
         }
         if (!operationIsCurrent(operation)) { endAccountOperation(operation); task.lastResults.push({ name, ok: false, stale: true, error: 'State operation was superseded by a newer request' }); return; }
-        if (result.ok) { Object.assign(current, next, { selfStream: !!next.selfStream, updatedAt: Date.now() }); persistSessions(); }
+        if (result.ok && task.active && task.runToken === runToken) { Object.assign(current, next, { selfStream: !!next.selfStream, updatedAt: Date.now() }); persistSessions(); }
         task.lastResults.push({ name, ok: result.ok, error: result.ok ? null : result.error });
         endAccountOperation(operation);
       })));
@@ -1423,7 +1424,7 @@ app.post('/api/voice/state-cycle/stop', (req, res) => {
   const id = String(req.body?.id || '');
   const task = stateCycles.get(id);
   if (!task) return fail(res, new Error('State cycle not found'), 404);
-  task.active = false; clearInterval(task.timer); stateCycles.delete(id); persistAutomationTasks(); return ok(res);
+  task.active = false; task.runToken = Number(task.runToken || 0) + 1; clearTimeout(task.timer); clearInterval(task.timer); stateCycles.delete(id); persistAutomationTasks(); return ok(res);
 });
 
 async function restoreSavedAccounts() {
