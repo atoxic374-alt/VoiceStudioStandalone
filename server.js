@@ -1176,8 +1176,11 @@ app.post('/api/playing/save', async (req, res) => {
   const channel = await entry.client.channels?.fetch?.(channelId).catch?.(() => null);
   if (!channel?.messages?.fetch) return fail(res, new Error(`Account "${account}" cannot access the selected text room`), 400);
   const existing = playingSessions.get(account);
-  const session = { account, scenarioName, guildId: guildId || existing?.guildId || '', channelId, channelName: channelName || channelId, steps, intervalMs, currentIndex: existing?.currentIndex || 0, active: existing?.active || false, status: existing?.status || 'saved', createdAt: existing?.createdAt || Date.now(), updatedAt: Date.now() };
-  if (existing) { clearTimeout(existing.timer); session.lastAction = existing.lastAction; }
+  const wasActive = !!existing?.active;
+  const nextRunToken = Number(existing?.runToken || 0) + 1;
+  if (existing) { existing.active = false; existing.runToken = nextRunToken; clearTimeout(existing.timer); existing.timer = null; }
+  const session = { account, scenarioName, guildId: guildId || existing?.guildId || '', channelId, channelName: channelName || channelId, steps, intervalMs, currentIndex: existing?.currentIndex || 0, active: wasActive, status: wasActive ? 'running' : (existing?.status || 'saved'), runToken: nextRunToken, createdAt: existing?.createdAt || Date.now(), updatedAt: Date.now() };
+  if (existing) session.lastAction = existing.lastAction;
   playingSessions.set(account, session); if (session.active) schedulePlaying(session); persistPlayingSessions();
   return ok(res, { session: { ...session, timer: undefined } });
 });
