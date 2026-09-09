@@ -6,6 +6,7 @@ const { execFileSync, spawn } = require('child_process');
 const FFMPEG_PATH = require('ffmpeg-static');
 const { EventEmitter } = require('events');
 const { Client } = require('discord.js-selfbot-v13');
+const { VoiceAgent } = require('./ai-agent');
 const helmet = require('helmet');
 const AUTH_COOKIE = 'voice_studio_auth';
 const CLIENT_DEVICE_COOKIE = 'voice_studio_client_device';
@@ -82,6 +83,7 @@ const stateCycles = new Map();
 const syntheticStreams = new Map();
 const mediaStreamers = new Map();
 const accountOperations = new Map();
+const aiAgents = new Map();
 const playingSessions = new Map();
 const playingSafety = new Map();
 const PLAYING_MIN_INTERACTION_GAP_MS = 2500;
@@ -122,6 +124,15 @@ function requireAuth(req, res, next) {
   return res.status(401).json({ success: false, error: 'Authentication required' });
 }
 function emitLive(type, payload = {}) { liveEvents.emit('event', { type, at: Date.now(), ...payload }); }
+function stopAIAgent(name) {
+  const agent = aiAgents.get(name);
+  if (!agent) return false;
+  agent.stop();
+  aiAgents.delete(name);
+  emitLive('ai.stopped', { account: name });
+  return true;
+}
+function stopAllAIAgents() { for (const name of [...aiAgents.keys()]) stopAIAgent(name); }
 function accountHealth(name, entry) {
   const client = entry?.client;
   const status = client?.ws?.status;
@@ -1034,6 +1045,7 @@ app.post('/api/discord/disconnect', async (req, res) => {
   const name = String(req.body?.name || [...clients.keys()][0] || '');
   const entry = clients.get(name);
   if (!entry) return ok(res);
+  stopAIAgent(name);
   stopTasksForAccount(name);
   stopSyntheticStream(name, { leaveVoice: true });
   try { await entry.client.destroy(); } catch {}
@@ -1048,6 +1060,7 @@ app.post('/api/discord/disconnect-bulk', async (req, res) => {
   const results = await mapWithConcurrency(names, 8, (name) => withResultRetry(async () => {
       const entry = clients.get(name);
       if (!entry) return { name, ok: false, error: 'Account is not connected' };
+      stopAIAgent(name);
       stopTasksForAccount(name);
       stopSyntheticStream(name, { leaveVoice: true });
       removeSessionsForAccount(name);
@@ -1060,6 +1073,7 @@ app.post('/api/discord/disconnect-bulk', async (req, res) => {
   return ok(res, { results, summary: summary(results) });
 });
 app.post('/api/discord/disconnect-all', async (_req, res) => {
+  stopAllAIAgents();
   for (const name of clients.keys()) { stopTasksForAccount(name); stopSyntheticStream(name, { leaveVoice: true }); }
   for (const entry of clients.values()) { try { await entry.client.destroy(); } catch {} }
   clients.clear();
@@ -1155,6 +1169,32 @@ app.get('/api/playing/channels', (req, res) => {
   return ok(res, { channels: filtered.sort((a, b) => a.name.localeCompare(b.name)), guilds });
 });
 app.get('/api/playing/events', (_req, res) => ok(res, { events: readPlayingEvents() }));
+app.get('/api/ai/status', (_req, res) => ok(res, { agents: [...aiAgents.values()].map((agent) => agent.status()) }));
+app.post('/api/ai/start', (req, res) => {
+  const accounts = cleanAccounts(req.body?.accounts);
+  const systemPrompt = String(req.body?.systemPrompt || '').trim().slice(0, 4000);
+  if (!accounts.length) return fail(res, new Error('Select at least one account'), 400);
+  if (!systemPrompt) return fail(res, new Error('AI personality and instructions are required'), 400);
+  const results = accounts.map((name) => {
+    const entry = clients.get(name);
+    const savedSession = [...voiceSessions.values()].find((item) => item.name === name && item.channelId);
+    const current = savedSession && entry ? (readGatewayVoiceState(entry.client, savedSession.guildId) || savedSession) : savedSession;
+    const connection = entry?.client?.voice?.connection;
+    if (!entry || !connection || !current?.channelId) return { name, ok: false, error: 'الحساب يجب أن يكون داخل قناة صوتية أولاً' };
+    try {
+      stopAIAgent(name);
+      const agent = new VoiceAgent({ account: name, connection, userId: entry.client.user?.id, systemPrompt, onEvent: (event) => emitLive(`ai.${event.event}`, event) });
+      agent.start(); aiAgents.set(name, agent); emitLive('ai.started', { account: name });
+      return { name, ok: true, channelId: current.channelId };
+    } catch (error) { return { name, ok: false, error: error.message || String(error) }; }
+  });
+  return ok(res, { results, agents: [...aiAgents.values()].map((agent) => agent.status()) });
+});
+app.post('/api/ai/stop', (req, res) => {
+  const accounts = cleanAccounts(req.body?.accounts);
+  if (!accounts.length) return fail(res, new Error('Select at least one account'), 400);
+  return ok(res, { results: accounts.map((name) => ({ name, ok: stopAIAgent(name), alreadyStopped: !aiAgents.has(name) })) });
+});
 app.post('/api/playing/preview', (req, res) => { const steps = cleanPlayingSteps(req.body?.steps); if (!steps.length) return fail(res, new Error('At least one complete action is required'), 400); return ok(res, { preview: steps.map((step, index) => ({ order: index + 1, button: step.button, phrase: step.phrase || null, messageId: step.messageId || 'auto-detect', customId: step.customId || 'auto-detect' })) }); });
 app.post('/api/playing/save', async (req, res) => {
   const account = String(req.body?.account || '').trim();
@@ -1210,6 +1250,7 @@ app.post('/api/voice/leave', async (req, res) => {
   const results = await mapWithConcurrency(accounts, 8, (name) => withResultRetry(() => withAccountLock(name, async () => {
     const client = getClient(name);
     if (!client) return { name, ok: false, error: 'Account is not connected' };
+    stopAIAgent(name);
     const current = readGatewayVoiceState(client, guildId) || voiceSessions.get(sessionKey(name, guildId));
     // A manual leave only removes the current room session. Keep the account
     // in its active rotation so the next tick can join it again.
@@ -1486,4 +1527,4 @@ if (require.main === module) {
   app.listen(PORT, '0.0.0.0', () => { console.log(`Voice Studio listening on http://localhost:${PORT}`); setInterval(() => { try { reconcileVoiceSessions(); } catch (error) { console.warn('[voice] session reconciliation failed:', error.message); } }, 3000).unref?.(); restoreSavedAccounts().then(() => restoreAutomationTasks()).catch((error) => console.warn('[restore] restore failed:', error.message)); });
 }
 
-module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase };
+module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, aiAgents, stopAIAgent, stopAllAIAgents, stopPlayingSession, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase };

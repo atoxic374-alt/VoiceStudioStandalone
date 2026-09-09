@@ -281,3 +281,16 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .profiles-pager[hidden] { display: none; }
 .profiles-pager span { color: var(--muted); font-size: 9px; }
 .profiles-pager .room-page-button { min-width: 72px; }
+.ai-description { margin: 0 25px 18px; color: var(--muted); font-size: 11px; }
+.ai-card .field { margin: 0 25px; }
+.ai-card .field textarea { width: 100%; resize: vertical; min-height: 110px; border: 1px solid var(--line); border-radius: 12px; padding: 12px 13px; background: rgba(5,8,21,.35); color: var(--text); font: inherit; font-size: 12px; outline: none; }
+.ai-card .field textarea:focus { border-color: rgba(140,124,255,.75); box-shadow: 0 0 0 4px rgba(140,124,255,.1); }
+.ai-toolbar, .ai-actions { display: flex; align-items: center; gap: 10px; padding: 16px 25px; }
+.ai-toolbar span { color: var(--faint); font-size: 9px; }
+.ai-card #aiWorkspace { padding-bottom: 8px; }
+.ai-card #aiWorkspace[hidden] { display: none; }
+.ai-card .playing-section-head { margin: 0 25px 10px; }
+.ai-card .playing-accounts { max-height: 280px; overflow: auto; margin: 0 25px; }
+.ai-card .playing-account { display: flex; align-items: center; gap: 10px; padding: 10px; margin-bottom: 7px; border: 1px solid var(--line); border-radius: 12px; background: rgba(255,255,255,.025); cursor: pointer; }
+.ai-card .playing-account.is-incompatible { opacity: .48; cursor: not-allowed; }
+.ai-card .playing-account input { accent-color: var(--cyan); }
