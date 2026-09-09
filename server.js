@@ -298,7 +298,13 @@ function schedulePlaying(session) {
   session.timer = setTimeout(run, Math.max(0, Number(session.startDelayMs || 250)));
 }
 for (const saved of loadPlayingSessions()) {
-  if (saved?.account && saved?.channelId && Array.isArray(saved.steps) && saved.steps.length) { const session = { ...saved, active: true, running: false }; playingSessions.set(playingKey(session.account), session); schedulePlaying(session); }
+  if (saved?.account && saved?.channelId && Array.isArray(saved.steps) && saved.steps.length) {
+    // Restore the persisted state exactly. A manually stopped session must stay stopped
+    // after a server restart; only an explicit Start/Restart action may activate it again.
+    const session = { ...saved, active: saved.active === true, running: false, timer: null, runToken: Number(saved.runToken || 0) };
+    playingSessions.set(playingKey(session.account), session);
+    if (session.active) schedulePlaying(session);
+  }
 }
 function cleanChannelIds(channelIds) {
   if (!Array.isArray(channelIds)) return [];
