@@ -306,6 +306,59 @@ for (const saved of loadPlayingSessions()) {
     if (session.active) schedulePlaying(session);
   }
 }
+function startAllPlayingSessions(reason = 'discord-start') {
+  const results = [];
+  for (const session of playingSessions.values()) {
+    if (session.active) {
+      results.push({ account: session.account, ok: true, alreadyActive: true });
+      continue;
+    }
+    session.active = true;
+    session.status = 'starting';
+    session.startDelayMs = 0;
+    session.updatedAt = Date.now();
+    schedulePlaying(session);
+    results.push({ account: session.account, ok: true });
+  }
+  persistPlayingSessions();
+  logPlayingEvent('bulk-started', { reason, accounts: results.map((item) => item.account) });
+  return { results, started: results.filter((item) => !item.alreadyActive).length, alreadyActive: results.filter((item) => item.alreadyActive).length };
+}
+function stopAllPlayingSessions(reason = 'discord-stop') {
+  const accounts = [...playingSessions.keys()];
+  const results = accounts.map((account) => ({ account, ok: stopPlayingSession(account, reason) }));
+  logPlayingEvent('bulk-stopped', { reason, accounts });
+  return { results, stopped: results.filter((item) => item.ok).length };
+}
+function playingCommandText(message) {
+  const prefix = String(process.env.DISCORD_COMMAND_PREFIX || '').trim();
+  const content = String(message?.content || '').trim();
+  if (prefix && !content.toLocaleLowerCase().startsWith(prefix.toLocaleLowerCase())) return '';
+  return (prefix ? content.slice(prefix.length) : content).trim().toLocaleLowerCase();
+}
+const handledPlayingCommands = new Set();
+async function handlePlayingDiscordCommand(client, message) {
+  const command = playingCommandText(message);
+  if (!['start', 'stop'].includes(command)) return false;
+  const configuredChannel = String(process.env.DISCORD_COMMAND_CHANNEL_ID || '').trim();
+  if (configuredChannel && String(message.channel?.id || '') !== configuredChannel) return false;
+  const configuredUser = String(process.env.DISCORD_COMMAND_USER_ID || '').trim();
+  const authorId = String(message.author?.id || '');
+  // By default only a message authored by this connected account can control
+  // the sessions. DISCORD_COMMAND_USER_ID may designate one owner account.
+  if (configuredUser ? authorId !== configuredUser : authorId !== String(client.user?.id || '')) return false;
+  const messageKey = String(message.id || '');
+  if (messageKey && handledPlayingCommands.has(messageKey)) return false;
+  if (messageKey) {
+    handledPlayingCommands.add(messageKey);
+    if (handledPlayingCommands.size > 1000) handledPlayingCommands.delete(handledPlayingCommands.values().next().value);
+  }
+  const result = command === 'start' ? startAllPlayingSessions() : stopAllPlayingSessions();
+  try {
+    await message.react?.('✅');
+  } catch (error) { console.warn('[playing-command] unable to add confirmation reaction:', error.message); }
+  return true;
+}
 function cleanChannelIds(channelIds) {
   if (!Array.isArray(channelIds)) return [];
   return [...new Set(channelIds.map((value) => String(value || '').trim()).filter(Boolean))].slice(0, 500);
@@ -893,6 +946,7 @@ async function connectOne(token, name) {
   client.on?.('error', markError);
   client.on?.('ready', () => { entry.lastError = null; entry.lastSeenAt = Date.now(); emitLive('account.health.changed', { account: accountHealth(finalName, entry) }); });
   client.on?.('disconnect', () => { entry.lastSeenAt = Date.now(); emitLive('account.health.changed', { account: accountHealth(finalName, entry) }); });
+  client.on?.('messageCreate', (message) => { handlePlayingDiscordCommand(client, message).catch((error) => console.warn('[playing-command] failed:', error.message)); });
   emitLive('account.connected', { account: accountHealth(finalName, entry) });
 
   // Restore only the channel state; media capture remains browser-owned and must be
@@ -1496,4 +1550,4 @@ if (require.main === module) {
   app.listen(PORT, '0.0.0.0', () => { console.log(`Voice Studio listening on http://localhost:${PORT}`); setInterval(() => { try { reconcileVoiceSessions(); } catch (error) { console.warn('[voice] session reconciliation failed:', error.message); } }, 3000).unref?.(); restoreSavedAccounts().then(() => restoreAutomationTasks()).catch((error) => console.warn('[restore] restore failed:', error.message)); });
 }
 
-module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase };
+module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase };

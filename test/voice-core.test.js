@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
-const { sendVoiceOp, sendVoiceOpConfirmed, rotations, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession } = require('../server');
+const { sendVoiceOp, sendVoiceOpConfirmed, rotations, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand } = require('../server');
 
 function fakeClient({ ready = true, confirms = true } = {}) {
   const ws = new EventEmitter();
@@ -181,5 +181,65 @@ test('stopping a Playing session invalidates its pending run', () => {
     assert.equal(session.timer, null);
   } finally {
     playingSessions.delete(account);
+  }
+});
+
+test('starts all saved Playing sessions and does not duplicate active timers', () => {
+  const saved = [...playingSessions.entries()];
+  playingSessions.clear();
+  const first = { account: 'bulk-start-1', channelId: 'text-1', steps: [{ button: 'Join' }], intervalMs: 60000, active: false, status: 'saved', timer: null };
+  const second = { account: 'bulk-start-2', channelId: 'text-2', steps: [{ button: 'Join' }], intervalMs: 60000, active: true, status: 'running', timer: null };
+  playingSessions.set(first.account, first);
+  playingSessions.set(second.account, second);
+  try {
+    const result = startAllPlayingSessions('test');
+    assert.equal(result.started, 1);
+    assert.equal(result.alreadyActive, 1);
+    assert.equal(first.active, true);
+    assert.equal(second.active, true);
+    clearTimeout(first.timer);
+  } finally {
+    playingSessions.delete(first.account);
+    playingSessions.delete(second.account);
+    for (const [account, session] of saved) playingSessions.set(account, session);
+  }
+});
+
+test('stops every saved Playing session', () => {
+  const saved = [...playingSessions.entries()];
+  playingSessions.clear();
+  const accounts = ['bulk-stop-1', 'bulk-stop-2'];
+  for (const account of accounts) playingSessions.set(account, { account, active: true, status: 'running', timer: setTimeout(() => {}, 10000) });
+  try {
+    const result = stopAllPlayingSessions('test');
+    assert.equal(result.stopped, 2);
+    for (const account of accounts) assert.equal(playingSessions.get(account).active, false);
+  } finally {
+    for (const account of accounts) playingSessions.delete(account);
+    for (const [account, session] of saved) playingSessions.set(account, session);
+  }
+});
+
+test('Discord start and stop commands control every Playing session with one reaction', async () => {
+  const saved = [...playingSessions.entries()];
+  playingSessions.clear();
+  const sessions = ['discord-command-1', 'discord-command-2'].map((account) => ({ account, channelId: 'text', steps: [{ button: 'Join' }], intervalMs: 60000, active: false, status: 'saved', timer: null }));
+  sessions.forEach((session) => playingSessions.set(session.account, session));
+  const reacted = [];
+  const channel = {};
+  const client = { user: { id: 'owner-1' } };
+  try {
+    assert.equal(await handlePlayingDiscordCommand(client, { id: 'command-start', content: 'start', author: { id: 'owner-1' }, channel, react: async (emoji) => reacted.push(emoji) }), true);
+    assert.deepEqual(sessions.map((session) => session.active), [true, true]);
+    assert.deepEqual(reacted, ['✅']);
+    assert.equal(await handlePlayingDiscordCommand(client, { id: 'command-stop', content: 'stop', author: { id: 'owner-1' }, channel, react: async (emoji) => reacted.push(emoji) }), true);
+    assert.deepEqual(sessions.map((session) => session.active), [false, false]);
+    assert.deepEqual(reacted, ['✅', '✅']);
+    assert.equal(await handlePlayingDiscordCommand(client, { id: 'command-stop', content: 'stop', author: { id: 'owner-1' }, channel, react: async (emoji) => reacted.push(emoji) }), false);
+    assert.deepEqual(reacted, ['✅', '✅']);
+    sessions.forEach((session) => clearTimeout(session.timer));
+  } finally {
+    sessions.forEach((session) => playingSessions.delete(session.account));
+    for (const [account, session] of saved) playingSessions.set(account, session);
   }
 });
