@@ -32,14 +32,6 @@ The dashboard accepts one account at a time or a bulk list. Bulk lines may be wr
 
 Each connected account is shown with its avatar, display name, username, guild nickname when available, Discord user ID, presence status, current guild/channel, and current voice flags. Active sessions also show in the session list and refresh automatically.
 
-## AI voice conversations
-
-The **AI** section provides an explicit, user-controlled voice agent. Open the section, write a personality and operating instructions, enable the workspace, select one or more accounts that are already inside voice channels, and press **Run AI**. Accounts that are not currently in voice are shown but cannot be selected. The server also validates this condition again before starting each agent, so a stale browser selection cannot start an agent on an account outside voice.
-
-Each selected account receives the same personality prompt but maintains its own conversation history. The agent listens for other speakers, transcribes short speech segments, generates a concise response, synthesizes speech, and plays it back into that account's current voice connection. The implementation uses the configured OpenAI-compatible provider through server-side environment variables (`OPENAI_API_KEY`, `AI_CHAT_MODEL`, `AI_STT_MODEL`, `AI_TTS_MODEL`, and `AI_TTS_VOICE`). To keep latency low, use a fast chat model, short instructions, and a concise response policy in the personality text. The agent is not started at server boot; it only runs after the user presses **Run AI**, and it stops automatically when the account leaves voice or disconnects.
-
-Voice account automation may violate Discord's Terms of Service. Use only accounts and credentials you are authorized to control, inform people when they are speaking with an AI, and avoid impersonating real people.
-
 The automation panel starts and stops channel rotation and voice-state cycling. Rotation visits only the voice channels explicitly selected by the user in the selected guild at the configured interval. State cycling applies the selected sequence of mute, deaf, video, and stream flags at the same interval. Both task types are kept in memory, exposed through status endpoints, and stopped cleanly by their task ID.
 
 ## تخصص اختيار الحسابات والسيرفر والرومات

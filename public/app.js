@@ -567,27 +567,12 @@ async function refreshSessions() {
       await syncSelectedAccountVoice();
       const data = await api('/api/voice/sessions');
       renderSessions(data.sessions || []);
-      renderAIAccounts(data.sessions || []); loadAIStatus();
       await loadTasks();
     } catch (error) { console.warn('[voice] sessions refresh failed', error); }
     finally { state.refreshPromise = null; }
   })();
   return state.refreshPromise;
 }
-function selectedAIAccounts() { return [...document.querySelectorAll('#aiAccounts input[type="checkbox"]:checked')].map((input) => input.value); }
-function renderAIAccounts(sessions = []) {
-  const root = $('#aiAccounts'); if (!root) return;
-  const activeNames = new Set(sessions.filter((session) => session.channelId).map((session) => session.name));
-  const selected = new Set(selectedAIAccounts());
-  root.innerHTML = state.clients.length ? state.clients.map((client) => {
-    const inVoice = activeNames.has(client.name);
-    return `<label class="playing-account ${inVoice ? '' : 'is-incompatible'}"><input type="checkbox" value="${escapeHTML(client.name)}" ${selected.has(client.name) && inVoice ? 'checked' : ''} ${inVoice ? '' : 'disabled'} /><span class="target-avatar">${client.avatar ? `<img src="${escapeHTML(client.avatar)}" alt="" />` : escapeHTML((client.displayName || client.name || '?')[0])}</span><span><strong>${escapeHTML(client.displayName || client.name)}</strong><small>${inVoice ? 'داخل قناة صوتية · جاهز' : 'ليس داخل فويس'}</small></span></label>`;
-  }).join('') : '<div class="task-empty">لا توجد حسابات متصلة</div>';
-}
-async function loadAIStatus() { try { const data = await api('/api/ai/status'); const agents = data.agents || []; $('#navAiCount').textContent = String(agents.filter((agent) => agent.active).length); $('#aiStatusBadge').textContent = agents.length ? `${agents.length} يعمل` : 'متوقف'; } catch (error) { console.warn('[ai] status failed', error); } }
-async function runAI() { const accounts = selectedAIAccounts(); const systemPrompt = $('#aiSystemPrompt').value.trim(); if (!accounts.length) return feedback('#aiFeedback', 'اختر حساباً واحداً على الأقل داخل فويس.', 'error'); if (!systemPrompt) return feedback('#aiFeedback', 'اكتب الشخصية والتعليمات أولاً.', 'error'); try { const data = await api('/api/ai/start', { method: 'POST', body: JSON.stringify({ accounts, systemPrompt }) }); const failed = (data.results || []).filter((item) => !item.ok); feedback('#aiFeedback', failed.length ? `تم تشغيل ${data.results.length - failed.length}، وتعذر تشغيل ${failed.length}.` : `تم تشغيل AI على ${accounts.length} حسابات.`, failed.length ? 'error' : 'success'); loadAIStatus(); } catch (error) { feedback('#aiFeedback', error.message, 'error'); } }
-async function stopAI() { const accounts = selectedAIAccounts(); if (!accounts.length) return feedback('#aiFeedback', 'اختر الحسابات التي تريد إيقافها.', 'error'); try { await api('/api/ai/stop', { method: 'POST', body: JSON.stringify({ accounts }) }); feedback('#aiFeedback', 'تم إيقاف AI للحسابات المحددة.', 'success'); loadAIStatus(); } catch (error) { feedback('#aiFeedback', error.message, 'error'); } }
-function initAI() { $('#aiToggleButton')?.addEventListener('click', () => { const workspace = $('#aiWorkspace'); workspace.hidden = !workspace.hidden; $('#aiToggleButton').textContent = workspace.hidden ? 'تشغيل الإعدادات' : 'إخفاء الإعدادات'; }); $('#aiRunButton')?.addEventListener('click', runAI); $('#aiStopButton')?.addEventListener('click', stopAI); $('#aiSelectAll')?.addEventListener('click', () => { const boxes = [...document.querySelectorAll('#aiAccounts input:not(:disabled)')]; const all = boxes.length && boxes.every((box) => box.checked); boxes.forEach((box) => { box.checked = !all; }); }); const saved = localStorage.getItem('voice-ai-prompt'); if (saved) $('#aiSystemPrompt').value = saved; $('#aiSystemPrompt')?.addEventListener('input', (event) => localStorage.setItem('voice-ai-prompt', event.target.value)); }
 async function loadTasks() {
   try {
     const [rotations, cycles] = await Promise.all([api('/api/voice/rotations'), api('/api/voice/state-cycles')]);
@@ -810,7 +795,7 @@ function initCustomSelects() {
   document.addEventListener('click', (event) => { if (!event.target.closest('.custom-select')) document.querySelectorAll('.custom-select.is-open').forEach((item) => item.classList.remove('is-open')); });
 }
 function init() {
-  initTheme(); initLanguage(); initNavigation(); initActivity(); initPlaying(); initAI(); initCustomSelects();
+  initTheme(); initLanguage(); initNavigation(); initActivity(); initPlaying(); initCustomSelects();
   $('#profilesPrevButton')?.addEventListener('click', () => { state.profilesPage -= 1; renderProfiles(state.clients); });
   $('#profilesNextButton')?.addEventListener('click', () => { state.profilesPage += 1; renderProfiles(state.clients); });
   $('#serverSelect')?.addEventListener('change', (event) => { state.selectedGuildId = event.target.value; state.selectedTarget = null; renderChannels(); }); $('#roomSearch')?.addEventListener('input', () => { state.selectedTarget = null; renderChannels(); });
