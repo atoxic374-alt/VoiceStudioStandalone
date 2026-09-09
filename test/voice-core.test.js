@@ -221,6 +221,8 @@ test('stops every saved Playing session', () => {
 });
 
 test('Discord start and stop commands control every Playing session with one reaction', async () => {
+  const previousOwners = process.env.DISCORD_COMMAND_OWNERS;
+  process.env.DISCORD_COMMAND_OWNERS = 'owner-1, owner-2';
   const saved = [...playingSessions.entries()];
   playingSessions.clear();
   const sessions = ['discord-command-1', 'discord-command-2'].map((account) => ({ account, channelId: 'text', steps: [{ button: 'Join' }], intervalMs: 60000, active: false, status: 'saved', timer: null }));
@@ -237,9 +239,13 @@ test('Discord start and stop commands control every Playing session with one rea
     assert.deepEqual(reacted, ['✅', '✅']);
     assert.equal(await handlePlayingDiscordCommand(client, { id: 'command-stop', content: 'stop', author: { id: 'owner-1' }, channel, react: async (emoji) => reacted.push(emoji) }), false);
     assert.deepEqual(reacted, ['✅', '✅']);
+    assert.equal(await handlePlayingDiscordCommand(client, { id: 'command-unauthorized', content: 'start', author: { id: 'not-an-owner' }, channel, react: async (emoji) => reacted.push(emoji) }), false);
+    assert.deepEqual(reacted, ['✅', '✅']);
     sessions.forEach((session) => clearTimeout(session.timer));
   } finally {
     sessions.forEach((session) => playingSessions.delete(session.account));
     for (const [account, session] of saved) playingSessions.set(account, session);
+    if (previousOwners === undefined) delete process.env.DISCORD_COMMAND_OWNERS;
+    else process.env.DISCORD_COMMAND_OWNERS = previousOwners;
   }
 });

@@ -342,11 +342,14 @@ async function handlePlayingDiscordCommand(client, message) {
   if (!['start', 'stop'].includes(command)) return false;
   const configuredChannel = String(process.env.DISCORD_COMMAND_CHANNEL_ID || '').trim();
   if (configuredChannel && String(message.channel?.id || '') !== configuredChannel) return false;
-  const configuredUser = String(process.env.DISCORD_COMMAND_USER_ID || '').trim();
+  const owners = String(process.env.DISCORD_COMMAND_OWNERS || '')
+    .split(/[\s,]+/)
+    .map((value) => value.trim())
+    .filter(Boolean);
   const authorId = String(message.author?.id || '');
-  // By default only a message authored by this connected account can control
-  // the sessions. DISCORD_COMMAND_USER_ID may designate one owner account.
-  if (configuredUser ? authorId !== configuredUser : authorId !== String(client.user?.id || '')) return false;
+  // An explicit allow-list is required. Never fall back to the connected
+  // account, because every connected account can receive the same command.
+  if (!authorId || !owners.includes(authorId)) return false;
   const messageKey = String(message.id || '');
   if (messageKey && handledPlayingCommands.has(messageKey)) return false;
   if (messageKey) {
