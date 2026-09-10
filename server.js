@@ -574,8 +574,12 @@ function ensureSyntheticVideo() {
     throw new Error(`Unable to create synthetic stream source: ${error.message}`);
   }
 }
-function stopSyntheticStream(name, { leaveVoice = false, silent = false } = {}) {
-  mediaRunGenerations.set(name, Number(mediaRunGenerations.get(name) || 0) + 1);
+function stopSyntheticStream(name, { leaveVoice = false, silent = false, invalidate = true } = {}) {
+  // Replacing an old transport as part of a new start must not invalidate the
+  // new start's generation. Previously startSyntheticStreamUnqueued() called
+  // this function after capturing its generation, so every camera/Go Live
+  // replacement cancelled itself with "Media start cancelled...".
+  if (invalidate) mediaRunGenerations.set(name, Number(mediaRunGenerations.get(name) || 0) + 1);
   const pendingRestart = pendingMediaRestarts.get(name);
   if (pendingRestart) {
     clearTimeout(pendingRestart);
@@ -921,7 +925,7 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
   const existing = syntheticStreams.get(name);
   // Replacing a media transport must not send a voice leave for the account.
   // The primary voice connection owns room membership.
-  if (existing) stopSyntheticStream(name);
+  if (existing) stopSyntheticStream(name, { invalidate: false });
   const liveTarget = await confirmLiveMediaTarget(client, guildId, session.channelId);
   if (!liveTarget.ok) {
     logMediaEvent('warn', 'media.live_target_changed', { account: name, guildId, channelId: session.channelId, mediaKind, error: liveTarget.error, first: liveTarget.first, second: liveTarget.second });
@@ -1326,7 +1330,12 @@ function rotationControlledAccounts(guildId) {
   }
   return controlled;
 }
-function operationKey(name, guildId) { return `${String(name)}__${String(guildId)}`; }
+// Voice, camera, and Go Live all share one Discord gateway identity per
+// account. Scope operation supersession to the account, not the guild: a room
+// move in one guild must cancel stale media/state work started for that
+// account elsewhere as well. Keeping guildId in the operation is still useful
+// for diagnostics and callers.
+function operationKey(name) { return String(name); }
 function beginAccountOperation(name, guildId, kind) {
   const key = operationKey(name, guildId);
   const previous = accountOperations.get(key);
@@ -2352,4 +2361,4 @@ if (require.main === module) {
   app.listen(PORT, '0.0.0.0', () => { console.log(`Voice Studio listening on http://localhost:${PORT}`); setInterval(() => { try { reconcileVoiceSessions(); } catch (error) { console.warn('[voice] session reconciliation failed:', error.message); } }, 3000).unref?.(); startVoiceWatchdog(); restoreSavedAccounts().then(() => restoreAutomationTasks()).catch((error) => console.warn('[restore] restore failed:', error.message)); });
 }
 
-module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck };
+module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck };

@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
-const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere } = require('../server');
+const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey } = require('../server');
 
 function fakeClient({ ready = true, confirms = true } = {}) {
   const ws = new EventEmitter();
@@ -108,6 +108,15 @@ test('destroys a primary dispatcher when media start is cancelled during signali
   resolveSignaling();
   await assert.rejects(pending, /cancelled by a newer account operation/);
   assert.equal(destroyed, 1);
+});
+
+test('supersedes operations for the whole account, even across guilds', () => {
+  const first = beginAccountOperation('account-scope', 'guild-a', 'media');
+  const second = beginAccountOperation('account-scope', 'guild-b', 'move');
+  assert.equal(operationKey('account-scope', 'guild-a'), operationKey('account-scope', 'guild-b'));
+  assert.equal(operationIsCurrent(first), false);
+  assert.equal(operationIsCurrent(second), true);
+  endAccountOperation(second);
 });
 
 test('isolates bulk voice control from accounts managed by rotation in the same guild', () => {
