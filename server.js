@@ -112,6 +112,7 @@ const WATCHDOG_CONFIRMATION_MISSES = 2;
 const WATCHDOG_REPAIR_COOLDOWN_MS = Math.max(10000, Number(process.env.VOICE_WATCHDOG_COOLDOWN_MS || 30000));
 const watchdogObservations = new Map();
 const mediaDesired = new Map();
+const mediaRunGenerations = new Map();
 let watchdogRunning = false;
 let mediaStartTail = Promise.resolve();
 
@@ -553,6 +554,7 @@ function ensureSyntheticVideo() {
   }
 }
 function stopSyntheticStream(name, { leaveVoice = false } = {}) {
+  mediaRunGenerations.set(name, Number(mediaRunGenerations.get(name) || 0) + 1);
   const pendingRestart = pendingMediaRestarts.get(name);
   if (pendingRestart) {
     clearTimeout(pendingRestart);
@@ -702,23 +704,27 @@ async function startSyntheticStream(name, guildId, mediaKind = 'go-live', desire
   // account still owns an independent Streamer; only the start operations are
   // queued so the next account begins after the previous result is known.
   const previous = mediaStartTail;
+  const generation = Number(mediaRunGenerations.get(name) || 0);
   let release;
   mediaStartTail = new Promise((resolve) => { release = resolve; });
   await previous.catch(() => {});
   try {
-    const result = await startSyntheticStreamUnqueued(name, guildId, mediaKind, desiredState);
+    if (generation !== Number(mediaRunGenerations.get(name) || 0)) return { ok: false, cancelled: true, error: 'Media start cancelled by a newer account operation' };
+    const result = await startSyntheticStreamUnqueued(name, guildId, mediaKind, desiredState, generation);
     if (MEDIA_START_GAP_MS > 0) await new Promise((resolve) => setTimeout(resolve, MEDIA_START_GAP_MS));
     return result;
   } finally { release(); }
 }
-async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live', desiredState = null) {
+async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live', desiredState = null, generation = Number(mediaRunGenerations.get(name) || 0)) {
   const pendingRestart = pendingMediaRestarts.get(name);
   if (pendingRestart) { clearTimeout(pendingRestart); pendingMediaRestarts.delete(name); }
   const client = getClient(name);
+  const isCurrentRun = () => generation === Number(mediaRunGenerations.get(name) || 0);
   const saved = voiceSessions.get(sessionKey(name, guildId)) || {};
   const observed = client ? readGatewayVoiceState(client, guildId) : null;
   const session = { ...saved, ...(observed || {}), ...(desiredState || {}) };
   for (const key of ['selfMute', 'selfDeaf', 'selfVideo', 'selfStream']) if (typeof observed?.[key] !== 'boolean' && typeof saved?.[key] === 'boolean') session[key] = saved[key];
+  if (!isCurrentRun()) return { ok: false, cancelled: true, error: 'Media start cancelled by a newer account operation' };
   if (!client || !session?.channelId) return { ok: false, error: 'Account is not in a voice channel' };
   const existing = syntheticStreams.get(name);
   // Replacing a media transport must not send a voice leave for the account.
@@ -736,6 +742,7 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
     let stage = 'module';
     try {
       const { Streamer, playStream } = await loadVideoStreamModule();
+      if (!isCurrentRun()) return { ok: false, cancelled: true, error: 'Media start cancelled by a newer account operation' };
       logMediaEvent('info', 'media.module_ready', { account: name, guildId, channelId: session.channelId, mediaKind, attempt });
       // Each media run gets a fresh transport. Reusing a finished transport can
       // silently stop the next camera or Go Live session.
@@ -761,7 +768,8 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
       if (!streamer.voiceConnection) {
         stage = 'join-voice';
         logMediaEvent('info', 'media.join.start', { account: name, guildId, channelId: session.channelId, mediaKind, attempt });
-        await withTimeout(streamer.joinVoice(guildId, session.channelId), 10000, 'Dedicated media voice connection timed out after 10 seconds');
+      await withTimeout(streamer.joinVoice(guildId, session.channelId), 10000, 'Dedicated media voice connection timed out after 10 seconds');
+      if (!isCurrentRun()) throw new Error('Media start cancelled by a newer account operation');
         logMediaEvent('info', 'media.join.ready', { account: name, guildId, channelId: session.channelId, mediaKind, attempt });
       } else {
         logMediaEvent('info', 'media.join.reuse', { account: name, guildId, channelId: session.channelId, mediaKind, attempt });
@@ -774,6 +782,7 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
       const active = { streamer, controller, sourceProcess: source.sourceProcess, guildId, channelId: session.channelId, mediaKind, startedAt };
       syntheticStreams.set(name, active);
       const task = playStream(source.stream, streamer, { type: mediaKind, format: 'nut', width: 640, height: 360, frameRate: 15 }, controller.signal);
+      if (!isCurrentRun()) throw new Error('Media start cancelled by a newer account operation');
       stage = 'webrtc-ready';
       active.task = task;
       task.then(() => {
