@@ -750,6 +750,21 @@ async function joinMediaVoiceWithDiagnostics(client, streamer, guildId, channelI
     streamer?._gatewayEmitter?.off?.('VOICE_SERVER_UPDATE', onVoiceServer);
   }
 }
+async function resyncPrimaryVoiceForMedia(client, guildId, channelId, session) {
+  // A dedicated Streamer uses the same Discord gateway as the primary voice
+  // connection. Re-asserting the primary room immediately before the media
+  // handshake gives Discord a clean, current voice session/token pair instead
+  // of relying on a stale VOICE_STATE_UPDATE from the previous room.
+  const primary = await sendVoiceOpConfirmed(client, guildId, channelId, {
+    selfMute: !!session?.selfMute,
+    selfDeaf: !!session?.selfDeaf,
+    selfVideo: false,
+    selfStream: false,
+  }, 4500);
+  if (!primary.ok) throw new Error(`Primary voice resync failed: ${primary.error}`);
+  await new Promise((resolve) => setTimeout(resolve, 350));
+  return primary;
+}
 function waitForWebRtcReady(streamer, timeoutMs = 6000) {
   return withTimeout(new Promise((resolve) => {
     const startedAt = Date.now();
@@ -867,6 +882,7 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
       // transport; checking only the object existence can skip the handshake
       // and leave the media connection waiting until the timeout.
       stage = 'join-voice';
+      await resyncPrimaryVoiceForMedia(client, guildId, session.channelId, session);
       logMediaEvent('info', 'media.join.start', { account: name, guildId, channelId: session.channelId, mediaKind, attempt });
       logMediaEvent('info', 'media.join.waiting_gateway', { account: name, guildId, channelId: session.channelId, mediaKind, attempt, timeoutMs: MEDIA_JOIN_TIMEOUT_MS });
       await joinMediaVoiceWithDiagnostics(client, streamer, guildId, session.channelId, MEDIA_JOIN_TIMEOUT_MS, { account: name, mediaKind, attempt });
@@ -940,7 +956,12 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
       if (syntheticStreams.get(name)?.streamer === streamer) syntheticStreams.delete(name);
       if (createdStreamer && mediaStreamers.get(name) === streamer) mediaStreamers.delete(name);
       logMediaEvent('error', 'media.attempt_failed', { account: name, guildId, channelId: session.channelId, mediaKind, attempt, stage, error: error?.message || String(error) });
-      if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 250));
+      if (attempt < 2) {
+        // A missing session/token is a gateway ordering failure, not an FFmpeg
+        // failure. Give Discord time to publish the replacement voice server
+        // update before constructing the next dedicated transport.
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
     }
   }
   stopSyntheticStream(name);
