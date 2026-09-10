@@ -27,6 +27,13 @@ const PLAYING_LOG_FILE = path.join(DATA_DIR, 'playing-events.log');
 const CLIENT_BIND_FILE = path.join(DATA_DIR, 'client-binding.json');
 const MEDIA_LOG_FILE = path.join(DATA_DIR, 'media-events.log');
 fs.mkdirSync(DATA_DIR, { recursive: true });
+const BUILD_FILES = ['server.js', 'package.json', 'public/app.js', 'public/index.html', 'public/styles.css', 'public/playing.css'];
+function getBuildVersion() {
+  return crypto.createHash('sha256').update(BUILD_FILES.map((file) => {
+    const fullPath = path.join(__dirname, file);
+    try { const stat = fs.statSync(fullPath); return `${file}:${stat.size}:${stat.mtimeMs}`; } catch { return `${file}:missing`; }
+  }).join('|')).digest('hex').slice(0, 16);
+}
 
 function logMediaEvent(level, event, details = {}) {
   const record = { time: new Date().toISOString(), level, event, ...details };
@@ -1048,6 +1055,7 @@ function rateLimit(req, res, next) {
   return next();
 }
 app.use('/api', rateLimit, originGuard, requireAuth);
+app.get('/version', (_req, res) => res.json({ success: true, version: getBuildVersion() }));
 app.get('/api/health', (_req, res) => ok(res, { service: 'voice-studio', connected: clients.size, accounts: [...clients.entries()].map(([name, entry]) => accountHealth(name, entry)) }));
 const healthTimer = setInterval(() => {
   for (const [name, entry] of clients.entries()) {

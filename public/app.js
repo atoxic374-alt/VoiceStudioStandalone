@@ -17,10 +17,27 @@ const state = {
   overviewFilter: '', overviewSort: 'account',
   lastOperation: null, authenticated: false, mediaBusy: false, tasks: [],
   refreshPromise: null, liveEvents: null, liveRefreshTimer: null,
-  playingSessions: [], playingSessionsPromise: null,
+  playingSessions: [], playingSessionsPromise: null, buildVersion: '', updateNoticeShown: false,
 };
 
 let authPromptPromise = null;
+async function checkForUpdate() {
+  try {
+    const response = await fetch(`/version?ts=${Date.now()}`, { cache: 'no-store', credentials: 'same-origin' });
+    const payload = await response.json();
+    if (!payload?.version) return;
+    if (!state.buildVersion) { state.buildVersion = payload.version; return; }
+    if (payload.version !== state.buildVersion && !state.updateNoticeShown) {
+      state.updateNoticeShown = true;
+      $('#updateNotice')?.removeAttribute('hidden');
+    }
+  } catch {}
+}
+function initUpdateNotice() {
+  $('#updateReloadButton')?.addEventListener('click', () => window.location.reload());
+  checkForUpdate();
+  setInterval(checkForUpdate, 30000);
+}
 function requestAuthentication(message = 'أدخل كلمة مرور المساحة للمتابعة. لا يمكن استخدام الموقع قبل المصادقة.') {
   if (state.authenticated) return Promise.resolve(true);
   if (authPromptPromise) return authPromptPromise;
@@ -795,13 +812,13 @@ function initCustomSelects() {
   document.addEventListener('click', (event) => { if (!event.target.closest('.custom-select')) document.querySelectorAll('.custom-select.is-open').forEach((item) => item.classList.remove('is-open')); });
 }
 function init() {
-  initTheme(); initLanguage(); initNavigation(); initActivity(); initPlaying(); initCustomSelects();
+  initTheme(); initLanguage(); initNavigation(); initActivity(); initPlaying(); initCustomSelects(); initUpdateNotice();
   $('#profilesPrevButton')?.addEventListener('click', () => { state.profilesPage -= 1; renderProfiles(state.clients); });
   $('#profilesNextButton')?.addEventListener('click', () => { state.profilesPage += 1; renderProfiles(state.clients); });
   $('#serverSelect')?.addEventListener('change', (event) => { state.selectedGuildId = event.target.value; state.selectedTarget = null; renderChannels(); }); $('#roomSearch')?.addEventListener('input', () => { state.selectedTarget = null; renderChannels(); });
   $('#connectButton').addEventListener('click', connect); $('#bulkConnectButton').addEventListener('click', bulkConnect); $('#disconnectButton').addEventListener('click', openDisconnect); $('#refreshButton').addEventListener('click', refreshChannels); $('#accountSelect').addEventListener('change', async (event) => { state.selectedAccount = event.target.value; await loadGuilds(); await loadAutomationCatalog(); }); $('#automationGuild').addEventListener('change', renderAutomationChannels); $('#automationChannel').addEventListener('change', renderTargetAccounts); $('#rotationRoomFilter').addEventListener('input', (event) => { state.rotationRoomFilter = event.target.value; state.rotationRoomPage = 0; renderRotationRooms(); }); $('#rotationPrevButton').addEventListener('click', () => { state.rotationRoomPage -= 1; renderRotationRooms(); }); $('#rotationNextButton').addEventListener('click', () => { state.rotationRoomPage += 1; renderRotationRooms(); }); $('#bulkJoinButton').addEventListener('click', bulkJoinSelected); $('#channelSelect').addEventListener('change', handleChannelChange); $('#joinButton').addEventListener('click', join); $('#joinAllButton').addEventListener('click', joinAll); $('#leaveButton').addEventListener('click', leave); $('#cameraButton')?.addEventListener('click', toggleCamera); $('#screenButton')?.addEventListener('click', toggleScreen); $('#startRotationButton').addEventListener('click', startRotation); $('#startCycleButton').addEventListener('click', startCycle); $('#stopMediaButton')?.addEventListener('click', () => stopCurrentStream()); $('#applyBulkStateButton')?.addEventListener('click', applyBulkState); $('#overviewFilter')?.addEventListener('input', (event) => { state.overviewFilter = event.target.value; refreshSessions(); }); $('#overviewSort')?.addEventListener('change', (event) => { state.overviewSort = event.target.value; refreshSessions(); }); document.querySelectorAll('.state-button').forEach((button) => button.addEventListener('click', () => applyState(button.dataset.state))); document.querySelectorAll('#statePicker input').forEach((input) => input.addEventListener('change', () => input.closest('.state-option')?.classList.toggle('is-selected', input.checked)));
   $('#operationClose').addEventListener('click', () => { $('#operationModal').hidden = true; $('.operation-loader')?.classList.remove('is-done', 'is-error'); }); $('#leaveAllButton')?.addEventListener('click', openLeaveAll); $('#confirmLeaveButton')?.addEventListener('click', leaveAllSelected); $('#cancelLeaveButton')?.addEventListener('click', () => { $('#leaveModal').hidden = true; }); $('#confirmDisconnectButton')?.addEventListener('click', disconnectSelected); $('#cancelDisconnectButton')?.addEventListener('click', () => { $('#disconnectModal').hidden = true; }); $('#disconnectModalClose')?.addEventListener('click', () => { $('#disconnectModal').hidden = true; }); window.addEventListener('beforeunload', () => stopCurrentStream({ updateDiscord: false }));
   document.addEventListener('change', (event) => { if (event.target.closest('#automationAccounts')) updateQuickStateButtons(); });
-  loadClients().then(() => renderPlayingAccounts()).catch(() => {}); refreshSessions(); loadTasks(); loadPlayingSessions(); connectLiveEvents(); setInterval(refreshSessions, 15000); setInterval(loadTasks, 15000); setInterval(loadPlayingSessions, 15000);
+  loadClients().then(() => renderPlayingAccounts()).catch(() => {}); refreshSessions(); loadTasks(); loadPlayingSessions(); connectLiveEvents(); initUpdateNotice(); setInterval(refreshSessions, 15000); setInterval(loadTasks, 15000); setInterval(loadPlayingSessions, 15000);
 }
 init();
