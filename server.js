@@ -1317,9 +1317,14 @@ app.post('/api/voice/state', async (req, res) => {
       selfStream: selfStream !== undefined ? selfStream : !!current.selfStream,
     };
     if (next.selfDeaf && (next.selfVideo || next.selfStream)) { endAccountOperation(operation); return { name, ok: false, error: 'Video or screen share cannot be enabled while deafened' }; }
+    // Use the same settle window as state rotation before touching media. The
+    // account lock above prevents concurrent operations for this account, and
+    // rotationControlledAccounts prevents Quick controls from racing a room
+    // rotation in the same guild.
+    await waitForMediaSettle(next, current);
     let result;
-    if (next.selfStream && !syntheticStreams.has(name)) result = await startSyntheticStream(name, guildId, 'go-live');
-    else if (next.selfVideo && !syntheticStreams.has(name)) result = await startSyntheticStream(name, guildId, 'camera');
+    if (next.selfStream) result = await startSyntheticStream(name, guildId, 'go-live');
+    else if (next.selfVideo) result = await startSyntheticStream(name, guildId, 'camera');
     else result = await sendVoiceOpConfirmed(client, guildId, current.channelId, next, 6000);
     if (!operationIsCurrent(operation)) { endAccountOperation(operation); return { name, ok: false, stale: true, error: 'Voice operation was superseded by a newer request' }; }
     if (result.ok) {
