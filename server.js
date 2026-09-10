@@ -970,6 +970,11 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
         selfVideo: false,
       }), MEDIA_JOIN_TIMEOUT_MS, 'Primary voice connection did not become ready');
       logMediaEvent('info', 'media.primary_voice_ready', { account: name, guildId, channelId: session.channelId, mediaKind, source: 'voice.joinChannel' });
+      // Some discord.js-selfbot versions update the manager's connection
+      // property after the promise resolves instead of returning the exact
+      // object stored there. Always re-read the canonical connection before
+      // selecting the media transport.
+      primaryConnection = client.voice?.connection || primaryConnection;
     } catch (error) {
       logMediaEvent('warn', 'media.primary_voice_unavailable', { account: name, guildId, channelId: session.channelId, mediaKind, error: error?.message || String(error) });
       primaryConnection = null;
@@ -979,8 +984,8 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
   // second Streamer voice connection on the same gateway is what produces the
   // observed state=184/token=missing timeout: Discord can deliver the state
   // event while omitting VOICE_SERVER_UPDATE for the competing transport.
-    if (primaryConnection && String(voiceConnectionChannelId(primaryConnection)) === String(session.channelId)
-        && typeof primaryConnection.createStreamConnection === 'function') {
+    if (primaryConnection && typeof primaryConnection.createStreamConnection === 'function'
+        && (!voiceConnectionChannelId(primaryConnection) || String(voiceConnectionChannelId(primaryConnection)) === String(session.channelId))) {
       logMediaEvent('info', 'media.primary_transport_selected', { account: name, guildId, channelId: session.channelId, mediaKind });
       const primaryResult = await startBuiltInGoLive(name, guildId, session, mediaKind, isCurrentRun);
     if (primaryResult.ok) {
