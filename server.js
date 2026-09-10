@@ -744,6 +744,39 @@ function stopTasksForAccount(name) {
   }
   if (changed) persistAutomationTasks();
 }
+function markTokenChanged(name, token, error) {
+  stopTasksForAccount(name);
+  playingSessions.delete(name);
+  persistPlayingSessions();
+  stopSyntheticStream(name, { leaveVoice: true });
+  removeSessionsForAccount(name);
+  const previous = clients.get(name);
+  try { previous?.client?.destroy?.(); } catch {}
+  clients.set(name, {
+    client: null,
+    token,
+    savedAt: previous?.savedAt || Date.now(),
+    connectedAt: previous?.connectedAt || null,
+    lastSeenAt: Date.now(),
+    lastError: `Token changed or invalid: ${error?.message || String(error || 'Login failed')}`,
+    invalidToken: true,
+  });
+  persistConnectedAccounts();
+  emitLive('account.health.changed', { account: accountHealth(name, clients.get(name)) });
+}
+async function connectOneWithRetry(token, name) {
+  let lastError;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try { return await connectOne(token, name); }
+    catch (error) {
+      lastError = error;
+      if (attempt === 0) await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+  }
+  const finalName = String(name || '').trim().slice(0, 48) || `account-${clients.size + 1}`;
+  markTokenChanged(finalName, String(token || '').trim(), lastError);
+  throw new Error(`Token changed or invalid after retry: ${lastError?.message || 'Login failed'}`);
+}
 function rotationControlledAccounts(guildId) {
   const controlled = new Set();
   for (const task of rotations.values()) {
@@ -964,6 +997,7 @@ function removeSessionsForAccount(name, guildId) {
 }
 function reconcileVoiceSessions() {
   for (const [name, entry] of clients.entries()) {
+    if (!entry?.client) continue;
     for (const session of [...voiceSessions.values()].filter((item) => item.name === name)) {
       const actual = readGatewayVoiceState(entry.client, session.guildId);
       if (!actual || !actual.channelId) {
@@ -1024,7 +1058,7 @@ async function connectOne(token, name) {
   let finalName = String(name || '').trim().slice(0, 48);
   const normalizedToken = token.trim();
   const existing = [...clients.entries()].find(([, entry]) => entry.token === normalizedToken);
-  if (existing) {
+  if (existing?.[1]?.client) {
     const existingClient = existing[1].client;
     return { name: existing[0], username: existingClient.user?.tag || existingClient.user?.username || existing[0], displayName: existingClient.user?.globalName || existingClient.user?.username || existing[0], nickname: existingClient.user?.globalName || existingClient.user?.username || existing[0], id: existingClient.user?.id || null, avatar: existingClient.user?.displayAvatarURL?.({ size: 128 }) || null, alreadyConnected: true };
   }
@@ -1034,7 +1068,7 @@ async function connectOne(token, name) {
   if (clients.has(finalName)) {
     stopTasksForAccount(finalName);
     stopSyntheticStream(finalName, { leaveVoice: true });
-    try { await clients.get(finalName).client.destroy(); } catch {}
+    try { await clients.get(finalName)?.client?.destroy?.(); } catch {}
     clients.delete(finalName);
   }
   const entry = { client, token: normalizedToken, savedAt: Date.now(), connectedAt: Date.now(), lastSeenAt: Date.now(), lastError: null };
@@ -1147,11 +1181,11 @@ app.get('/api/accounts/health', (_req, res) => ok(res, { accounts: [...clients.e
 app.get('/api/discord/clients', (_req, res) => {
   const sessionByName = new Map([...voiceSessions.values()].map((session) => [session.name, session]));
   return ok(res, { clients: [...clients.entries()].map(([name, entry]) => {
-    const user = entry.client.user;
+    const user = entry.client?.user;
     const savedVoice = sessionByName.get(name) || null;
-    const actualVoice = readGatewayVoiceState(entry.client, savedVoice?.guildId || '') || null;
+    const actualVoice = entry.client ? readGatewayVoiceState(entry.client, savedVoice?.guildId || '') || null : null;
     const voice = actualVoice?.channelId ? { ...(savedVoice || {}), ...actualVoice, name } : savedVoice;
-    const guild = voice ? entry.client.guilds?.cache?.get?.(voice.guildId) : null;
+    const guild = voice && entry.client ? entry.client.guilds?.cache?.get?.(voice.guildId) : null;
     const member = guild?.members?.cache?.get?.(user?.id);
     const channel = voice ? guild?.channels?.cache?.get?.(voice.channelId) : null;
     return {
@@ -1161,14 +1195,14 @@ app.get('/api/discord/clients', (_req, res) => {
       nickname: member?.displayName || user?.globalName || user?.username || name,
       id: user?.id || null,
       avatar: user?.displayAvatarURL?.({ size: 128 }) || null,
-      status: user?.presence?.status || 'online',
+      status: entry.invalidToken ? 'offline' : (user?.presence?.status || 'online'),
       health: accountHealth(name, entry),
       voice: voice ? { guildId: voice.guildId, guildName: guild?.name || voice.guildId, guildIcon: guild?.iconURL?.({ size: 64 }) || null, channelId: voice.channelId, channelName: channel?.name || voice.channelId, selfMute: !!voice.selfMute, selfDeaf: !!voice.selfDeaf, selfVideo: !!voice.selfVideo, selfStream: !!voice.selfStream } : null,
     };
   }) });
 });
 app.post('/api/discord/connect', async (req, res) => {
-  try { return ok(res, await connectOne(req.body?.token, req.body?.name)); }
+  try { return ok(res, await connectOneWithRetry(req.body?.token, req.body?.name)); }
   catch (error) { return fail(res, error, 400); }
 });
 app.post('/api/discord/connect-bulk', async (req, res) => {
@@ -1180,10 +1214,9 @@ app.post('/api/discord/connect-bulk', async (req, res) => {
     while (cursor < items.length) {
       const index = cursor++;
       const item = items[index] || {};
-      results[index] = await withResultRetry(async () => {
-        try { return { ok: true, ...(await connectOne(item.token, item.name || `account-${index + 1}`)) }; }
-        catch (error) { return { ok: false, name: item.name || `account-${index + 1}`, error: error.message }; }
-      });
+      results[index] = await connectOneWithRetry(item.token, item.name || `account-${index + 1}`)
+        .then((result) => ({ ok: true, ...result }))
+        .catch((error) => ({ ok: false, name: item.name || `account-${index + 1}`, error: error.message }));
     }
   };
   await Promise.all(Array.from({ length: Math.min(3, items.length) }, worker));
@@ -1195,7 +1228,7 @@ app.post('/api/discord/disconnect', async (req, res) => {
   if (!entry) return ok(res);
   stopTasksForAccount(name);
   stopSyntheticStream(name, { leaveVoice: true });
-  try { await entry.client.destroy(); } catch {}
+  try { await entry.client?.destroy?.(); } catch {}
   clients.delete(name);
   persistConnectedAccounts();
   emitLive('account.disconnected', { name });
@@ -1210,7 +1243,7 @@ app.post('/api/discord/disconnect-bulk', async (req, res) => {
       stopTasksForAccount(name);
       stopSyntheticStream(name, { leaveVoice: true });
       removeSessionsForAccount(name);
-      try { await entry.client.destroy(); } catch (error) { return { name, ok: false, error: error.message }; }
+      try { await entry.client?.destroy?.(); } catch (error) { return { name, ok: false, error: error.message }; }
       clients.delete(name);
       emitLive('account.disconnected', { name });
       return { name, ok: true };
@@ -1220,7 +1253,7 @@ app.post('/api/discord/disconnect-bulk', async (req, res) => {
 });
 app.post('/api/discord/disconnect-all', async (_req, res) => {
   for (const name of clients.keys()) { stopTasksForAccount(name); stopSyntheticStream(name, { leaveVoice: true }); }
-  for (const entry of clients.values()) { try { await entry.client.destroy(); } catch {} }
+  for (const entry of clients.values()) { try { await entry.client?.destroy?.(); } catch {} }
   clients.clear();
   persistConnectedAccounts();
   emitLive('account.disconnected-all');
@@ -1255,6 +1288,7 @@ app.get('/api/voice/sessions', (req, res) => {
   const sessionsByName = new Map();
   for (const session of voiceSessions.values()) { if (!sessionsByName.has(session.name)) sessionsByName.set(session.name, []); sessionsByName.get(session.name).push(session); }
   for (const [name, entry] of clients.entries()) {
+    if (!entry?.client) continue;
     for (const session of (sessionsByName.get(name) || [])) {
       const actual = readGatewayVoiceState(entry.client, session.guildId);
       if (actual && !actual.channelId) { removeSessionsForAccount(name, session.guildId); continue; }
@@ -1277,8 +1311,8 @@ app.get('/api/voice/target-accounts', (req, res) => {
   const channelId = String(req.query?.channelId || '').trim();
   if (!guildId || !channelId) return fail(res, new Error('guildId and channelId are required'), 400);
   const accounts = [...clients.entries()].map(([name, entry]) => {
-    const user = entry.client.user;
-    const guild = entry.client.guilds?.cache?.get?.(guildId);
+    const user = entry.client?.user;
+    const guild = entry.client?.guilds?.cache?.get?.(guildId);
     const channel = guild?.channels?.cache?.get?.(channelId);
     const member = guild?.members?.cache?.get?.(user?.id);
     const session = voiceSessions.get(sessionKey(name, guildId));
@@ -1297,6 +1331,7 @@ app.get('/api/playing/sessions', (_req, res) => ok(res, { sessions: [...playingS
 app.get('/api/playing/channels', (req, res) => {
   const channels = new Map();
   for (const [account, entry] of clients.entries()) {
+    if (!entry?.client) continue;
     for (const guild of entry.client.guilds?.cache?.values?.() || []) {
       for (const channel of guild.channels?.cache?.values?.() || []) {
         const isText = channel?.isText?.() || [0, 5, 10, 11, 12, 15].includes(Number(channel?.type));
