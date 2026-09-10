@@ -553,6 +553,12 @@ function ensureSyntheticVideo() {
   }
 }
 function stopSyntheticStream(name, { leaveVoice = false } = {}) {
+  const pendingRestart = pendingMediaRestarts.get(name);
+  if (pendingRestart) {
+    clearTimeout(pendingRestart);
+    pendingMediaRestarts.delete(name);
+  }
+  mediaRestartAttempts.delete(name);
   const active = syntheticStreams.get(name);
   if (active) {
     try { active.controller?.abort?.(); } catch {}
