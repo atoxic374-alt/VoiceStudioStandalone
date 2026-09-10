@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
-const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts } = require('../server');
+const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId } = require('../server');
 
 function fakeClient({ ready = true, confirms = true } = {}) {
   const ws = new EventEmitter();
@@ -29,6 +29,12 @@ test('sends a complete OP4 payload for camera and screen share state', () => {
   const result = sendVoiceOp(client, 'guild-1', 'channel-1', { selfMute: false, selfDeaf: false, selfVideo: true, selfStream: true });
   assert.deepEqual(result, { ok: true });
   assert.deepEqual(getSent().d, { guild_id: 'guild-1', channel_id: 'channel-1', self_mute: false, self_deaf: false, self_video: true, self_stream: true });
+});
+
+test('detects the active voice channel from every supported connection shape', () => {
+  assert.equal(voiceConnectionChannelId({ channel: { id: 'channel-a' } }), 'channel-a');
+  assert.equal(voiceConnectionChannelId({ channelId: 'channel-b' }), 'channel-b');
+  assert.equal(voiceConnectionChannelId({ channel_id: 'channel-c' }), 'channel-c');
 });
 
 test('confirms a voice state from the gateway', async () => {

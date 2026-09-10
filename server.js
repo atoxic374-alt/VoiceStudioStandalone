@@ -890,7 +890,7 @@ async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live',
   const target = validateMediaTarget(client, guildId, session.channelId);
   if (!target.ok) return { ok: false, error: target.error };
   const connection = client?.voice?.connection;
-  if (!connection || connection.channel?.id !== session.channelId) return { ok: false, error: 'The account has no active voice connection' };
+  if (!connection || voiceConnectionChannelId(connection) !== String(session.channelId)) return { ok: false, error: 'The account has no active voice connection' };
   const source = createBlackMediaSource();
   let streamConnection;
   const signaling = waitForDiscordStreamEvents(client, guildId, session.channelId, 8000);
@@ -916,6 +916,9 @@ async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live',
     try { streamConnection?.disconnect?.(); } catch {}
     return { ok: false, error: error.message || 'Unable to start Go Live' };
   }
+}
+function voiceConnectionChannelId(connection) {
+  return connection?.channel?.id ?? connection?.channelId ?? connection?.channel_id ?? null;
 }
 async function startSyntheticStream(name, guildId, mediaKind = 'go-live', desiredState = null) {
   // Serialize the full media-start operation across all accounts. Each
@@ -958,8 +961,8 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
   const channel = client.guilds?.cache?.get?.(guildId)?.channels?.cache?.get?.(session.channelId);
   if (!channel) return { ok: false, error: 'Voice channel is not available for streaming' };
   let primaryConnection = client.voice?.connection;
-  if ((!primaryConnection || String(primaryConnection.channel?.id) !== String(session.channelId))
-      && typeof client.voice?.joinChannel === 'function') {
+    if ((!primaryConnection || String(voiceConnectionChannelId(primaryConnection)) !== String(session.channelId))
+        && typeof client.voice?.joinChannel === 'function') {
     try {
       primaryConnection = await withTimeout(client.voice.joinChannel(channel, {
         selfMute: !!session.selfMute,
@@ -976,9 +979,10 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
   // second Streamer voice connection on the same gateway is what produces the
   // observed state=184/token=missing timeout: Discord can deliver the state
   // event while omitting VOICE_SERVER_UPDATE for the competing transport.
-  if (primaryConnection?.channel?.id === session.channelId
-      && typeof primaryConnection.createStreamConnection === 'function') {
-    const primaryResult = await startBuiltInGoLive(name, guildId, session, mediaKind, isCurrentRun);
+    if (primaryConnection && String(voiceConnectionChannelId(primaryConnection)) === String(session.channelId)
+        && typeof primaryConnection.createStreamConnection === 'function') {
+      logMediaEvent('info', 'media.primary_transport_selected', { account: name, guildId, channelId: session.channelId, mediaKind });
+      const primaryResult = await startBuiltInGoLive(name, guildId, session, mediaKind, isCurrentRun);
     if (primaryResult.ok) {
       mediaDesired.set(name, { guildId, channelId: session.channelId, mediaKind });
       mediaRestartAttempts.delete(name);
@@ -988,6 +992,7 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
     }
     return primaryResult;
   }
+  logMediaEvent('warn', 'media.primary_transport_unavailable', { account: name, guildId, channelId: session.channelId, mediaKind, hasConnection: !!primaryConnection, connectionChannelId: voiceConnectionChannelId(primaryConnection), hasCreateStreamConnection: typeof primaryConnection?.createStreamConnection === 'function' });
   let lastError;
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     let streamer;
@@ -2391,4 +2396,4 @@ if (require.main === module) {
   app.listen(PORT, '0.0.0.0', () => { console.log(`Voice Studio listening on http://localhost:${PORT}`); setInterval(() => { try { reconcileVoiceSessions(); } catch (error) { console.warn('[voice] session reconciliation failed:', error.message); } }, 3000).unref?.(); startVoiceWatchdog(); restoreSavedAccounts().then(() => restoreAutomationTasks()).catch((error) => console.warn('[restore] restore failed:', error.message)); });
 }
 
-module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck };
+module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck };
