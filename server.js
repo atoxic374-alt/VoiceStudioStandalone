@@ -1286,13 +1286,15 @@ function rotationPreferredChannel(name, task, index = 0, randomTarget = null) {
 async function moveRotationAccount(name, task, preferredChannelId, opts = {}) {
   const ids = [...(task.channels || [])];
   if (!ids.length) return { name, ok: false, error: 'No rotation rooms configured' };
+  // Room rotation owns membership only. Media flags are intentionally omitted
+  // here because the state cycle owns Stream/Camera and restarting a media
+  // transport inside a room move can block the move on VOICE_SERVER_UPDATE.
+  const roomState = { selfMute: !!opts.selfMute, selfDeaf: !!opts.selfDeaf };
   const start = Math.max(0, ids.indexOf(preferredChannelId));
   const ordered = [...ids.slice(start), ...ids.slice(0, start)];
   let last = { name, ok: false, error: 'All rotation rooms failed', attemptedChannels: [] };
   const wasOutsideRoom = !voiceSessions.has(sessionKey(name, task.guildId));
-  const mediaVariants = [opts];
-  if (opts.selfStream === true) mediaVariants.push({ ...opts, selfStream: false, selfVideo: true });
-  else if (opts.selfVideo === true) mediaVariants.push({ ...opts, selfVideo: false, selfStream: true });
+  const mediaVariants = [roomState];
   for (const channelId of ordered) {
     for (let mediaIndex = 0; mediaIndex < mediaVariants.length; mediaIndex += 1) {
       const variant = mediaVariants[mediaIndex];
