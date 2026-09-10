@@ -1789,7 +1789,9 @@ async function moveAccountLocked(name, guildId, channelId, opts = {}) {
       endAccountOperation(operation);
       return { name, ok: true, alreadyIn: true, channelId };
     }
-    const desired = normalizeVoiceState({ ...(current || {}), ...opts });
+    // Moving rooms is deliberately a voice-membership operation only. Media
+    // state is re-applied by the independent state-cycle task after the move.
+    const desired = normalizeVoiceState({ ...(current || {}), ...opts, selfVideo: false, selfStream: false });
     // The primary discord.js voice state owns room membership. A media
     // Streamer must be torn down without sending its own OP4 leave request;
     // doing so races the move below and can suppress VOICE_SERVER_UPDATE for
@@ -1826,24 +1828,7 @@ async function moveAccountLocked(name, guildId, channelId, opts = {}) {
       }
       for (const key of [...voiceSessions.keys()]) if (key.startsWith(`${name}__`) && key !== sessionKey(name, guildId)) voiceSessions.delete(key);
       const actual = confirmed;
-      upsertSession(name, guildId, channelId, { ...desired, ...(actual || {}), selfVideo: desired.selfVideo, selfStream: desired.selfStream });
-      if (desired.selfStream || desired.selfVideo) {
-        // Discord sends the voice-state and voice-server events asynchronously.
-        // Let the primary voice connection settle after a room move before a
-        // dedicated Streamer starts its second voice handshake. Without this,
-        // the two OP4 requests can race and the media Streamer may receive the
-        // state event but miss VOICE_SERVER_UPDATE entirely.
-        await waitForMediaSettle(desired, current);
-        const media = await startSyntheticStream(name, guildId, desired.selfStream ? 'go-live' : 'camera');
-        // Room membership is already confirmed at this point. A media
-        // handshake can fail independently (for example when Discord drops
-        // VOICE_SERVER_UPDATE); do not report the room move as failed or the
-        // rotation will immediately try another room and appear stuck.
-        if (!media.ok) {
-          endAccountOperation(operation);
-          return { name, ok: true, channelId, mediaOk: false, mediaError: media.error, warning: `Room joined; media start failed: ${media.error}` };
-        }
-      }
+      upsertSession(name, guildId, channelId, { ...desired, ...(actual || {}), selfVideo: false, selfStream: false });
     }
     endAccountOperation(operation);
     return { name, ok: result.ok, error: result.ok ? null : result.error, channelId };
