@@ -98,7 +98,6 @@ const liveEvents = new EventEmitter();
 liveEvents.setMaxListeners(0);
 const accountLocks = new Map();
 const MEDIA_SETTLE_DELAY_MS = 4000;
-const ROTATION_PHASE_GAP_MS = 120000;
 const SYNTHETIC_VIDEO_FILE = path.join(DATA_DIR, 'synthetic-stream-black-v2.mp4');
 
 function ok(res, payload = {}) { return res.json({ success: true, ...payload }); }
@@ -766,7 +765,7 @@ function operationIsCurrent(operation) { return accountOperations.get(operation.
 function endAccountOperation(operation) { if (accountOperations.get(operation.key) === operation) accountOperations.delete(operation.key); }
 function taskConflict(accounts, guildId, type) {
   const conflicts = [];
-  const activeTasks = type === 'rotation' ? [...rotations.values(), ...stateCycles.values()] : [...stateCycles.values()];
+  const activeTasks = type === 'rotation' ? rotations.values() : stateCycles.values();
   for (const task of activeTasks) {
     if (String(task.guildId) !== String(guildId)) continue;
     const overlap = accounts.filter((name) => (task.accounts || []).includes(name));
@@ -775,9 +774,6 @@ function taskConflict(accounts, guildId, type) {
   return conflicts;
 }
 function taskAccountConflicts(accounts, guildId, type) { return taskConflict(accounts, guildId, type).flatMap((item) => item.accounts); }
-function linkedRoomRotation(accounts, guildId) {
-  return [...rotations.values()].find((task) => String(task.guildId) === String(guildId) && (task.accounts || []).some((name) => accounts.includes(name))) || null;
-}
 function getClient(name) {
   const entry = clients.get(String(name || ''));
   return entry?.client || null;
@@ -1503,12 +1499,6 @@ app.post('/api/voice/rotation/start', async (req, res) => {
     } finally { task.running = false; }
   }, delay);
   rotations.set(id, task);
-  for (const stateTask of stateCycles.values()) {
-    if (String(stateTask.guildId) !== String(guildId) || !(stateTask.accounts || []).some((name) => accounts.includes(name))) continue;
-    stateTask.phaseRoomId = id;
-    stateTask.phaseGapMs = ROTATION_PHASE_GAP_MS;
-    stateTask.nextAt = Number(task.nextAt || Date.now() + delay) + ROTATION_PHASE_GAP_MS;
-  }
   persistAutomationTasks();
   return ok(res, { id, started: true, initial, summary: summary(initial) });
 });
@@ -1532,16 +1522,12 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
   const id = crypto.randomUUID();
   const task = { id, type: 'cycle', accounts, guildId, states, intervalMs: delay, currentIdx: 0, runToken: 0, startedAt: Date.now(), nextAt: Date.now() + delay };
   task.running = false; task.active = true;
-  const linkedRoom = linkedRoomRotation(accounts, guildId);
-  if (linkedRoom) { task.phaseRoomId = linkedRoom.id; task.phaseGapMs = ROTATION_PHASE_GAP_MS; task.nextAt = Number(linkedRoom.nextAt || Date.now() + delay) + ROTATION_PHASE_GAP_MS; }
-  task.lastResults = linkedRoom
-    ? task.accounts.map((name) => ({ name, ok: true, scheduled: true, reason: 'State rotation scheduled after room rotation' }))
-    : await mapWithConcurrency(task.accounts, 8, (name) => withResultRetry(() => withAccountLock(name, async () => {
+  task.lastResults = await mapWithConcurrency(task.accounts, 8, (name) => withResultRetry(() => withAccountLock(name, async () => {
     const current = voiceSessions.get(sessionKey(name, task.guildId));
     const client = getClient(name);
     if (!current || !client) return recordTaskResult(task, { name, ok: false, error: !current ? 'Account is not currently in a voice channel' : 'Account is not connected' });
     const operation = beginAccountOperation(name, task.guildId, 'cycle');
-    const next = { ...current, ...normalizeVoiceState(task.states[0]), selfMute: task.states[0].selfMute === undefined ? !!current.selfMute : !!task.states[0].selfMute };
+    const next = { ...current, ...mergeVoiceState(current, task.states[0]) };
     if (next.selfDeaf && (next.selfVideo || next.selfStream)) { endAccountOperation(operation); return { name, ok: false, error: 'Invalid deafened media state' }; }
     await waitForMediaSettle(next, current);
     const result = (next.selfStream || next.selfVideo)
@@ -1552,7 +1538,6 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
     endAccountOperation(operation);
     return { name, ok: result.ok, error: result.ok ? null : result.error };
   })));
-  if (!linkedRoom) task.nextAt = Date.now() + task.intervalMs;
   const runStateCycle = async () => {
     if (task.nextAt > Date.now()) { if (task.active) task.timer = setTimeout(runStateCycle, task.nextAt - Date.now()); return; }
     if (!task.active || task.running) return;
@@ -1582,8 +1567,7 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
         recordTaskResult(task, { name, ok: result.ok, error: result.ok ? null : result.error });
         endAccountOperation(operation);
       })));
-      const roomTask = task.phaseRoomId ? rotations.get(task.phaseRoomId) : null;
-      task.nextAt = roomTask ? Number(roomTask.nextAt || Date.now() + task.intervalMs) + Number(task.phaseGapMs || 0) : Date.now() + task.intervalMs;
+      task.nextAt = Date.now() + task.intervalMs;
       persistAutomationTasks();
       emitLive('task.completed', { id: task.id, taskType: 'cycle', nextAt: task.nextAt, currentIdx: task.currentIdx, results: task.lastResults });
     } finally { task.running = false; if (task.active) task.timer = setTimeout(runStateCycle, Math.max(1000, task.nextAt - Date.now())); }
@@ -1653,7 +1637,7 @@ async function restoreAutomationTasks() {
       if (task.running) { task.timer = setTimeout(runStateCycle, 1000); return; }
       task.running = true;
       task.currentIdx = (task.currentIdx + 1) % task.states.length;
-      const state = normalizeVoiceState(task.states[task.currentIdx]);
+      const state = task.states[task.currentIdx];
       try {
         task.lastResults = await mapWithConcurrency(task.accounts, 8, (name) => withResultRetry(() => withAccountLock(name, async () => {
           const current = voiceSessions.get(sessionKey(name, task.guildId)); const client = getClient(name);
@@ -1669,8 +1653,7 @@ async function restoreAutomationTasks() {
         })));
       } finally {
         task.running = false;
-        const roomTask = task.phaseRoomId ? rotations.get(task.phaseRoomId) : null;
-        task.nextAt = roomTask ? Number(roomTask.nextAt || Date.now() + task.intervalMs) + Number(task.phaseGapMs || 0) : Date.now() + task.intervalMs;
+        task.nextAt = Date.now() + task.intervalMs;
         persistAutomationTasks();
         if (task.active) task.timer = setTimeout(runStateCycle, Math.max(1000, task.nextAt - Date.now()));
       }
