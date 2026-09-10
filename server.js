@@ -291,7 +291,7 @@ async function sendPlayingPhrase(session, canContinue = () => true) {
   session.lastAction = { button: step.button, phrase, noResponse: !!click.noResponse, at: Date.now() };
   return { ok: true, button: step.button, phrase, noResponse: !!click.noResponse };
 }
-function schedulePlaying(session) {
+function schedulePlaying(session, restoreDelayMs = null) {
   const run = async () => {
     if (!session.active || !playingSessions.has(session.account)) return;
     const runToken = Number(session.runToken || 0);
@@ -302,7 +302,8 @@ function schedulePlaying(session) {
     finally { session.running = false; if (session.lastResult?.fatal) { session.active = false; session.status = 'error'; logPlayingEvent('paused', { account: session.account, reason: session.lastResult.error }); } else if (session.lastResult?.waiting) session.status = 'waiting'; session.nextAt = Date.now() + session.intervalMs; if (session.active && canContinue()) session.timer = setTimeout(run, session.intervalMs); persistPlayingSessions(); }
   };
   session.runToken = Number(session.runToken || 0);
-  session.timer = setTimeout(run, Math.max(0, Number(session.startDelayMs || 250)));
+  const delay = restoreDelayMs === null ? Number(session.startDelayMs || 250) : restoreDelayMs;
+  session.timer = setTimeout(run, Math.max(0, delay));
 }
 for (const saved of loadPlayingSessions()) {
   if (saved?.account && saved?.channelId && Array.isArray(saved.steps) && saved.steps.length) {
@@ -310,7 +311,11 @@ for (const saved of loadPlayingSessions()) {
     // after a server restart; only an explicit Start/Restart action may activate it again.
     const session = { ...saved, active: saved.active === true, running: false, timer: null, runToken: Number(saved.runToken || 0) };
     playingSessions.set(playingKey(session.account), session);
-    if (session.active) schedulePlaying(session);
+    if (session.active) {
+      const savedNextAt = Number(session.nextAt);
+      const restoreDelay = Number.isFinite(savedNextAt) ? savedNextAt - Date.now() : 250;
+      schedulePlaying(session, restoreDelay);
+    }
   }
 }
 function startAllPlayingSessions(reason = 'discord-start') {
