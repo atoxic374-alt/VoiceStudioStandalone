@@ -144,6 +144,13 @@ function cleanAccounts(accounts) {
 function normalizeVoiceState(state = {}) {
   return { selfMute: !!state.selfMute, selfDeaf: !!state.selfDeaf, selfVideo: !!state.selfVideo, selfStream: !!state.selfStream };
 }
+function mergeVoiceState(current = {}, requested = {}) {
+  const merged = { ...current };
+  for (const key of ['selfMute', 'selfDeaf', 'selfVideo', 'selfStream']) {
+    if (typeof requested?.[key] === 'boolean') merged[key] = requested[key];
+  }
+  return normalizeVoiceState(merged);
+}
 function persistAutomationTasks() {
   const payload = { version: 1, rotations: [...rotations.values()].map(({ timer, running, ...task }) => task), stateCycles: [...stateCycles.values()].map(({ timer, running, ...task }) => task), savedAt: Date.now() };
   const temp = `${AUTOMATION_TASKS_FILE}.tmp`;
@@ -759,8 +766,8 @@ function operationIsCurrent(operation) { return accountOperations.get(operation.
 function endAccountOperation(operation) { if (accountOperations.get(operation.key) === operation) accountOperations.delete(operation.key); }
 function taskConflict(accounts, guildId, type) {
   const conflicts = [];
-  const activeTasks = type === 'rotation' ? rotations : stateCycles;
-  for (const task of activeTasks.values()) {
+  const activeTasks = type === 'rotation' ? [...rotations.values(), ...stateCycles.values()] : [...stateCycles.values()];
+  for (const task of activeTasks) {
     if (String(task.guildId) !== String(guildId)) continue;
     const overlap = accounts.filter((name) => (task.accounts || []).includes(name));
     if (overlap.length) conflicts.push({ id: task.id, accounts: overlap });
@@ -1561,7 +1568,7 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
         const client = getClient(name);
         if (!client) return recordTaskResult(task, { name, ok: false, error: 'Account is not connected' });
         const operation = beginAccountOperation(name, task.guildId, 'cycle');
-        const next = { ...current, ...normalizeVoiceState(state), selfMute: state.selfMute === undefined ? !!current.selfMute : !!state.selfMute };
+        const next = { ...current, ...mergeVoiceState(current, state) };
         if (next.selfDeaf && (next.selfVideo || next.selfStream)) { endAccountOperation(operation); return; }
         let result;
         await waitForMediaSettle(next, current);
@@ -1651,7 +1658,7 @@ async function restoreAutomationTasks() {
         task.lastResults = await mapWithConcurrency(task.accounts, 8, (name) => withResultRetry(() => withAccountLock(name, async () => {
           const current = voiceSessions.get(sessionKey(name, task.guildId)); const client = getClient(name);
           if (!current || !client) return { name, ok: false, error: 'Account is not currently in a voice channel' };
-          const next = { ...current, ...normalizeVoiceState(state), selfMute: state.selfMute === undefined ? !!current.selfMute : !!state.selfMute };
+          const next = { ...current, ...mergeVoiceState(current, state) };
           if (next.selfDeaf && (next.selfVideo || next.selfStream)) return { name, ok: false, error: 'Invalid deafened media state' };
           let result;
           await waitForMediaSettle(next, current);
