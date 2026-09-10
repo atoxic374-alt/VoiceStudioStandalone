@@ -782,6 +782,17 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
       logMediaEvent('info', 'media.streamer_created', { account: name, guildId, channelId: session.channelId, mediaKind, attempt });
       mediaStreamers.set(name, streamer);
       createdStreamer = true;
+      // The library calls signalVideo(false) from joinVoice(). Its default
+      // payload also sets self_deaf=true, which can override the account's
+      // primary voice state and break the dedicated media handshake. Keep the
+      // historical payload used by the working media path.
+      streamer.signalVideo = (enabled) => streamer.sendOpcode(4, {
+        guild_id: guildId,
+        channel_id: session.channelId,
+        self_mute: !!session.selfMute,
+        self_deaf: false,
+        self_video: !!enabled,
+      });
       // A fresh Streamer can expose a placeholder voiceConnection before its
       // gateway/WebRTC handshake is complete. Always call joinVoice for a new
       // transport; checking only the object existence can skip the handshake
