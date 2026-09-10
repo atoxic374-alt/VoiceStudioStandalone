@@ -655,7 +655,7 @@ async function confirmTaskAccounts() {
 }
 function taskRemaining(task) { return Math.max(0, Math.ceil((Number(task.nextAt || 0) - Date.now()) / 1000)); }
 function taskCountdownLabel(task) { const seconds = taskRemaining(task); return formatDuration(seconds); }
-function taskLiveSummary(task) { const results = task.accounts || []; const statuses = results.map((name) => task.accountStatus?.[name] || (task.lastResults || []).find((item) => item.name === name)); const failed = statuses.filter((item) => item?.ok === false).length; const passed = statuses.filter((item) => item?.ok === true).length; return `${passed}/${results.length} نجح · ${failed} خطأ` ; }
+function taskLiveSummary(task) { if (task.initializing) return `جاري إدخال ${task.accounts?.length || 0} حساب`; const results = task.accounts || []; const statuses = results.map((name) => task.accountStatus?.[name] || (task.lastResults || []).find((item) => item.name === name)); const failed = statuses.filter((item) => item?.ok === false).length; const passed = statuses.filter((item) => item?.ok === true).length; return `${passed}/${results.length} نجح · ${failed} خطأ` ; }
 function renderTasks(tasks) {
   const list = $('#tasksList');
   if (!list) return;

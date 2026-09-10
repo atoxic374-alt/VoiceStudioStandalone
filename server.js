@@ -2368,18 +2368,41 @@ app.post('/api/voice/rotation/start', async (req, res) => {
     ? randomRotationTargets(accounts, channelIds, (name) => voiceSessions.get(sessionKey(name, guildId))?.channelId)
     : null;
   const initialTask = { guildId, channels: channelIds, type: 'rotation', accountTargets: {} };
-  const initial = await mapWithConcurrency(accounts, AUTOMATION_CONCURRENCY, (name, index) => {
-    const current = voiceSessions.get(sessionKey(name, guildId));
-    const target = initialTargets?.get(name);
-    const currentIndex = channelIds.indexOf(current?.channelId);
-    const preferred = target || channelIds[currentIndex >= 0 ? (currentIndex + 1) % channelIds.length : index % channelIds.length];
-    return moveRotationAccount(name, initialTask, preferred, normalizeVoiceState(current || {}));
-  });
   const id = crypto.randomUUID();
-  const task = { id, accounts, guildId, guildName: guildName || guildId, channels: channelIds, intervalMs: delay, randomOrder: !!randomOrder, currentIdx: 0, startedAt: Date.now(), nextAt: Date.now() + delay, accountStatus: {}, accountTargets: { ...initialTask.accountTargets } };
-  initial.forEach((result) => recordTaskResult(task, result));
-  task.running = false; task.active = true;
-  task.lastResults = initial;
+  const task = { id, accounts, guildId, guildName: guildName || guildId, channels: channelIds, intervalMs: delay, randomOrder: !!randomOrder, currentIdx: 0, startedAt: Date.now(), nextAt: Date.now() + delay, accountStatus: {}, accountTargets: {}, running: true, active: true, initializing: true, lastResults: [] };
+  // Register and persist the task before moving any account. Joining a voice
+  // room can take several seconds per account; keeping this request open made
+  // the browser report "Failed to fetch" and left no automation visible.
+  rotations.set(id, task);
+  persistAutomationTasks();
+  emitLive('task.started', { id: task.id, taskType: 'rotation', initializing: true, accounts: task.accounts });
+  const runInitial = async () => {
+    let initial = [];
+    try {
+      initial = await mapWithConcurrency(accounts, AUTOMATION_CONCURRENCY, (name, index) => {
+        const current = voiceSessions.get(sessionKey(name, guildId));
+        const target = initialTargets?.get(name);
+        const currentIndex = channelIds.indexOf(current?.channelId);
+        const preferred = target || channelIds[currentIndex >= 0 ? (currentIndex + 1) % channelIds.length : index % channelIds.length];
+        return moveRotationAccount(name, initialTask, preferred, normalizeVoiceState(current || {}));
+      });
+      initial.forEach((result) => recordTaskResult(task, result));
+      task.accountTargets = { ...initialTask.accountTargets };
+      task.lastResults = initial;
+      task.nextAt = Date.now() + task.intervalMs;
+      emitLive('task.completed', { id: task.id, taskType: 'rotation', initializing: false, nextAt: task.nextAt, currentIdx: task.currentIdx, results: task.lastResults });
+    } catch (error) {
+      const result = { name: 'rotation', ok: false, error: error?.message || String(error) };
+      task.lastResults = [result];
+      recordTaskResult(task, result);
+      logMediaEvent('error', 'automation.rotation_initialization_failed', { id: task.id, guildId, error: result.error });
+    } finally {
+      task.initializing = false;
+      task.running = false;
+      persistAutomationTasks();
+    }
+  };
+  runInitial().catch((error) => logMediaEvent('error', 'automation.rotation_background_failed', { id: task.id, guildId, error: error?.message || String(error) }));
   task.timer = setInterval(async () => {
     if (!task.active || task.running) return;
     task.running = true;
@@ -2399,9 +2422,8 @@ app.post('/api/voice/rotation/start', async (req, res) => {
       emitLive('task.completed', { id: task.id, taskType: 'rotation', nextAt: task.nextAt, currentIdx: task.currentIdx, results: task.lastResults });
     } finally { task.running = false; }
   }, delay);
-  rotations.set(id, task);
   persistAutomationTasks();
-  return ok(res, { id, started: true, initial, summary: summary(initial) });
+  return ok(res, { id, started: true, initializing: true, accounts: task.accounts, summary: { total: accounts.length, ok: 0, failed: 0, skipped: 0, pending: accounts.length, retries: 0 } });
 });
 app.post('/api/voice/rotation/stop', (req, res) => {
   const id = String(req.body?.id || '');
