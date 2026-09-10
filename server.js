@@ -262,7 +262,8 @@ async function waitForDiscordRequestSlot() {
 function componentLabel(component) { const label = component?.label || component?.data?.label || ''; const emoji = component?.emoji || component?.data?.emoji; const emojiName = typeof emoji === 'string' ? emoji : emoji?.name || emoji?.id || ''; return `${String(label).trim()} ${String(emojiName).trim()}`.trim(); }
 function messageButtons(message) { return (message?.components || []).flatMap((row) => row?.components || []).filter((component) => String(component?.type || '').toUpperCase() === 'BUTTON' || component?.type === 2); }
 function normalizePlayingButton(value) { return String(value || '').normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').replace(/\s+/g, ' ').trim().toLocaleLowerCase(); }
-async function dispatchPlayingButton(message, customId, details) {
+async function dispatchPlayingButton(message, customId, details, canContinue = () => true) {
+  if (!canContinue()) return { ok: false, stopped: true, error: 'Playing session stopped before click' };
   let interaction;
   try { interaction = message.clickButton(customId); } catch (error) { const messageText = error.message || String(error); const rateLimited = error.status === 429 || /429|rate.?limit|too many requests/i.test(messageText); logPlayingEvent(rateLimited ? 'safety.rate-limited' : 'button.click.failed', { ...details, error: messageText }); return { ok: false, skip: true, rateLimited, error: messageText }; }
   const response = await Promise.race([
@@ -273,9 +274,12 @@ async function dispatchPlayingButton(message, customId, details) {
   if (response.error) { const error = response.error.message || String(response.error); const rateLimited = response.error.status === 429 || /429|rate.?limit|too many requests/i.test(error); logPlayingEvent(rateLimited ? 'safety.rate-limited' : 'button.click.failed', { ...details, error }); return { ok: false, skip: true, rateLimited, error }; }
   return { ok: true, responded: true };
 }
-async function findPlayingButton(channel, session, step) {
+async function findPlayingButton(channel, session, step, canContinue = () => true) {
+  if (!canContinue()) return null;
   await waitForDiscordRequestSlot();
+  if (!canContinue()) return null;
   const messages = await channel.messages.fetch({ limit: 50 }).catch(() => null);
+  if (!canContinue()) return null;
   if (!messages) return null;
   const entries = [...messages.values()].sort((a, b) => Number(b.createdTimestamp || 0) - Number(a.createdTimestamp || 0));
   session.lastScan = entries.slice(0, 10).map((message) => ({ messageId: String(message.id), labels: messageButtons(message).map(componentLabel).filter(Boolean) }));
@@ -306,9 +310,12 @@ async function findPlayingButton(channel, session, step) {
   }
   return null;
 }
-async function findAnyPlayingButton(channel, session) {
+async function findAnyPlayingButton(channel, session, canContinue = () => true) {
+  if (!canContinue()) return null;
   await waitForDiscordRequestSlot();
+  if (!canContinue()) return null;
   const messages = await channel.messages.fetch({ limit: 50 }).catch(() => null);
+  if (!canContinue()) return null;
   if (!messages) return null;
   const entries = [...messages.values()].sort((a, b) => Number(b.createdTimestamp || 0) - Number(a.createdTimestamp || 0));
   session.lastScan = entries.slice(0, 10).map((message) => ({ messageId: String(message.id), labels: messageButtons(message).map(componentLabel).filter(Boolean) }));
@@ -345,13 +352,14 @@ async function sendPlayingPhrase(session, canContinue = () => true) {
   await waitForDiscordRequestSlot();
   const channel = await client.channels?.fetch?.(session.channelId).catch?.(() => null);
   if (!channel?.messages?.fetch) return { ok: false, error: 'Text channel is not available for this account' };
-  const found = await findAnyPlayingButton(channel, session);
+  const found = await findAnyPlayingButton(channel, session, canContinue);
   const step = found?.step;
   const stepIndex = found?.stepIndex ?? 0;
   if (!found) { const available = session.lastScan?.flatMap((item) => item.labels).filter(Boolean).slice(0, 20) || []; logPlayingEvent('button.waiting', { account: session.account, requested: session.steps.map((item) => item.button), available }); return { ok: false, waiting: true, error: 'Waiting for any configured button', available }; }
   if (!canContinue()) return { ok: false, stopped: true, error: 'Playing session stopped before click' };
   logPlayingEvent('button.click.started', { account: session.account, requested: step.button, label: found.label, messageId: String(found.message.id), customId: found.customId });
-  const click = await dispatchPlayingButton(found.message, found.customId, { account: session.account, requested: step.button, label: found.label, messageId: String(found.message.id), customId: found.customId });
+  const click = await dispatchPlayingButton(found.message, found.customId, { account: session.account, requested: step.button, label: found.label, messageId: String(found.message.id), customId: found.customId }, canContinue);
+  if (click.stopped) return click;
   session.lastActionKey = found.key;
   playingSafety.set(session.account, Date.now() + (click.rateLimited ? 15000 : PLAYING_MIN_INTERACTION_GAP_MS));
   if (!click.ok) return skipPlayingStep(session, step, stepIndex, found, { error: `Button "${step.button}" click failed: ${click.error}` });
