@@ -100,10 +100,10 @@ const liveEvents = new EventEmitter();
 liveEvents.setMaxListeners(0);
 const accountLocks = new Map();
 const MEDIA_SETTLE_DELAY_MS = 4000;
-// The gap is measured from the start of the previous media-start attempt.
-// This spaces out WebRTC/Streamer handshakes without waiting for a stream that
-// may remain active for a long time.
-const MEDIA_START_GAP_MS = Math.max(0, Number(process.env.MEDIA_START_GAP_MS || 20000));
+// Media starts are a real queue: the next account waits until the previous
+// account's media attempt returns (ready or failed), then starts immediately.
+// An optional gap can still be configured, but the default is zero.
+const MEDIA_START_GAP_MS = Math.max(0, Number(process.env.MEDIA_START_GAP_MS || 0));
 const SYNTHETIC_VIDEO_FILE = path.join(DATA_DIR, 'synthetic-stream-black-v2.mp4');
 const DISCORD_REQUEST_GAP_MS = Math.max(0, Number(process.env.DISCORD_REQUEST_GAP_MS || 120));
 let nextDiscordRequestAt = 0;
@@ -677,18 +677,18 @@ async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live')
   }
 }
 async function startSyntheticStream(name, guildId, mediaKind = 'go-live', desiredState = null) {
-  // Serialize the start moment across all accounts. Each account still owns
-  // an independent Streamer; only the handshake start times are spaced out.
+  // Serialize the full media-start operation across all accounts. Each
+  // account still owns an independent Streamer; only the start operations are
+  // queued so the next account begins after the previous result is known.
   const previous = mediaStartTail;
   let release;
   mediaStartTail = new Promise((resolve) => { release = resolve; });
   await previous.catch(() => {});
-  const startedAt = Date.now();
-  let released = false;
-  const releaseOnce = () => { if (!released) { released = true; release(); } };
-  const releaseTimer = setTimeout(releaseOnce, MEDIA_START_GAP_MS);
-  try { return await startSyntheticStreamUnqueued(name, guildId, mediaKind, desiredState); }
-  finally { if (MEDIA_START_GAP_MS === 0) releaseOnce(); else if (Date.now() - startedAt >= MEDIA_START_GAP_MS) releaseOnce(); }
+  try {
+    const result = await startSyntheticStreamUnqueued(name, guildId, mediaKind, desiredState);
+    if (MEDIA_START_GAP_MS > 0) await new Promise((resolve) => setTimeout(resolve, MEDIA_START_GAP_MS));
+    return result;
+  } finally { release(); }
 }
 async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live', desiredState = null) {
   const pendingRestart = pendingMediaRestarts.get(name);
