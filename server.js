@@ -1686,7 +1686,10 @@ app.post('/api/voice/leave', async (req, res) => {
   const accounts = cleanAccounts(req.body?.accounts);
   const guildId = String(req.body?.guildId || '');
   if (!accounts.length || !guildId) return fail(res, new Error('accounts and guildId are required'), 400);
-  const results = await mapWithConcurrency(accounts, 8, (name) => withResultRetry(() => withAccountLock(name, async () => {
+  // Leaving is intentionally fast and idempotent. Wrapping it in the normal
+  // three-attempt retry helper multiplied a 5s gateway confirmation into a
+  // request long enough for Railway/browser fetch to time out.
+  const results = await mapWithConcurrency(accounts, 12, (name) => withAccountLock(name, async () => {
     const client = getClient(name);
     if (!client) return { name, ok: false, error: 'Account is not connected' };
     const current = readGatewayVoiceState(client, guildId) || voiceSessions.get(sessionKey(name, guildId));
@@ -1694,10 +1697,10 @@ app.post('/api/voice/leave', async (req, res) => {
     // in its active rotation so the next tick can join it again.
     if (!current?.channelId) { removeSessionsForAccount(name, guildId); return { name, ok: true, alreadyLeft: true }; }
     stopSyntheticStream(name, { leaveVoice: true });
-    const result = await sendVoiceOpConfirmed(client, guildId, null, {}, 5000);
+    const result = await sendVoiceOpConfirmed(client, guildId, null, {}, 2500);
     if (result.ok) removeSessionsForAccount(name, guildId);
     return { name, ok: result.ok, error: result.ok ? null : result.error };
-  })));
+  }));
   emitLive('operation.completed', { operation: 'leave', results, summary: summary(results) });
   return ok(res, { results, summary: summary(results) });
 });
