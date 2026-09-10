@@ -996,7 +996,13 @@ async function watchdogMedia(session) {
   if (!desired || String(desired.guildId) !== String(session.guildId) || String(desired.channelId) !== String(session.channelId)) return;
   const expectedKind = session.selfStream ? 'go-live' : session.selfVideo ? 'camera' : null;
   const key = watchdogKey('media', session.name, session.guildId);
-  const mismatch = !!expectedKind && !syntheticStreams.has(session.name) && !pendingMediaRestarts.has(session.name);
+  const active = syntheticStreams.get(session.name);
+  const voiceReady = active?.streamer?.voiceConnection?.webRtcConn?.ready === true;
+  const mediaReady = expectedKind === 'camera'
+    ? voiceReady
+    : active?.streamer?.voiceConnection?.streamConnection?.webRtcConn?.ready === true;
+  const sourceReady = !!active?.sourceProcess && active.sourceProcess.exitCode === null && !active.sourceProcess.killed;
+  const mismatch = !!expectedKind && (!active || !voiceReady || !mediaReady || !sourceReady) && !pendingMediaRestarts.has(session.name);
   if (!watchdogIsMismatch(key, mismatch)) return;
   logMediaEvent('warn', 'watchdog.media_repair', { account: session.name, guildId: session.guildId, channelId: session.channelId, mediaKind: expectedKind });
   const result = await withAccountLock(session.name, () => startSyntheticStream(session.name, session.guildId, expectedKind, session));
