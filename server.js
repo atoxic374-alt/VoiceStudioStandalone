@@ -1697,6 +1697,49 @@ async function moveAccountLocked(name, guildId, channelId, opts = {}) {
   })();
 }
 
+function renamePersistedAccount(oldName, newName) {
+  if (!oldName || !newName || oldName === newName) return;
+  for (const [key, session] of [...voiceSessions.entries()]) {
+    if (session.name !== oldName) continue;
+    voiceSessions.delete(key);
+    voiceSessions.set(sessionKey(newName, session.guildId), { ...session, name: newName });
+  }
+  for (const task of [...rotations.values(), ...stateCycles.values()]) {
+    task.accounts = (task.accounts || []).map((account) => account === oldName ? newName : account);
+    if (task.accountTargets?.[oldName]) {
+      task.accountTargets[newName] = task.accountTargets[oldName];
+      delete task.accountTargets[oldName];
+    }
+    if (task.accountStatus?.[oldName]) {
+      task.accountStatus[newName] = task.accountStatus[oldName];
+      delete task.accountStatus[oldName];
+    }
+  }
+  const playing = playingSessions.get(oldName);
+  if (playing) {
+    playingSessions.delete(oldName);
+    playingSessions.set(newName, { ...playing, account: newName });
+  }
+  persistSessions();
+  persistAutomationTasks();
+  persistPlayingSessions();
+}
+function normalizeConnectedAccountNames() {
+  let changed = false;
+  for (const [oldName, entry] of [...clients.entries()]) {
+    if (!/^account-\d+$/i.test(oldName)) continue;
+    const preferred = String(entry.client?.user?.globalName || entry.client?.user?.username || entry.client?.user?.tag || entry.client?.user?.id || '').trim().slice(0, 48);
+    if (!preferred || preferred === oldName || clients.has(preferred)) continue;
+    clients.delete(oldName);
+    clients.set(preferred, entry);
+    renamePersistedAccount(oldName, preferred);
+    emitLive('account.renamed', { oldName, name: preferred });
+    changed = true;
+  }
+  if (changed) persistConnectedAccounts();
+  return changed;
+}
+
 async function connectOne(token, name) {
   if (typeof token !== 'string' || !token.trim()) throw new Error('A Discord token is required');
   let finalName = String(name || '').trim().slice(0, 48);
@@ -1708,7 +1751,13 @@ async function connectOne(token, name) {
   }
   const client = new Client({ checkUpdate: false, fetchAllMembers: false });
   await client.login(normalizedToken);
-  if (!finalName) finalName = String(client.user?.globalName || client.user?.username || `account-${clients.size + 1}`).trim().slice(0, 48);
+  const generatedAlias = /^account-\d+$/i.test(finalName);
+  if (!finalName || generatedAlias) {
+    const discordName = client.user?.globalName || client.user?.username || client.user?.tag || client.user?.id;
+    const previousName = finalName;
+    finalName = String(discordName || `account-${clients.size + 1}`).trim().slice(0, 48);
+    if (generatedAlias) renamePersistedAccount(previousName, finalName);
+  }
   if (clients.has(finalName)) {
     stopTasksForAccount(finalName);
     stopSyntheticStream(finalName, { leaveVoice: true });
@@ -1837,6 +1886,7 @@ app.get('/api/events', (req, res) => {
 });
 app.get('/api/accounts/health', (_req, res) => ok(res, { accounts: [...clients.entries()].map(([name, entry]) => accountHealth(name, entry)) }));
 app.get('/api/discord/clients', (_req, res) => {
+  normalizeConnectedAccountNames();
   const sessionByName = new Map([...voiceSessions.values()].map((session) => [session.name, session]));
   return ok(res, { clients: [...clients.entries()].map(([name, entry]) => {
     const user = entry.client?.user;
@@ -1872,9 +1922,9 @@ app.post('/api/discord/connect-bulk', async (req, res) => {
     while (cursor < items.length) {
       const index = cursor++;
       const item = items[index] || {};
-      results[index] = await connectOneWithRetry(item.token, item.name || `account-${index + 1}`)
+      results[index] = await connectOneWithRetry(item.token, item.name)
         .then((result) => ({ ok: true, ...result }))
-        .catch((error) => ({ ok: false, name: item.name || `account-${index + 1}`, error: error.message }));
+        .catch((error) => ({ ok: false, name: item.name || `bulk-${index + 1}`, error: error.message }));
     }
   };
   await Promise.all(Array.from({ length: Math.min(3, items.length) }, worker));
