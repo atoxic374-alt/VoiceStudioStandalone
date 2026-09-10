@@ -914,12 +914,29 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
   }
   logMediaEvent('info', 'media.live_target_confirmed', { account: name, guildId, channelId: session.channelId, mediaKind, confirmations: 2 });
   const startedAt = Date.now();
+  const channel = client.guilds?.cache?.get?.(guildId)?.channels?.cache?.get?.(session.channelId);
+  if (!channel) return { ok: false, error: 'Voice channel is not available for streaming' };
+  let primaryConnection = client.voice?.connection;
+  if ((!primaryConnection || String(primaryConnection.channel?.id) !== String(session.channelId))
+      && typeof client.voice?.joinChannel === 'function') {
+    try {
+      primaryConnection = await withTimeout(client.voice.joinChannel(channel, {
+        selfMute: !!session.selfMute,
+        selfDeaf: false,
+        selfVideo: false,
+      }), MEDIA_JOIN_TIMEOUT_MS, 'Primary voice connection did not become ready');
+      logMediaEvent('info', 'media.primary_voice_ready', { account: name, guildId, channelId: session.channelId, mediaKind, source: 'voice.joinChannel' });
+    } catch (error) {
+      logMediaEvent('warn', 'media.primary_voice_unavailable', { account: name, guildId, channelId: session.channelId, mediaKind, error: error?.message || String(error) });
+      primaryConnection = null;
+    }
+  }
   // Prefer the already-authenticated primary voice connection. Opening a
   // second Streamer voice connection on the same gateway is what produces the
   // observed state=184/token=missing timeout: Discord can deliver the state
   // event while omitting VOICE_SERVER_UPDATE for the competing transport.
-  if (client.voice?.connection?.channel?.id === session.channelId
-      && typeof client.voice.connection.createStreamConnection === 'function') {
+  if (primaryConnection?.channel?.id === session.channelId
+      && typeof primaryConnection.createStreamConnection === 'function') {
     const primaryResult = await startBuiltInGoLive(name, guildId, session, mediaKind);
     if (primaryResult.ok) {
       mediaDesired.set(name, { guildId, channelId: session.channelId, mediaKind });
