@@ -1102,11 +1102,7 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
   // second Streamer voice connection on the same gateway is what produces the
   // observed state=184/token=missing timeout: Discord can deliver the state
   // event while omitting VOICE_SERVER_UPDATE for the competing transport.
-  // `createStreamConnection()` is Discord's screenshare/Go Live transport.
-  // It must never be used for camera mode: camera media is sent over the
-  // voice WebRTC connection by the library's `playStream(..., { type:
-  // 'camera' })` path, which also owns the selfVideo signal.
-  if (mediaKind === 'go-live' && primaryConnection && typeof primaryConnection.createStreamConnection === 'function'
+    if (primaryConnection && typeof primaryConnection.createStreamConnection === 'function'
         && (!voiceConnectionChannelId(primaryConnection) || String(voiceConnectionChannelId(primaryConnection)) === String(session.channelId))) {
       logMediaEvent('info', 'media.primary_transport_selected', { account: name, guildId, channelId: session.channelId, mediaKind });
       const primaryResult = await startBuiltInGoLive(name, guildId, session, mediaKind, isCurrentRun);
@@ -1127,7 +1123,7 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
     logMediaEvent('error', 'media.dedicated_fallback_blocked', { account: name, guildId, channelId: session.channelId, mediaKind, reason: 'primary-voice-connection-exists' });
     return primaryResult;
   }
-  logMediaEvent('info', 'media.dedicated_transport_selected', { account: name, guildId, channelId: session.channelId, mediaKind, reason: mediaKind === 'camera' ? 'camera-uses-voice-webrtc' : 'primary-unavailable', hasConnection: !!primaryConnection, connectionChannelId: voiceConnectionChannelId(primaryConnection), hasCreateStreamConnection: typeof primaryConnection?.createStreamConnection === 'function' });
+  logMediaEvent('warn', 'media.primary_transport_unavailable', { account: name, guildId, channelId: session.channelId, mediaKind, hasConnection: !!primaryConnection, connectionChannelId: voiceConnectionChannelId(primaryConnection), hasCreateStreamConnection: typeof primaryConnection?.createStreamConnection === 'function' });
   let lastError;
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     let streamer;
