@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
-const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets } = require('../server');
+const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait } = require('../server');
 
 function fakeClient({ ready = true, confirms = true } = {}) {
   const ws = new EventEmitter();
@@ -82,6 +82,22 @@ test('filters Streamer voice events to the requested guild and channel', () => {
   streamer._gatewayEmitter.emit('VOICE_STATE_UPDATE', { user_id: 'user-1', guild_id: 'guild-1', channel_id: 'other-channel', session_id: 'wrong' });
   streamer._gatewayEmitter.emit('VOICE_STATE_UPDATE', { user_id: 'user-1', guild_id: 'guild-1', channel_id: 'channel-1', session_id: 'right' });
   assert.deepEqual(received.map((item) => item.session_id), ['right']);
+});
+
+test('starts primary media before waiting for Discord stream signaling', async () => {
+  const order = [];
+  let resolveSignaling;
+  const signaling = new Promise((resolve) => { resolveSignaling = resolve; });
+  const connection = {
+    playVideo: () => {
+      order.push('playVideo');
+      setImmediate(() => { order.push('discord-signaling'); resolveSignaling(); });
+      return { id: 'dispatcher' };
+    },
+  };
+  const dispatcher = await playPrimaryMediaAndWait(connection, {}, signaling);
+  assert.deepEqual(order, ['playVideo', 'discord-signaling']);
+  assert.deepEqual(dispatcher, { id: 'dispatcher' });
 });
 
 test('isolates bulk voice control from accounts managed by rotation in the same guild', () => {
