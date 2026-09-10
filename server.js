@@ -956,6 +956,7 @@ function voiceStateMatchesExpected(actual, expected) {
 async function watchdogRotation(task, account) {
   const client = getClient(account);
   if (!client || !task.active || task.running) return;
+  if (accountOperations.has(operationKey(account, task.guildId))) return;
   const key = watchdogKey('rotation', task.id, account);
   const actual = readGatewayVoiceState(client, task.guildId);
   const expectedChannel = task.accountTargets?.[account] || rotationPreferredChannel(account, task, 0);
@@ -969,6 +970,7 @@ async function watchdogRotation(task, account) {
 async function watchdogStateCycle(task, account) {
   const client = getClient(account);
   if (!client || !task.active || task.running) return;
+  if (accountOperations.has(operationKey(account, task.guildId))) return;
   const key = watchdogKey('cycle', task.id, account);
   const actual = readGatewayVoiceState(client, task.guildId);
   const expected = task.states?.[task.accountStateIdx?.[account]];
@@ -1337,8 +1339,13 @@ async function moveAccount(name, guildId, channelId, opts = {}) {
     const result = await sendVoiceOpConfirmed(client, guildId, channelId, { ...desired, selfVideo: false, selfStream: false });
     if (!operationIsCurrent(operation)) { endAccountOperation(operation); return { name, ok: false, stale: true, error: 'Voice move was superseded by a newer request' }; }
     if (result.ok) {
+      const confirmed = readGatewayVoiceState(client, guildId);
+      if (!confirmed?.channelId || String(confirmed.channelId) !== String(channelId)) {
+        endAccountOperation(operation);
+        return { name, ok: false, error: 'Discord confirmed the request but the account is not in the target room', channelId };
+      }
       for (const key of [...voiceSessions.keys()]) if (key.startsWith(`${name}__`) && key !== sessionKey(name, guildId)) voiceSessions.delete(key);
-      const actual = readGatewayVoiceState(client, guildId);
+      const actual = confirmed;
       upsertSession(name, guildId, channelId, { ...desired, ...(actual || {}), selfVideo: desired.selfVideo, selfStream: desired.selfStream });
       if (desired.selfStream || desired.selfVideo) {
         const media = await startSyntheticStream(name, guildId, desired.selfStream ? 'go-live' : 'camera');
