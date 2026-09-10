@@ -533,11 +533,13 @@ function stopSyntheticStream(name, { leaveVoice = false } = {}) {
     try { active.streamConnection?.disconnect?.(); } catch {}
   }
   syntheticStreams.delete(name);
+  const streamer = mediaStreamers.get(name);
   if (leaveVoice) {
-    const streamer = mediaStreamers.get(name);
     try { streamer?.leaveVoice?.(); } catch {}
-    mediaStreamers.delete(name);
   }
+  // Every media run gets a fresh Streamer. Releasing the reference here is
+  // safe; leaving the primary voice room remains an explicit operation.
+  mediaStreamers.delete(name);
 }
 function scheduleMediaRestart(name, active, reason) {
   if (!active || active.restarting || pendingMediaRestarts.has(name)) return;
@@ -645,7 +647,9 @@ async function startSyntheticStream(name, guildId, mediaKind = 'go-live', desire
   for (const key of ['selfMute', 'selfDeaf', 'selfVideo', 'selfStream']) if (typeof observed?.[key] !== 'boolean' && typeof saved?.[key] === 'boolean') session[key] = saved[key];
   if (!client || !session?.channelId) return { ok: false, error: 'Account is not in a voice channel' };
   const existing = syntheticStreams.get(name);
-  if (existing) stopSyntheticStream(name, { leaveVoice: true });
+  // Replacing a media transport must not send a voice leave for the account.
+  // The primary voice connection owns room membership.
+  if (existing) stopSyntheticStream(name);
   const channel = client.guilds?.cache?.get?.(guildId)?.channels?.cache?.get?.(session.channelId);
   if (!channel) return { ok: false, error: 'Voice channel is not available for streaming' };
   const startedAt = Date.now();
@@ -671,7 +675,10 @@ async function startSyntheticStream(name, guildId, mediaKind = 'go-live', desire
       });
       const mediaConnection = streamer.voiceConnection;
       if (mediaConnection && (String(mediaConnection.guildId) !== String(guildId) || String(mediaConnection.channelId) !== String(session.channelId))) {
-        try { streamer.leaveVoice(); } catch {}
+        // Do not send an account-level voice leave while replacing a stale
+        // dedicated transport. The subsequent joinVoice call selects the
+        // requested room without disturbing the primary voice session.
+        try { streamer.stopStream?.(); } catch {}
       }
       if (!streamer.voiceConnection) {
         logMediaEvent('info', 'media.join.start', { account: name, guildId, channelId: session.channelId, mediaKind, attempt });
@@ -688,13 +695,16 @@ async function startSyntheticStream(name, guildId, mediaKind = 'go-live', desire
       task.then(() => {
         active.completedAt = Date.now();
         if (syntheticStreams.get(name) === active) {
-          stopSyntheticStream(name, { leaveVoice: true });
+          // The media transport ended; keep the primary voice session alive
+          // while a replacement transport is scheduled.
+          stopSyntheticStream(name);
           scheduleMediaRestart(name, active, 'media task ended');
         }
       }).catch((error) => {
         logMediaEvent('error', 'media.runtime_failed', { account: name, guildId, channelId: session.channelId, mediaKind, error: error?.message || String(error) });
         if (syntheticStreams.get(name) === active) {
-          stopSyntheticStream(name, { leaveVoice: true });
+          // Runtime media failures must not turn into a voice-room leave.
+          stopSyntheticStream(name);
           scheduleMediaRestart(name, active, error?.message || 'media task failed');
         }
       });
@@ -727,8 +737,9 @@ async function startSyntheticStream(name, guildId, mediaKind = 'go-live', desire
       lastError = error;
       try { controller?.abort?.(); } catch {}
       try { source?.sourceProcess?.kill?.('SIGTERM'); } catch {}
+      // Clean up only this failed media transport. The account may still be
+      // connected to the primary voice room.
       try { streamer?.stopStream?.(); } catch {}
-      try { streamer?.leaveVoice?.(); } catch {}
       if (syntheticStreams.get(name)?.streamer === streamer) syntheticStreams.delete(name);
       if (createdStreamer && mediaStreamers.get(name) === streamer) mediaStreamers.delete(name);
       logMediaEvent('error', 'media.attempt_failed', { account: name, guildId, channelId: session.channelId, mediaKind, attempt, error: error?.message || String(error) });
@@ -1080,6 +1091,10 @@ function reconcileVoiceSessions() {
     for (const session of [...voiceSessions.values()].filter((item) => item.name === name)) {
       const actual = readGatewayVoiceState(entry.client, session.guildId);
       if (!actual || !actual.channelId) {
+        // A dedicated media transport can briefly report no voice state while
+        // its replacement Streamer is being created. Keep the confirmed
+        // session during the bounded restart window.
+        if (pendingMediaRestarts.has(name) && session.channelId) continue;
         const active = syntheticStreams.get(name);
         if (active && active.guildId === session.guildId && active.channelId === session.channelId) {
           upsertSession(name, session.guildId, session.channelId, { selfMute: session.selfMute, selfDeaf: false, selfVideo: active.mediaKind === 'camera', selfStream: active.mediaKind === 'go-live' });
@@ -1113,7 +1128,10 @@ async function moveAccount(name, guildId, channelId, opts = {}) {
     const observed = readGatewayVoiceState(client, guildId);
     const current = { ...(saved || {}), ...(observed || {}) };
     for (const key of ['selfMute', 'selfDeaf', 'selfVideo', 'selfStream']) if (typeof observed?.[key] !== 'boolean' && typeof saved?.[key] === 'boolean') current[key] = saved[key];
-    if (current?.channelId === channelId) return { name, ok: true, alreadyIn: true, channelId };
+    if (current?.channelId === channelId) {
+      endAccountOperation(operation);
+      return { name, ok: true, alreadyIn: true, channelId };
+    }
     const desired = normalizeVoiceState({ ...(current || {}), ...opts });
     if (syntheticStreams.has(name) || mediaStreamers.has(name)) stopSyntheticStream(name, { leaveVoice: true });
     const result = await sendVoiceOpConfirmed(client, guildId, channelId, { ...desired, selfVideo: false, selfStream: false });
