@@ -110,9 +110,11 @@ let nextDiscordRequestAt = 0;
 const WATCHDOG_INTERVAL_MS = Math.max(5000, Number(process.env.VOICE_WATCHDOG_INTERVAL_MS || 10000));
 const WATCHDOG_CONFIRMATION_MISSES = 2;
 const WATCHDOG_REPAIR_COOLDOWN_MS = Math.max(10000, Number(process.env.VOICE_WATCHDOG_COOLDOWN_MS || 30000));
+const AUTOMATION_CONCURRENCY = Math.max(1, Math.min(8, Number(process.env.VOICE_AUTOMATION_CONCURRENCY || 2)));
 const watchdogObservations = new Map();
 const mediaDesired = new Map();
 const mediaRunGenerations = new Map();
+const pendingRoomMoves = new Set();
 let watchdogRunning = false;
 let mediaStartTail = Promise.resolve();
 
@@ -190,6 +192,7 @@ async function recoverVoiceAfterStateFailure(name, guildId, current) {
   return restored;
 }
 async function executeStateForAccount(name, task, requestedState) {
+  if (pendingRoomMoves.has(name)) return { name, ok: false, deferred: true, error: 'State cycle deferred while the account is moving rooms' };
   const current = voiceSessions.get(sessionKey(name, task.guildId));
   const client = getClient(name);
   if (!current) return { name, ok: false, error: 'Account is not currently in a voice channel' };
@@ -1320,7 +1323,12 @@ function reconcileVoiceSessions() {
   }
 }
 async function moveAccount(name, guildId, channelId, opts = {}) {
-  return withAccountLock(name, async () => {
+  pendingRoomMoves.add(name);
+  try { return await withAccountLock(name, () => moveAccountLocked(name, guildId, channelId, opts)); }
+  finally { pendingRoomMoves.delete(name); }
+}
+async function moveAccountLocked(name, guildId, channelId, opts = {}) {
+  return (async () => {
     const client = getClient(name);
     if (!client) return { name, ok: false, error: 'Account is not connected' };
     const operation = beginAccountOperation(name, guildId, 'move');
@@ -1354,7 +1362,7 @@ async function moveAccount(name, guildId, channelId, opts = {}) {
     }
     endAccountOperation(operation);
     return { name, ok: result.ok, error: result.ok ? null : result.error, channelId };
-  });
+  })();
 }
 
 async function connectOne(token, name) {
@@ -1809,7 +1817,7 @@ app.post('/api/voice/rotation/start', async (req, res) => {
     ? randomRotationTargets(accounts, channelIds, (name) => voiceSessions.get(sessionKey(name, guildId))?.channelId)
     : null;
   const initialTask = { guildId, channels: channelIds, type: 'rotation', accountTargets: {} };
-  const initial = await mapWithConcurrency(accounts, 8, (name, index) => {
+  const initial = await mapWithConcurrency(accounts, AUTOMATION_CONCURRENCY, (name, index) => {
     const current = voiceSessions.get(sessionKey(name, guildId));
     const target = initialTargets?.get(name);
     const currentIndex = channelIds.indexOf(current?.channelId);
@@ -1829,7 +1837,7 @@ app.post('/api/voice/rotation/start', async (req, res) => {
       ? randomRotationTargets(task.accounts, task.channels, (name) => voiceSessions.get(sessionKey(name, task.guildId))?.channelId)
       : null;
     try {
-      task.lastResults = await mapWithConcurrency(task.accounts, 8, async (name, index) => {
+      task.lastResults = await mapWithConcurrency(task.accounts, AUTOMATION_CONCURRENCY, async (name, index) => {
         const current = voiceSessions.get(sessionKey(name, task.guildId));
         const randomTarget = randomTargets?.get(name);
         const preferred = rotationPreferredChannel(name, task, index, randomTarget);
@@ -1864,7 +1872,7 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
   const id = crypto.randomUUID();
   const task = { id, type: 'cycle', accounts, guildId, states, intervalMs: delay, currentIdx: 0, accountStateIdx: {}, runToken: 0, startedAt: Date.now(), nextAt: Date.now() + delay };
   task.running = false; task.active = true;
-  task.lastResults = await mapWithConcurrency(task.accounts, 8, (name) => withResultRetry(() => withAccountLock(name, async () => {
+  task.lastResults = await mapWithConcurrency(task.accounts, AUTOMATION_CONCURRENCY, (name) => withResultRetry(() => withAccountLock(name, async () => {
     const index = randomStateIndex(task.states);
     task.accountStateIdx[name] = index;
     return recordTaskResult(task, await executeStateForAccount(name, task, task.states[index]));
@@ -1877,7 +1885,7 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
     task.currentIdx = (task.currentIdx + 1) % task.states.length;
     try {
       task.lastResults = [];
-      await mapWithConcurrency(task.accounts, 8, (name) => withResultRetry(() => withAccountLock(name, async () => {
+      await mapWithConcurrency(task.accounts, AUTOMATION_CONCURRENCY, (name) => withResultRetry(() => withAccountLock(name, async () => {
         const index = randomStateIndex(task.states, task.accountStateIdx[name]);
         task.accountStateIdx[name] = index;
         const result = await executeStateForAccount(name, task, task.states[index]);
@@ -1927,7 +1935,7 @@ async function restoreAutomationTasks() {
         ? randomRotationTargets(task.accounts, task.channels, (name) => voiceSessions.get(sessionKey(name, task.guildId))?.channelId)
         : null;
       try {
-        task.lastResults = await mapWithConcurrency(task.accounts, 8, async (name, index) => {
+        task.lastResults = await mapWithConcurrency(task.accounts, AUTOMATION_CONCURRENCY, async (name, index) => {
           const current = voiceSessions.get(sessionKey(name, task.guildId));
           const randomTarget = randomTargets?.get(name);
           const preferred = rotationPreferredChannel(name, task, index, randomTarget);
@@ -1955,7 +1963,7 @@ async function restoreAutomationTasks() {
       task.running = true;
       task.currentIdx = (task.currentIdx + 1) % task.states.length;
       try {
-        task.lastResults = await mapWithConcurrency(task.accounts, 8, (name) => withResultRetry(() => withAccountLock(name, async () => {
+        task.lastResults = await mapWithConcurrency(task.accounts, AUTOMATION_CONCURRENCY, (name) => withResultRetry(() => withAccountLock(name, async () => {
           const index = randomStateIndex(task.states, task.accountStateIdx[name]);
           task.accountStateIdx[name] = index;
           return recordTaskResult(task, await executeStateForAccount(name, task, task.states[index]));
