@@ -88,6 +88,7 @@ const rotations = new Map();
 const stateCycles = new Map();
 const syntheticStreams = new Map();
 const mediaStreamers = new Map();
+const pendingMediaRestarts = new Map();
 const accountOperations = new Map();
 const playingSessions = new Map();
 const playingSafety = new Map();
@@ -538,6 +539,24 @@ function stopSyntheticStream(name, { leaveVoice = false } = {}) {
     mediaStreamers.delete(name);
   }
 }
+function scheduleMediaRestart(name, active, reason) {
+  if (!active || active.restarting || pendingMediaRestarts.has(name)) return;
+  active.restarting = true;
+  logMediaEvent('warn', 'media.restart_scheduled', { account: name, guildId: active.guildId, channelId: active.channelId, mediaKind: active.mediaKind, reason });
+  const restartTimer = setTimeout(async () => {
+    pendingMediaRestarts.delete(name);
+    const current = voiceSessions.get(sessionKey(name, active.guildId));
+    const expectedKind = current?.selfStream ? 'go-live' : current?.selfVideo ? 'camera' : null;
+    if (!current || current.channelId !== active.channelId || expectedKind !== active.mediaKind) return;
+    const result = await startSyntheticStream(name, active.guildId, active.mediaKind, current);
+    if (result.ok) {
+      const restored = voiceSessions.get(sessionKey(name, active.guildId));
+      if (restored) Object.assign(restored, { selfVideo: active.mediaKind === 'camera', selfStream: active.mediaKind === 'go-live', updatedAt: Date.now() });
+      persistSessions();
+    }
+  }, 1000);
+  pendingMediaRestarts.set(name, restartTimer);
+}
 function createBlackMediaSource() {
   const sourceProcess = spawn(FFMPEG_PATH || 'ffmpeg', [
     '-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'color=c=black:s=640x360:r=15',
@@ -617,6 +636,8 @@ async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live')
   }
 }
 async function startSyntheticStream(name, guildId, mediaKind = 'go-live', desiredState = null) {
+  const pendingRestart = pendingMediaRestarts.get(name);
+  if (pendingRestart) { clearTimeout(pendingRestart); pendingMediaRestarts.delete(name); }
   const client = getClient(name);
   const saved = voiceSessions.get(sessionKey(name, guildId)) || {};
   const observed = client ? readGatewayVoiceState(client, guildId) : null;
@@ -624,10 +645,7 @@ async function startSyntheticStream(name, guildId, mediaKind = 'go-live', desire
   for (const key of ['selfMute', 'selfDeaf', 'selfVideo', 'selfStream']) if (typeof observed?.[key] !== 'boolean' && typeof saved?.[key] === 'boolean') session[key] = saved[key];
   if (!client || !session?.channelId) return { ok: false, error: 'Account is not in a voice channel' };
   const existing = syntheticStreams.get(name);
-  if (existing) {
-    if (existing.mediaKind === mediaKind && existing.channelId === session.channelId) return { ok: true, alreadyActive: true };
-    stopSyntheticStream(name);
-  }
+  if (existing) stopSyntheticStream(name, { leaveVoice: true });
   const channel = client.guilds?.cache?.get?.(guildId)?.channels?.cache?.get?.(session.channelId);
   if (!channel) return { ok: false, error: 'Voice channel is not available for streaming' };
   const startedAt = Date.now();
@@ -639,12 +657,11 @@ async function startSyntheticStream(name, guildId, mediaKind = 'go-live', desire
     let createdStreamer = false;
     try {
       const { Streamer, playStream } = await loadVideoStreamModule();
-      streamer = mediaStreamers.get(name);
-      if (!streamer) {
-        streamer = new Streamer(client);
-        mediaStreamers.set(name, streamer);
-        createdStreamer = true;
-      }
+      // Each media run gets a fresh transport. Reusing a finished transport can
+      // silently stop the next camera or Go Live session.
+      streamer = new Streamer(client);
+      mediaStreamers.set(name, streamer);
+      createdStreamer = true;
       streamer.signalVideo = (enabled) => streamer.sendOpcode(4, {
         guild_id: guildId,
         channel_id: session.channelId,
@@ -668,8 +685,19 @@ async function startSyntheticStream(name, guildId, mediaKind = 'go-live', desire
       syntheticStreams.set(name, active);
       const task = playStream(source.stream, streamer, { type: mediaKind, format: 'nut', width: 640, height: 360, frameRate: 15 }, controller.signal);
       active.task = task;
-      task.then(() => { active.completedAt = Date.now(); if (syntheticStreams.get(name)?.task === task) stopSyntheticStream(name); })
-        .catch((error) => logMediaEvent('error', 'media.runtime_failed', { account: name, guildId, channelId: session.channelId, mediaKind, error: error?.message || String(error) }));
+      task.then(() => {
+        active.completedAt = Date.now();
+        if (syntheticStreams.get(name) === active) {
+          stopSyntheticStream(name, { leaveVoice: true });
+          scheduleMediaRestart(name, active, 'media task ended');
+        }
+      }).catch((error) => {
+        logMediaEvent('error', 'media.runtime_failed', { account: name, guildId, channelId: session.channelId, mediaKind, error: error?.message || String(error) });
+        if (syntheticStreams.get(name) === active) {
+          stopSyntheticStream(name, { leaveVoice: true });
+          scheduleMediaRestart(name, active, error?.message || 'media task failed');
+        }
+      });
       await withTimeout(new Promise((resolve) => {
         const check = () => {
           const voiceReady = streamer.voiceConnection?.webRtcConn?.ready === true;
@@ -702,7 +730,7 @@ async function startSyntheticStream(name, guildId, mediaKind = 'go-live', desire
       try { streamer?.stopStream?.(); } catch {}
       try { streamer?.leaveVoice?.(); } catch {}
       if (syntheticStreams.get(name)?.streamer === streamer) syntheticStreams.delete(name);
-      if (createdStreamer && !streamer?.voiceConnection) mediaStreamers.delete(name);
+      if (createdStreamer && mediaStreamers.get(name) === streamer) mediaStreamers.delete(name);
       logMediaEvent('error', 'media.attempt_failed', { account: name, guildId, channelId: session.channelId, mediaKind, attempt, error: error?.message || String(error) });
       if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 250));
     }
