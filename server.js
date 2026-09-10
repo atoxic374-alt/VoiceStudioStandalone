@@ -848,6 +848,22 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
     return { ok: false, error: mediaTarget.error, permissionDenied: true };
   }
   const startedAt = Date.now();
+  // Prefer the already-authenticated primary voice connection. Opening a
+  // second Streamer voice connection on the same gateway is what produces the
+  // observed state=184/token=missing timeout: Discord can deliver the state
+  // event while omitting VOICE_SERVER_UPDATE for the competing transport.
+  if (client.voice?.connection?.channel?.id === session.channelId
+      && typeof client.voice.connection.createStreamConnection === 'function') {
+    const primaryResult = await startBuiltInGoLive(name, guildId, session, mediaKind);
+    if (primaryResult.ok) {
+      mediaDesired.set(name, { guildId, channelId: session.channelId, mediaKind });
+      mediaRestartAttempts.delete(name);
+      logMediaEvent('info', 'media.ready', { account: name, guildId, channelId: session.channelId, mediaKind, transport: 'primary-voice', durationMs: Date.now() - startedAt });
+    } else {
+      logMediaEvent('error', 'media.primary_transport_failed', { account: name, guildId, channelId: session.channelId, mediaKind, error: primaryResult.error });
+    }
+    return primaryResult;
+  }
   let lastError;
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     let streamer;
@@ -1116,10 +1132,16 @@ async function watchdogMedia(session) {
   const expectedKind = session.selfStream ? 'go-live' : session.selfVideo ? 'camera' : null;
   const key = watchdogKey('media', session.name, session.guildId);
   const active = syntheticStreams.get(session.name);
-  const voiceReady = active?.streamer?.voiceConnection?.webRtcConn?.ready === true;
-  const mediaReady = expectedKind === 'camera'
-    ? voiceReady
-    : active?.streamer?.voiceConnection?.streamConnection?.webRtcConn?.ready === true;
+  const primaryTransport = active?.connection && active?.streamConnection;
+  const dedicatedTransport = active?.streamer?.voiceConnection;
+  const voiceReady = primaryTransport
+    ? active.connection.status === 0
+    : dedicatedTransport?.webRtcConn?.ready === true;
+  const mediaReady = primaryTransport
+    ? active.streamConnection.status === 0
+    : expectedKind === 'camera'
+      ? voiceReady
+      : dedicatedTransport?.streamConnection?.webRtcConn?.ready === true;
   const sourceReady = !!active?.sourceProcess && active.sourceProcess.exitCode === null && !active.sourceProcess.killed;
   const mismatch = !!expectedKind && (!active || !voiceReady || !mediaReady || !sourceReady) && !pendingMediaRestarts.has(session.name);
   if (!watchdogIsMismatch(key, mismatch)) return;
