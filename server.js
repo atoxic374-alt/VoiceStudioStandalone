@@ -907,19 +907,12 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
   // Replacing a media transport must not send a voice leave for the account.
   // The primary voice connection owns room membership.
   if (existing) stopSyntheticStream(name);
-  const channel = client.guilds?.cache?.get?.(guildId)?.channels?.cache?.get?.(session.channelId);
-  if (!channel) return { ok: false, error: 'Voice channel is not available for streaming' };
   const liveTarget = await confirmLiveMediaTarget(client, guildId, session.channelId);
   if (!liveTarget.ok) {
     logMediaEvent('warn', 'media.live_target_changed', { account: name, guildId, channelId: session.channelId, mediaKind, error: liveTarget.error, first: liveTarget.first, second: liveTarget.second });
     return { ok: false, error: liveTarget.error };
   }
   logMediaEvent('info', 'media.live_target_confirmed', { account: name, guildId, channelId: session.channelId, mediaKind, confirmations: 2 });
-  const mediaTarget = validateMediaTarget(client, guildId, session.channelId);
-  if (!mediaTarget.ok) {
-    logMediaEvent('warn', 'media.permission_denied', { account: name, guildId, channelId: session.channelId, mediaKind, error: mediaTarget.error });
-    return { ok: false, error: mediaTarget.error, permissionDenied: true };
-  }
   const startedAt = Date.now();
   // Prefer the already-authenticated primary voice connection. Opening a
   // second Streamer voice connection on the same gateway is what produces the
@@ -1362,17 +1355,13 @@ function sendVoiceOpConfirmed(client, guildId, channelId, opts = {}, timeoutMs =
 
     let settled = false;
     let timer = null;
-    let retryTimer = null;
     let verifyTimer = null;
-    let attempts = 0;
     const cleanup = () => {
       try { client.ws?.off?.('VOICE_STATE_UPDATE', onWsState); } catch {}
       try { client.off?.('voiceStateUpdate', onJsState); } catch {}
       if (timer) clearTimeout(timer);
-      if (retryTimer) clearTimeout(retryTimer);
       if (verifyTimer) clearTimeout(verifyTimer);
       timer = null;
-      retryTimer = null;
     };
     const finish = (result) => {
       if (settled) return;
@@ -1428,15 +1417,8 @@ function sendVoiceOpConfirmed(client, guildId, channelId, opts = {}, timeoutMs =
     const deadline = Date.now() + timeoutMs;
     timer = setTimeout(verifyUntilDeadline, 250);
 
-    const send = () => {
-      if (settled) return;
-      attempts += 1;
-      const sent = sendVoiceOp(client, guildId, channelId, opts);
-      if (!sent.ok) return finish(sent);
-      verifyTimer = setTimeout(() => { if (cachedStateMatches()) finish({ ok: true, confirmed: true, source: 'gateway-cache' }); }, 150);
-      if (attempts < 3) retryTimer = setTimeout(send, Math.min(900, Math.floor(timeoutMs / 3)));
-    };
-    send();
+    const sent = sendVoiceOp(client, guildId, channelId, opts);
+    if (!sent.ok) return finish(sent);
   });
 }
 
