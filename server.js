@@ -353,7 +353,10 @@ async function handlePlayingDiscordCommand(client, message) {
   const command = playingCommandText(message);
   if (!['start', 'stop'].includes(command)) return false;
   const configuredChannel = String(process.env.DISCORD_COMMAND_CHANNEL_ID || '').trim();
-  if (configuredChannel && String(message.channel?.id || '') !== configuredChannel) return false;
+  if (configuredChannel && String(message.channel?.id || '') !== configuredChannel) {
+    console.log(`[playing-command] ignored: channel mismatch author=${String(message.author?.id || 'unknown')} channel=${String(message.channel?.id || 'unknown')} expected=${configuredChannel}`);
+    return false;
+  }
   const owners = String(process.env.DISCORD_COMMAND_OWNERS || '')
     .split(/[\s,]+/)
     .map((value) => value.trim())
@@ -361,13 +364,17 @@ async function handlePlayingDiscordCommand(client, message) {
   const authorId = String(message.author?.id || '');
   // An explicit allow-list is required. Never fall back to the connected
   // account, because every connected account can receive the same command.
-  if (!authorId || !owners.includes(authorId)) return false;
+  if (!authorId || !owners.includes(authorId)) {
+    console.log(`[playing-command] ignored: owner mismatch author=${authorId || 'unknown'} configured=${owners.length ? owners.join(',') : 'none'} command=${command}`);
+    return false;
+  }
   const messageKey = String(message.id || '');
   if (messageKey && handledPlayingCommands.has(messageKey)) return false;
   if (messageKey) {
     handledPlayingCommands.add(messageKey);
     if (handledPlayingCommands.size > 1000) handledPlayingCommands.delete(handledPlayingCommands.values().next().value);
   }
+  console.log(`[playing-command] accepted command=${command} author=${authorId} listener=${String(client?.user?.id || 'unknown')} sessions=${playingSessions.size}`);
   const result = command === 'start' ? startAllPlayingSessions() : stopAllPlayingSessions();
   try {
     await message.react?.('✅');
