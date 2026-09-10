@@ -100,6 +100,7 @@ const liveEvents = new EventEmitter();
 liveEvents.setMaxListeners(0);
 const accountLocks = new Map();
 const MEDIA_SETTLE_DELAY_MS = 4000;
+const MEDIA_START_GAP_MS = Math.max(0, Number(process.env.MEDIA_START_GAP_MS || 1500));
 const SYNTHETIC_VIDEO_FILE = path.join(DATA_DIR, 'synthetic-stream-black-v2.mp4');
 const DISCORD_REQUEST_GAP_MS = Math.max(0, Number(process.env.DISCORD_REQUEST_GAP_MS || 120));
 let nextDiscordRequestAt = 0;
@@ -109,6 +110,7 @@ const WATCHDOG_REPAIR_COOLDOWN_MS = Math.max(10000, Number(process.env.VOICE_WAT
 const watchdogObservations = new Map();
 const mediaDesired = new Map();
 let watchdogRunning = false;
+let mediaStartTail = Promise.resolve();
 
 function ok(res, payload = {}) { return res.json({ success: true, ...payload }); }
 function redact(value) { return String(value ?? '').replace(/(token|authorization|password|cookie)(["']?\s*[:=]\s*["']?)[^"',;\s}]+/gi, '$1$2[redacted]'); }
@@ -672,6 +674,21 @@ async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live')
   }
 }
 async function startSyntheticStream(name, guildId, mediaKind = 'go-live', desiredState = null) {
+  // Serialize media transport creation across all accounts. Voice flags can
+  // be changed in parallel, but simultaneous Streamer/WebRTC handshakes are
+  // expensive and frequently race each other on large account batches.
+  const previous = mediaStartTail;
+  let release;
+  mediaStartTail = new Promise((resolve) => { release = resolve; });
+  await previous.catch(() => {});
+  try {
+    return await startSyntheticStreamUnqueued(name, guildId, mediaKind, desiredState);
+  } finally {
+    if (MEDIA_START_GAP_MS > 0) await new Promise((resolve) => setTimeout(resolve, MEDIA_START_GAP_MS));
+    release();
+  }
+}
+async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live', desiredState = null) {
   const pendingRestart = pendingMediaRestarts.get(name);
   if (pendingRestart) { clearTimeout(pendingRestart); pendingMediaRestarts.delete(name); }
   const client = getClient(name);
