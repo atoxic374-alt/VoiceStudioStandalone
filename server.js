@@ -150,6 +150,57 @@ function mergeVoiceState(current = {}, requested = {}) {
   }
   return normalizeVoiceState(merged);
 }
+function randomStateIndex(states, previous = -1) {
+  const count = Array.isArray(states) ? states.length : 0;
+  if (!count) return 0;
+  if (count === 1) return 0;
+  const choices = Array.from({ length: count }, (_, index) => index).filter((index) => index !== previous);
+  return choices[Math.floor(Math.random() * choices.length)];
+}
+async function recoverVoiceAfterStateFailure(name, guildId, current) {
+  const client = getClient(name);
+  if (!client || !current?.channelId) return { ok: false, error: 'No confirmed voice session to recover' };
+  stopSyntheticStream(name, { leaveVoice: true });
+  const restored = await sendVoiceOpConfirmed(client, guildId, current.channelId, {
+    selfMute: !!current.selfMute,
+    selfDeaf: !!current.selfDeaf,
+    selfVideo: false,
+    selfStream: false,
+  }, 4500);
+  if (restored.ok) {
+    Object.assign(current, { selfVideo: false, selfStream: false, updatedAt: Date.now() });
+    persistSessions();
+  }
+  return restored;
+}
+async function executeStateForAccount(name, task, requestedState) {
+  const current = voiceSessions.get(sessionKey(name, task.guildId));
+  const client = getClient(name);
+  if (!current) return { name, ok: false, error: 'Account is not currently in a voice channel' };
+  if (!client) return { name, ok: false, error: 'Account is not connected' };
+  const operation = beginAccountOperation(name, task.guildId, 'cycle');
+  try {
+    const next = { ...current, ...mergeVoiceState(current, requestedState) };
+    if (next.selfDeaf && (next.selfVideo || next.selfStream)) return { name, ok: false, error: 'Invalid deafened media state' };
+    await waitForMediaSettle(next, current);
+    let result;
+    if (next.selfStream || next.selfVideo) {
+      result = await startSyntheticStream(name, task.guildId, next.selfStream ? 'go-live' : 'camera', next);
+      if (!result.ok) await recoverVoiceAfterStateFailure(name, task.guildId, current);
+    } else {
+      if (current.selfStream || current.selfVideo) stopSyntheticStream(name, { leaveVoice: true });
+      result = await sendVoiceOpConfirmed(client, task.guildId, current.channelId, next, 6000);
+    }
+    if (!operationIsCurrent(operation)) return { name, ok: false, stale: true, error: 'State operation was superseded by a newer request' };
+    if (result.ok) {
+      Object.assign(current, next, { updatedAt: Date.now() });
+      persistSessions();
+    }
+    return { name, ok: result.ok, error: result.ok ? null : result.error };
+  } finally {
+    endAccountOperation(operation);
+  }
+}
 function persistAutomationTasks() {
   const payload = { version: 1, rotations: [...rotations.values()].map(({ timer, running, ...task }) => task), stateCycles: [...stateCycles.values()].map(({ timer, running, ...task }) => task), savedAt: Date.now() };
   const temp = `${AUTOMATION_TASKS_FILE}.tmp`;
@@ -565,11 +616,11 @@ async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live')
     return { ok: false, error: error.message || 'Unable to start Go Live' };
   }
 }
-async function startSyntheticStream(name, guildId, mediaKind = 'go-live') {
+async function startSyntheticStream(name, guildId, mediaKind = 'go-live', desiredState = null) {
   const client = getClient(name);
   const saved = voiceSessions.get(sessionKey(name, guildId)) || {};
   const observed = client ? readGatewayVoiceState(client, guildId) : null;
-  const session = { ...saved, ...(observed || {}) };
+  const session = { ...saved, ...(observed || {}), ...(desiredState || {}) };
   for (const key of ['selfMute', 'selfDeaf', 'selfVideo', 'selfStream']) if (typeof observed?.[key] !== 'boolean' && typeof saved?.[key] === 'boolean') session[key] = saved[key];
   if (!client || !session?.channelId) return { ok: false, error: 'Account is not in a voice channel' };
   const existing = syntheticStreams.get(name);
@@ -1555,23 +1606,12 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
     && !(item.selfDeaf === true && (item.selfVideo === true || item.selfStream === true)));
   if (!validStates) return fail(res, new Error('State cycle contains an invalid voice state'), 400);
   const id = crypto.randomUUID();
-  const task = { id, type: 'cycle', accounts, guildId, states, intervalMs: delay, currentIdx: 0, runToken: 0, startedAt: Date.now(), nextAt: Date.now() + delay };
+  const task = { id, type: 'cycle', accounts, guildId, states, intervalMs: delay, currentIdx: 0, accountStateIdx: {}, runToken: 0, startedAt: Date.now(), nextAt: Date.now() + delay };
   task.running = false; task.active = true;
   task.lastResults = await mapWithConcurrency(task.accounts, 8, (name) => withResultRetry(() => withAccountLock(name, async () => {
-    const current = voiceSessions.get(sessionKey(name, task.guildId));
-    const client = getClient(name);
-    if (!current || !client) return recordTaskResult(task, { name, ok: false, error: !current ? 'Account is not currently in a voice channel' : 'Account is not connected' });
-    const operation = beginAccountOperation(name, task.guildId, 'cycle');
-    const next = { ...current, ...mergeVoiceState(current, task.states[0]) };
-    if (next.selfDeaf && (next.selfVideo || next.selfStream)) { endAccountOperation(operation); return { name, ok: false, error: 'Invalid deafened media state' }; }
-    await waitForMediaSettle(next, current);
-    const result = (next.selfStream || next.selfVideo)
-      ? await startRotationMediaWithFallback(name, task.guildId, next)
-      : await sendVoiceOpConfirmed(client, task.guildId, current.channelId, next, 6000);
-    if (!operationIsCurrent(operation)) { endAccountOperation(operation); return { name, ok: false, stale: true, error: 'State operation was superseded by a newer request' }; }
-    if (result.ok) { const applied = result.appliedState || next; Object.assign(current, applied, { selfStream: !!applied.selfStream, updatedAt: Date.now() }); persistSessions(); }
-    endAccountOperation(operation);
-    return { name, ok: result.ok, error: result.ok ? null : result.error };
+    const index = randomStateIndex(task.states);
+    task.accountStateIdx[name] = index;
+    return recordTaskResult(task, await executeStateForAccount(name, task, task.states[index]));
   })));
   const runStateCycle = async () => {
     if (task.nextAt > Date.now()) { if (task.active) task.timer = setTimeout(runStateCycle, task.nextAt - Date.now()); return; }
@@ -1579,28 +1619,14 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
     task.running = true;
     const runToken = task.runToken;
     task.currentIdx = (task.currentIdx + 1) % task.states.length;
-    const state = task.states[task.currentIdx];
     try {
       task.lastResults = [];
       await mapWithConcurrency(task.accounts, 8, (name) => withResultRetry(() => withAccountLock(name, async () => {
-        const current = voiceSessions.get(sessionKey(name, task.guildId));
-        if (!current) return recordTaskResult(task, { name, ok: false, error: 'Account is not currently in a voice channel' });
-        const client = getClient(name);
-        if (!client) return recordTaskResult(task, { name, ok: false, error: 'Account is not connected' });
-        const operation = beginAccountOperation(name, task.guildId, 'cycle');
-        const next = { ...current, ...mergeVoiceState(current, state) };
-        if (next.selfDeaf && (next.selfVideo || next.selfStream)) { endAccountOperation(operation); return; }
-        let result;
-        await waitForMediaSettle(next, current);
-        if (next.selfStream || next.selfVideo) result = await startSyntheticStream(name, task.guildId, next.selfStream ? 'go-live' : 'camera');
-        else {
-          if (current.selfStream || current.selfVideo) stopSyntheticStream(name);
-          result = await sendVoiceOpConfirmed(client, task.guildId, current.channelId, next, 6000);
-        }
-        if (!operationIsCurrent(operation)) { endAccountOperation(operation); task.lastResults.push({ name, ok: false, stale: true, error: 'State operation was superseded by a newer request' }); return; }
-        if (result.ok && task.active && task.runToken === runToken) { Object.assign(current, next, { selfStream: !!next.selfStream, updatedAt: Date.now() }); persistSessions(); }
-        recordTaskResult(task, { name, ok: result.ok, error: result.ok ? null : result.error });
-        endAccountOperation(operation);
+        const index = randomStateIndex(task.states, task.accountStateIdx[name]);
+        task.accountStateIdx[name] = index;
+        const result = await executeStateForAccount(name, task, task.states[index]);
+        if (!task.active || task.runToken !== runToken) return recordTaskResult(task, { name, ok: false, stale: true, error: 'State cycle stopped before completion' });
+        return recordTaskResult(task, result);
       })));
       task.nextAt = Date.now() + task.intervalMs;
       persistAutomationTasks();
@@ -1665,26 +1691,18 @@ async function restoreAutomationTasks() {
     if (!item.id || !item.guildId || !Array.isArray(item.states) || item.states.length < 2) continue;
     const accounts = cleanAccounts(item.accounts);
     if (taskAccountConflicts(accounts, item.guildId, 'cycle').length) continue;
-    const task = { ...item, type: 'cycle', accounts, running: false, active: true, intervalMs: Math.max(1000, Number(item.intervalMs || 60000)), nextAt: Number(item.nextAt || Date.now() + Number(item.intervalMs || 60000)) };
+    const task = { ...item, type: 'cycle', accounts, accountStateIdx: { ...(item.accountStateIdx || {}) }, running: false, active: true, intervalMs: Math.max(1000, Number(item.intervalMs || 60000)), nextAt: Number(item.nextAt || Date.now() + Number(item.intervalMs || 60000)) };
     const runStateCycle = async () => {
       if (!task.active) return;
       if (task.nextAt > Date.now()) { task.timer = setTimeout(runStateCycle, task.nextAt - Date.now()); return; }
       if (task.running) { task.timer = setTimeout(runStateCycle, 1000); return; }
       task.running = true;
       task.currentIdx = (task.currentIdx + 1) % task.states.length;
-      const state = task.states[task.currentIdx];
       try {
         task.lastResults = await mapWithConcurrency(task.accounts, 8, (name) => withResultRetry(() => withAccountLock(name, async () => {
-          const current = voiceSessions.get(sessionKey(name, task.guildId)); const client = getClient(name);
-          if (!current || !client) return { name, ok: false, error: 'Account is not currently in a voice channel' };
-          const next = { ...current, ...mergeVoiceState(current, state) };
-          if (next.selfDeaf && (next.selfVideo || next.selfStream)) return { name, ok: false, error: 'Invalid deafened media state' };
-          let result;
-          await waitForMediaSettle(next, current);
-          if (next.selfStream || next.selfVideo) result = await startSyntheticStream(name, task.guildId, next.selfStream ? 'go-live' : 'camera');
-          else { if (current.selfStream || current.selfVideo) stopSyntheticStream(name); result = await sendVoiceOpConfirmed(client, task.guildId, current.channelId, next, 6000); }
-          if (result.ok) { Object.assign(current, next, { updatedAt: Date.now() }); persistSessions(); }
-          return { name, ok: result.ok, error: result.ok ? null : result.error };
+          const index = randomStateIndex(task.states, task.accountStateIdx[name]);
+          task.accountStateIdx[name] = index;
+          return recordTaskResult(task, await executeStateForAccount(name, task, task.states[index]));
         })));
       } finally {
         task.running = false;
