@@ -405,7 +405,8 @@ async function bulkConnect() {
   try {
     const result = await post('/api/discord/connect-bulk', { accounts });
     const failed = result.results.filter((item) => !item.ok);
-    feedback('#bulkFeedback', `اكتمل الاتصال: ${result.summary.ok} نجح، ${result.summary.failed} فشل.`, failed.length ? 'error' : 'success');
+    const failureDetails = failed.length ? ` ${failed.map((item) => `${item.name || 'token'}: ${item.error || 'فشل الاتصال'}`).join(' | ')}` : '';
+    feedback('#bulkFeedback', `اكتمل الاتصال: ${result.summary.ok} نجح، ${result.summary.failed} فشل.${failureDetails}`, failed.length ? 'error' : 'success');
     addActivity('استيراد جماعي', `${result.summary.ok} حساب متصل`, failed.length ? 'error' : 'success');
     toast(`تم اتصال ${result.summary.ok} حساب`, failed.length ? 'error' : 'success');
     $('#bulkTokensInput').value = '';

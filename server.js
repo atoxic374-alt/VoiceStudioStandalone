@@ -83,6 +83,7 @@ app.use(express.static(path.join(__dirname, 'public'), { extensions: ['html'] })
 
 // This standalone app intentionally keeps tokens in memory only.
 const clients = new Map();
+const connectingTokens = new Set();
 const voiceSessions = new Map();
 const rotations = new Map();
 const stateCycles = new Map();
@@ -1381,24 +1382,19 @@ function startVoiceWatchdog() {
   return timer;
 }
 function markTokenChanged(name, token, error) {
+  const previous = clients.get(name);
+  if (previous?.token && previous.token !== token) return;
   stopTasksForAccount(name);
   playingSessions.delete(name);
   persistPlayingSessions();
   stopSyntheticStream(name, { leaveVoice: true });
   removeSessionsForAccount(name);
-  const previous = clients.get(name);
   try { previous?.client?.destroy?.(); } catch {}
-  clients.set(name, {
-    client: null,
-    token,
-    savedAt: previous?.savedAt || Date.now(),
-    connectedAt: previous?.connectedAt || null,
-    lastSeenAt: Date.now(),
-    lastError: `Token changed or invalid: ${error?.message || String(error || 'Login failed')}`,
-    invalidToken: true,
-  });
+  // Invalid credentials are not accounts. Do not keep a placeholder entry:
+  // clients.size drives the counter, preview, account selector, and persistence.
+  clients.delete(name);
   persistConnectedAccounts();
-  emitLive('account.health.changed', { account: accountHealth(name, clients.get(name)) });
+  emitLive('account.removed', { name, reason: 'invalid-token', error: error?.message || String(error || 'Login failed') });
 }
 async function connectOneWithRetry(token, name) {
   let lastError;
@@ -1416,7 +1412,7 @@ async function connectOneWithRetry(token, name) {
   const finalName = String(name || '').trim().slice(0, 48) || `account-${clients.size + 1}`;
   if (isInvalidCredentialError(lastError)) {
     markTokenChanged(finalName, String(token || '').trim(), lastError);
-    throw new Error(`Token is invalid or was revoked: ${lastError?.message || 'Discord rejected the token'}`);
+    throw new Error('Invalid Discord token: Discord rejected the token or it was revoked');
   }
   throw new Error(`Temporary Discord connection failure after retry: ${lastError?.message || 'Gateway unavailable'}`);
 }
@@ -1812,12 +1808,12 @@ async function connectOne(token, name) {
   let finalName = String(name || '').trim().slice(0, 48);
   const normalizedToken = token.trim();
   const existing = [...clients.entries()].find(([, entry]) => entry.token === normalizedToken);
-  if (existing?.[1]?.client) {
-    const existingClient = existing[1].client;
-    return { name: existing[0], username: existingClient.user?.tag || existingClient.user?.username || existing[0], displayName: existingClient.user?.globalName || existingClient.user?.username || existing[0], nickname: existingClient.user?.globalName || existingClient.user?.username || existing[0], id: existingClient.user?.id || null, avatar: existingClient.user?.displayAvatarURL?.({ size: 128 }) || null, alreadyConnected: true };
-  }
+  if (existing) throw new Error(`Duplicate token: already connected as ${existing[0]}`);
+  if (connectingTokens.has(normalizedToken)) throw new Error('Duplicate token: connection already in progress');
+  connectingTokens.add(normalizedToken);
   const client = new Client({ checkUpdate: false, fetchAllMembers: false });
-  await client.login(normalizedToken);
+  try { await client.login(normalizedToken); }
+  finally { connectingTokens.delete(normalizedToken); }
   const generatedAlias = /^account-\d+$/i.test(finalName);
   if (!finalName || generatedAlias) {
     const discordName = client.user?.globalName || client.user?.username || client.user?.tag || client.user?.id;
