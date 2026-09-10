@@ -604,8 +604,23 @@ function createBlackMediaSource() {
     '-an', '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-pix_fmt', 'yuv420p',
     '-f', 'nut', 'pipe:1',
   ], { stdio: ['ignore', 'pipe', 'pipe'] });
-  sourceProcess.stderr.on('data', (chunk) => logMediaEvent('warn', 'stream.source_warning', { error: String(chunk).trim().slice(0, 300) }));
+  sourceProcess.stderr.on('data', (chunk) => logMediaEvent('warn', 'stream.source_warning', { pid: sourceProcess.pid, error: String(chunk).trim().slice(0, 300) }));
+  sourceProcess.once('close', (code, signal) => {
+    if (code !== 0) logMediaEvent('error', 'stream.source_exited', { pid: sourceProcess.pid, code, signal });
+  });
   return { stream: sourceProcess.stdout, sourceProcess };
+}
+function waitForMediaSource(source, timeoutMs = 3000) {
+  return withTimeout(new Promise((resolve, reject) => {
+    let received = false;
+    const onData = (chunk) => {
+      if (chunk?.length) { received = true; cleanup(); resolve({ bytes: chunk.length }); }
+    };
+    const onClose = (code, signal) => { if (!received) { cleanup(); reject(new Error(`FFmpeg exited before producing media (code=${code}, signal=${signal || 'none'})`)); } };
+    const cleanup = () => { source.stream.off('data', onData); source.sourceProcess.off('close', onClose); };
+    source.stream.on('data', onData);
+    source.sourceProcess.once('close', onClose);
+  }), timeoutMs, 'FFmpeg produced no media data within 3 seconds');
 }
 function waitForDiscordStreamEvents(client, guildId, channelId, timeoutMs = 8000) {
   const expectedKey = `guild:${guildId}:${channelId}:${String(client.user?.id || '')}`;
@@ -712,11 +727,15 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
     let controller;
     let source;
     let createdStreamer = false;
+    let stage = 'module';
     try {
       const { Streamer, playStream } = await loadVideoStreamModule();
+      logMediaEvent('info', 'media.module_ready', { account: name, guildId, channelId: session.channelId, mediaKind, attempt });
       // Each media run gets a fresh transport. Reusing a finished transport can
       // silently stop the next camera or Go Live session.
       streamer = new Streamer(client);
+      stage = 'streamer-created';
+      logMediaEvent('info', 'media.streamer_created', { account: name, guildId, channelId: session.channelId, mediaKind, attempt });
       mediaStreamers.set(name, streamer);
       createdStreamer = true;
       streamer.signalVideo = (enabled) => streamer.sendOpcode(4, {
@@ -734,16 +753,22 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
         try { streamer.stopStream?.(); } catch {}
       }
       if (!streamer.voiceConnection) {
+        stage = 'join-voice';
         logMediaEvent('info', 'media.join.start', { account: name, guildId, channelId: session.channelId, mediaKind, attempt });
         await withTimeout(streamer.joinVoice(guildId, session.channelId), 10000, 'Dedicated media voice connection timed out after 10 seconds');
+        logMediaEvent('info', 'media.join.ready', { account: name, guildId, channelId: session.channelId, mediaKind, attempt });
       } else {
         logMediaEvent('info', 'media.join.reuse', { account: name, guildId, channelId: session.channelId, mediaKind, attempt });
       }
       controller = new AbortController();
       source = createBlackMediaSource();
+      stage = 'ffmpeg-output';
+      await waitForMediaSource(source);
+      logMediaEvent('info', 'media.ffmpeg_ready', { account: name, guildId, channelId: session.channelId, mediaKind, attempt, pid: source.sourceProcess.pid });
       const active = { streamer, controller, sourceProcess: source.sourceProcess, guildId, channelId: session.channelId, mediaKind, startedAt };
       syntheticStreams.set(name, active);
       const task = playStream(source.stream, streamer, { type: mediaKind, format: 'nut', width: 640, height: 360, frameRate: 15 }, controller.signal);
+      stage = 'webrtc-ready';
       active.task = task;
       task.then(() => {
         active.completedAt = Date.now();
@@ -770,6 +795,7 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
         };
         check();
       }), 6000, 'WebRTC media transport was not ready');
+      logMediaEvent('info', 'media.webrtc_ready', { account: name, guildId, channelId: session.channelId, mediaKind, attempt });
       if (active.completedAt || syntheticStreams.get(name) !== active) throw new Error('Media transport stopped before activation');
       const mediaState = mediaKind === 'camera'
         ? { selfMute: !!session.selfMute, selfDeaf: false, selfVideo: true, selfStream: false }
@@ -797,7 +823,7 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
       try { streamer?.stopStream?.(); } catch {}
       if (syntheticStreams.get(name)?.streamer === streamer) syntheticStreams.delete(name);
       if (createdStreamer && mediaStreamers.get(name) === streamer) mediaStreamers.delete(name);
-      logMediaEvent('error', 'media.attempt_failed', { account: name, guildId, channelId: session.channelId, mediaKind, attempt, error: error?.message || String(error) });
+      logMediaEvent('error', 'media.attempt_failed', { account: name, guildId, channelId: session.channelId, mediaKind, attempt, stage, error: error?.message || String(error) });
       if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 250));
     }
   }
