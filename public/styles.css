@@ -285,3 +285,4 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .task-row.has-task-errors { border-color: rgba(255, 105, 125, .38); }
 .task-error-badge { display: inline-block; margin-inline-start: 7px; padding: 3px 7px; border-radius: 999px; background: rgba(255, 105, 125, .14); color: var(--red); font-size: 8px; font-style: normal; font-weight: 800; }
 .rotation-error { display: inline-block; color: var(--red); font-size: 9px; font-weight: 800; }
+.rotation-countdown { display: inline-block; margin-inline-start: 6px; color: var(--violet-bright); font-size: 9px; font-weight: 800; }

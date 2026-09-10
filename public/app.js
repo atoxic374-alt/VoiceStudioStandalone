@@ -34,7 +34,7 @@ async function checkForUpdate() {
   } catch {}
 }
 function initUpdateNotice() {
-  $('#updateReloadButton')?.addEventListener('click', () => window.location.reload());
+  $('#updateReloadButton')?.addEventListener('click', () => { const notice = $('#updateNotice'); if (notice) notice.hidden = true; window.location.replace(`${window.location.pathname}?reload=${Date.now()}`); });
   checkForUpdate();
   setInterval(checkForUpdate, 30000);
 }
@@ -446,7 +446,7 @@ function renderProfiles(clients = []) {
     const rotation = state.tasks.find((task) => task.type === 'rotation' && task.accounts?.includes(client.name));
     const rotationResult = rotation?.accountStatus?.[client.name] || rotation?.lastResults?.find((item) => item.name === client.name);
     const rotationAlert = rotationResult?.ok === false ? `<span class="rotation-error">Rotation error: ${escapeHTML(rotationResult.error || 'failed')}</span>` : '';
-    const rotationInfo = rotation ? `${rotationAlert}<span class="rotation-status">Rotation active · ${escapeHTML(rotationResult?.ok === false ? 'retrying' : (rotation.accountTargets?.[client.name] ? `last room ${rotation.accountTargets[client.name]}` : 'waiting'))}</span><button type="button" class="rotation-info-button" data-rotation-info="${escapeHTML(rotation.id)}">Details · ${Math.round((rotation.intervalMs || 0) / 60000)} min</button>` : '';
+    const rotationInfo = rotation ? `${rotationAlert}<span class="rotation-status">Rotation active · ${escapeHTML(rotationResult?.ok === false ? 'retrying' : (rotation.accountTargets?.[client.name] ? `last room ${rotation.accountTargets[client.name]}` : 'waiting'))}</span><span class="rotation-countdown" data-profile-rotation-countdown="${escapeHTML(rotation.id)}">${escapeHTML(taskCountdownLabel(rotation))}</span><button type="button" class="rotation-info-button" data-rotation-info="${escapeHTML(rotation.id)}">Details · ${Math.round((rotation.intervalMs || 0) / 60000)} min</button>` : '';
     const voiceText = voice ? `<span class="profile-voice-destination"><span class="profile-guild-icon">${voice.guildIcon ? `<img src="${escapeHTML(voice.guildIcon)}" alt="" />` : '◆'}</span><span><small>Voice: ${escapeHTML(voice.channelName || voice.channelId)}</small><small>Server: ${escapeHTML(voice.guildName || voice.guildId)}</small></span></span>${rotationInfo}` : `${rotationInfo || 'Not in a room'}`;
     const flags = voice ? `${voice.selfMute ? 'Mute' : 'Unmute'}${voice.selfDeaf ? ' · Deafen' : ''}${voice.selfVideo ? ' · Video' : ''}${voice.selfStream ? ' · Stream' : ''}` : 'Offline'; const health = client.health || {}; const healthText = health.state === 'healthy' ? 'Healthy' : health.state === 'degraded' ? `Degraded${health.lastError ? ` · ${health.lastError}` : ''}` : 'Unknown';
     return `<div class="profile-row"><span class="profile-row-avatar">${avatar}</span><div class="profile-row-main"><strong>${escapeHTML(client.nickname || client.displayName || client.name)}</strong><small>@${escapeHTML(client.username || client.name)} · ID: ${escapeHTML(client.id || '—')} · <span class="health-${escapeHTML(health.state || 'unknown')}">${escapeHTML(healthText)}</span></small></div><div class="profile-row-voice"><span class="profile-online"></span><strong>${voiceText}</strong><small>${flags}</small></div><button class="profile-leave" type="button" data-profile-leave="${escapeHTML(client.name)}" data-profile-guild="${escapeHTML(voice?.guildId || '')}" ${voice ? '' : 'disabled'}>Leave</button></div>`;
@@ -634,7 +634,7 @@ function renderTasks(tasks) {
   list.querySelectorAll('[data-task-details]').forEach((button) => button.addEventListener('click', () => openTaskDetails(button.dataset.taskDetails)));
   list.querySelectorAll('.task-stop').forEach((button) => button.addEventListener('click', () => stopTask(button.dataset.taskType, button.dataset.taskId)));
 }
-function refreshTaskCountdowns() { state.tasks.forEach((task) => { const countdown = document.querySelector(`[data-task-countdown="${CSS.escape(task.id)}"]`); if (countdown) countdown.textContent = taskCountdownLabel(task); const summary = document.querySelector(`[data-task-summary="${CSS.escape(task.id)}"]`); if (summary) summary.textContent = taskLiveSummary(task); }); }
+function refreshTaskCountdowns() { state.tasks.forEach((task) => { const countdown = document.querySelector(`[data-task-countdown="${CSS.escape(task.id)}"]`); if (countdown) countdown.textContent = taskCountdownLabel(task); document.querySelectorAll(`[data-profile-rotation-countdown="${CSS.escape(task.id)}"]`).forEach((item) => { item.textContent = taskCountdownLabel(task); }); const summary = document.querySelector(`[data-task-summary="${CSS.escape(task.id)}"]`); if (summary) summary.textContent = taskLiveSummary(task); }); }
 $('#taskDetailsClose')?.addEventListener('click', () => { $('#taskDetailsModal').hidden = true; });
 $('#taskDetailsModal')?.addEventListener('click', (event) => { if (event.target.id === 'taskDetailsModal') event.currentTarget.hidden = true; });
 async function bulkJoinSelected() {
