@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
-const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId, cleanAccountRecords, normalizeExclusiveVoiceState } = require('../server');
+const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId, cleanAccountRecords, normalizeExclusiveVoiceState, clearVoiceFlags } = require('../server');
 
 test('cleans saved account records before they can affect the account count', () => {
   const records = cleanAccountRecords([
@@ -23,6 +23,13 @@ test('treats each rotation item as one exclusive voice mode', () => {
   assert.deepEqual(normalizeExclusiveVoiceState({ selfMute: true, selfStream: true }), { selfMute: false, selfDeaf: false, selfVideo: false, selfStream: true });
   assert.deepEqual(normalizeExclusiveVoiceState({ selfDeaf: true, selfVideo: true }), { selfMute: false, selfDeaf: false, selfVideo: true, selfStream: false });
   assert.deepEqual(normalizeExclusiveVoiceState({}), { selfMute: false, selfDeaf: false, selfVideo: false, selfStream: false });
+});
+
+test('clears every previous voice flag before the next rotation state', async () => {
+  const { client, getSent } = fakeClient();
+  const result = await clearVoiceFlags(client, 'guild-1', 'channel-1', { selfMute: true, selfDeaf: true, selfStream: true });
+  assert.equal(result.ok, true);
+  assert.deepEqual(getSent().d, { guild_id: 'guild-1', channel_id: 'channel-1', self_mute: false, self_deaf: false, self_video: false, self_stream: false });
 });
 
 function fakeClient({ ready = true, confirms = true } = {}) {

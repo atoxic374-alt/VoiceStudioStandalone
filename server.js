@@ -237,7 +237,9 @@ async function recoverVoiceAfterStateFailure(name, guildId, current) {
   }
   return restored;
 }
-async function executeStateForAccount(name, task, requestedState) {
+async function executeStateForAccount(name, task, requestedState, expectedRunToken = null) {
+  const taskIsCurrent = () => task.active !== false && (expectedRunToken == null || task.runToken === expectedRunToken);
+  if (!taskIsCurrent()) return { name, ok: false, stale: true, error: 'State cycle was stopped or superseded' };
   if (pendingRoomMoves.has(name)) return { name, ok: false, deferred: true, error: 'State cycle deferred while the account is moving rooms' };
   const current = voiceSessions.get(sessionKey(name, task.guildId));
   const client = getClient(name);
@@ -250,7 +252,9 @@ async function executeStateForAccount(name, task, requestedState) {
     if (current.selfStream || current.selfVideo || syntheticStreams.has(name)) stopSyntheticStream(name, { leaveVoice: false });
     const cleared = await clearVoiceFlags(client, task.guildId, current.channelId, current);
     if (!cleared.ok) return { name, ok: false, error: `Unable to clear previous voice state: ${cleared.error}` };
+    if (!taskIsCurrent()) return { name, ok: false, stale: true, error: 'State cycle was stopped or superseded' };
     await waitForMediaSettle(next, current);
+    if (!taskIsCurrent()) return { name, ok: false, stale: true, error: 'State cycle was stopped or superseded' };
     let result;
     if (next.selfStream || next.selfVideo) {
       result = await startSyntheticStream(name, task.guildId, next.selfStream ? 'go-live' : 'camera', next);
@@ -2502,7 +2506,7 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
         const index = nextStateIndex(task.states, history);
         task.stateHistory[name] = [...history, index];
         task.accountStateIdx[name] = index;
-        const result = await executeStateForAccount(name, task, task.states[index]);
+        const result = await executeStateForAccount(name, task, task.states[index], runToken);
         if (!task.active || task.runToken !== runToken) return recordTaskResult(task, { name, ok: false, stale: true, error: 'State cycle stopped before completion' });
         return recordTaskResult(task, result);
       })));
@@ -2523,7 +2527,7 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
         const index = nextStateIndex(task.states, task.stateHistory[name] || []);
         task.stateHistory[name] = [index];
         task.accountStateIdx[name] = index;
-        return recordTaskResult(task, await executeStateForAccount(name, task, task.states[index]));
+        return recordTaskResult(task, await executeStateForAccount(name, task, task.states[index], task.runToken));
       })));
       task.nextAt = Date.now() + task.intervalMs;
       persistAutomationTasks();
@@ -2621,4 +2625,4 @@ if (require.main === module) {
   app.listen(PORT, '0.0.0.0', () => { console.log(`Voice Studio listening on http://localhost:${PORT}`); setInterval(() => { try { reconcileVoiceSessions(); } catch (error) { console.warn('[voice] session reconciliation failed:', error.message); } }, 3000).unref?.(); startVoiceWatchdog(); restoreSavedAccounts().then(() => restoreAutomationTasks()).catch((error) => console.warn('[restore] restore failed:', error.message)); });
 }
 
-module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, normalizeExclusiveVoiceState, cleanAccountRecords, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck };
+module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, normalizeExclusiveVoiceState, clearVoiceFlags, cleanAccountRecords, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck };
