@@ -611,12 +611,21 @@ async function clearVoiceFlags(client, guildId, channelId, current = {}) {
   // cached state. Discord may still have a media flag when the local session
   // is stale or when the dedicated streamer owns the most recent transition.
   // Always send the complete zeroed OP4 payload before applying the next mode.
-  return sendVoiceOpConfirmed(client, guildId, channelId, {
+  const reset = {
     selfMute: false,
     selfDeaf: false,
     selfVideo: false,
     selfStream: false,
-  }, 6000);
+  };
+  // Discord may drop one VOICE_STATE_UPDATE while a media transport is being
+  // torn down. This reset is idempotent, so retry it before aborting rotation.
+  let last = null;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    last = await sendVoiceOpConfirmed(client, guildId, channelId, reset, attempt === 0 ? 6000 : 3000);
+    if (last.ok) return last;
+    if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 350 * (attempt + 1)));
+  }
+  return last || { ok: false, error: 'Unable to reset voice state' };
 }
 function readPersistedSessions() {
   try {
@@ -1079,8 +1088,8 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
   const channel = client.guilds?.cache?.get?.(guildId)?.channels?.cache?.get?.(session.channelId);
   if (!channel) return { ok: false, error: 'Voice channel is not available for streaming' };
   let primaryConnection = client.voice?.connection;
-    if ((!primaryConnection || String(voiceConnectionChannelId(primaryConnection)) !== String(session.channelId))
-        && typeof client.voice?.joinChannel === 'function') {
+  if ((!primaryConnection || String(voiceConnectionChannelId(primaryConnection)) !== String(session.channelId))
+      && typeof client.voice?.joinChannel === 'function') {
     try {
       primaryConnection = await withTimeout(client.voice.joinChannel(channel, {
         selfMute: !!session.selfMute,
@@ -1569,11 +1578,17 @@ function sendVoiceOpConfirmed(client, guildId, channelId, opts = {}, timeoutMs =
     const matches = (guild, channel) => String(guild) === String(guildId)
       && (channelId == null ? channel == null : String(channel) === String(channelId));
     const stateMatches = (data) => {
-      if (!data || String(data.user_id) !== String(userId) || !matches(data.guild_id, data.channel_id)) return false;
+      const payload = data?.d?.d || data?.d || data;
+      const eventUserId = payload?.user_id ?? payload?.userId ?? payload?.member?.user?.id;
+      const eventGuildId = payload?.guild_id ?? payload?.guildId ?? payload?.guild?.id;
+      const eventChannelId = payload?.channel_id ?? payload?.channelId ?? payload?.channel?.id ?? null;
+      if (!payload || String(eventUserId) !== String(userId) || !matches(eventGuildId, eventChannelId)) return false;
       const flags = [
         ['self_mute', 'selfMute'], ['self_deaf', 'selfDeaf'], ['self_video', 'selfVideo'], ['self_stream', 'selfStream'],
       ];
-      return flags.every(([wire, local]) => opts[local] === undefined || (data[wire] !== undefined && !!data[wire] === !!opts[local]));
+      return flags.every(([wire, local]) => opts[local] === undefined
+        || ((payload[wire] !== undefined || payload[local] !== undefined)
+          && !!(payload[wire] ?? payload[local]) === !!opts[local]));
     };
     const cachedStateMatches = () => {
       const state = readGatewayVoiceState(client, guildId);
@@ -1818,7 +1833,14 @@ async function moveAccountLocked(name, guildId, channelId, opts = {}) {
         // state event but miss VOICE_SERVER_UPDATE entirely.
         await waitForMediaSettle(desired, current);
         const media = await startSyntheticStream(name, guildId, desired.selfStream ? 'go-live' : 'camera');
-        if (!media.ok) { endAccountOperation(operation); return { name, ok: false, error: media.error, channelId }; }
+        // Room membership is already confirmed at this point. A media
+        // handshake can fail independently (for example when Discord drops
+        // VOICE_SERVER_UPDATE); do not report the room move as failed or the
+        // rotation will immediately try another room and appear stuck.
+        if (!media.ok) {
+          endAccountOperation(operation);
+          return { name, ok: true, channelId, mediaOk: false, mediaError: media.error, warning: `Room joined; media start failed: ${media.error}` };
+        }
       }
     }
     endAccountOperation(operation);

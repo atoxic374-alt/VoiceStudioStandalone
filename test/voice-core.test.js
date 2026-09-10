@@ -87,6 +87,13 @@ test('confirms a raw gateway envelope and rejects mismatched requested flags', a
   assert.equal((await pending).ok, true);
 });
 
+test('confirms a doubly wrapped gateway voice event', async () => {
+  const { client } = fakeClient({ confirms: false });
+  const pending = sendVoiceOpConfirmed(client, 'guild-1', 'channel-1', { selfMute: false }, 250);
+  client.ws.emit('VOICE_STATE_UPDATE', { d: { d: { user_id: 'user-1', guild_id: 'guild-1', channel_id: 'channel-1', self_mute: false } } });
+  assert.equal((await pending).ok, true);
+});
+
 test('returns a clear error when the gateway is not ready', async () => {
   const { client } = fakeClient({ ready: false });
   const result = await sendVoiceOpConfirmed(client, 'guild-1', 'channel-1', {}, 250);
