@@ -225,7 +225,7 @@ async function executeStateForAccount(name, task, requestedState) {
       Object.assign(current, next, { updatedAt: Date.now() });
       persistSessions();
     }
-    return { name, ok: result.ok, error: result.ok ? null : result.error };
+    return { name, ok: result.ok, permissionDenied: result.permissionDenied === true, error: result.ok ? null : result.error };
   } finally {
     endAccountOperation(operation);
   }
@@ -750,6 +750,11 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
   if (existing) stopSyntheticStream(name);
   const channel = client.guilds?.cache?.get?.(guildId)?.channels?.cache?.get?.(session.channelId);
   if (!channel) return { ok: false, error: 'Voice channel is not available for streaming' };
+  const mediaTarget = validateMediaTarget(client, guildId, session.channelId);
+  if (!mediaTarget.ok) {
+    logMediaEvent('warn', 'media.permission_denied', { account: name, guildId, channelId: session.channelId, mediaKind, error: mediaTarget.error });
+    return { ok: false, error: mediaTarget.error, permissionDenied: true };
+  }
   const startedAt = Date.now();
   let lastError;
   for (let attempt = 1; attempt <= 2; attempt += 1) {
