@@ -102,8 +102,9 @@ const accountLocks = new Map();
 const MEDIA_SETTLE_DELAY_MS = 4000;
 const MEDIA_JOIN_TIMEOUT_MS = Math.max(10000, Number(process.env.MEDIA_JOIN_TIMEOUT_MS || 20000));
 const MEDIA_WEBRTC_TIMEOUT_MS = Math.max(6000, Number(process.env.MEDIA_WEBRTC_TIMEOUT_MS || 10000));
-// Media starts are a real queue: the next account waits until the previous
-// account's media attempt returns (ready or failed), then starts immediately.
+// Media starts are serialized through an explicit FIFO queue. The next camera
+// or Go Live account starts only after the previous attempt has reached a
+// terminal result (ready, failed, or cancelled) and its resources are cleaned.
 // An optional gap can still be configured, but the default is zero.
 const MEDIA_START_GAP_MS = Math.max(0, Number(process.env.MEDIA_START_GAP_MS || 0));
 const SYNTHETIC_VIDEO_FILE = path.join(DATA_DIR, 'synthetic-stream-black-v2.mp4');
@@ -118,7 +119,9 @@ const mediaDesired = new Map();
 const mediaRunGenerations = new Map();
 const pendingRoomMoves = new Set();
 let watchdogRunning = false;
-let mediaStartTail = Promise.resolve();
+const mediaStartQueue = [];
+let mediaStartRunning = false;
+let mediaStartSequence = 0;
 
 function ok(res, payload = {}) { return res.json({ success: true, ...payload }); }
 function redact(value) { return String(value ?? '').replace(/(token|authorization|password|cookie)(["']?\s*[:=]\s*["']?)[^"',;\s}]+/gi, '$1$2[redacted]'); }
@@ -945,20 +948,47 @@ function voiceConnectionChannelId(connection) {
   return connection?.channel?.id ?? connection?.channelId ?? connection?.channel_id ?? null;
 }
 async function startSyntheticStream(name, guildId, mediaKind = 'go-live', desiredState = null) {
-  // Serialize the full media-start operation across all accounts. Each
-  // account still owns an independent Streamer; only the start operations are
-  // queued so the next account begins after the previous result is known.
-  const previous = mediaStartTail;
   const generation = Number(mediaRunGenerations.get(name) || 0);
-  let release;
-  mediaStartTail = new Promise((resolve) => { release = resolve; });
-  await previous.catch(() => {});
-  try {
-    if (generation !== Number(mediaRunGenerations.get(name) || 0)) return { ok: false, cancelled: true, error: 'Media start cancelled by a newer account operation' };
-    const result = await startSyntheticStreamUnqueued(name, guildId, mediaKind, desiredState, generation);
-    if (MEDIA_START_GAP_MS > 0) await new Promise((resolve) => setTimeout(resolve, MEDIA_START_GAP_MS));
-    return result;
-  } finally { release(); }
+  const sequence = ++mediaStartSequence;
+  const position = mediaStartQueue.length + (mediaStartRunning ? 1 : 0) + 1;
+  logMediaEvent('info', 'media.queue_enter', { sequence, account: name, guildId, mediaKind, position, queueDepth: mediaStartQueue.length + (mediaStartRunning ? 1 : 0) });
+  const result = await new Promise((resolve) => {
+    mediaStartQueue.push({ sequence, name, guildId, mediaKind, desiredState, generation, resolve });
+    processMediaStartQueue();
+  });
+  return result;
+}
+async function processMediaStartQueue() {
+  if (mediaStartRunning) return;
+  mediaStartRunning = true;
+  while (mediaStartQueue.length) {
+    const item = mediaStartQueue.shift();
+    let result;
+    const startedAt = Date.now();
+    logMediaEvent('info', 'media.queue_start', { sequence: item.sequence, account: item.name, guildId: item.guildId, mediaKind: item.mediaKind, queueDepth: mediaStartQueue.length });
+    try {
+      if (item.generation !== Number(mediaRunGenerations.get(item.name) || 0)) {
+        result = { ok: false, cancelled: true, error: 'Media start cancelled by a newer account operation' };
+      } else {
+        result = await startSyntheticStreamUnqueued(item.name, item.guildId, item.mediaKind, item.desiredState, item.generation);
+      }
+    } catch (error) {
+      result = { ok: false, error: error?.message || String(error) };
+    } finally {
+      logMediaEvent(result?.ok ? 'info' : 'warn', 'media.queue_complete', { sequence: item.sequence, account: item.name, guildId: item.guildId, mediaKind: item.mediaKind, ok: result?.ok === true, cancelled: result?.cancelled === true, durationMs: Date.now() - startedAt, queueDepth: mediaStartQueue.length, error: result?.ok ? undefined : result?.error });
+      item.resolve(result || { ok: false, error: 'Media queue item completed without a result' });
+      if (MEDIA_START_GAP_MS > 0 && mediaStartQueue.length) await new Promise((resolve) => setTimeout(resolve, MEDIA_START_GAP_MS));
+    }
+  }
+  mediaStartRunning = false;
+}
+function mediaQueueSnapshot() {
+  return {
+    running: mediaStartRunning,
+    active: mediaStartRunning ? 1 : 0,
+    pending: mediaStartQueue.length,
+    items: mediaStartQueue.map((item, index) => ({ sequence: item.sequence, account: item.name, guildId: item.guildId, mediaKind: item.mediaKind, position: index + 1 })),
+  };
 }
 async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live', desiredState = null, generation = Number(mediaRunGenerations.get(name) || 0)) {
   const pendingRestart = pendingMediaRestarts.get(name);
@@ -2042,6 +2072,7 @@ app.get('/api/voice/media-logs', (_req, res) => {
     return ok(res, { logs: lines });
   } catch (error) { return fail(res, new Error(`Unable to read media logs: ${error.message}`), 500); }
 });
+app.get('/api/voice/media-queue', (_req, res) => ok(res, { queue: mediaQueueSnapshot() }));
 app.get('/api/voice/target-accounts', (req, res) => {
   const guildId = String(req.query?.guildId || '').trim();
   const channelId = String(req.query?.channelId || '').trim();
