@@ -32,6 +32,13 @@ test('clears every previous voice flag before the next rotation state', async ()
   assert.deepEqual(getSent().d, { guild_id: 'guild-1', channel_id: 'channel-1', self_mute: false, self_deaf: false, self_video: false, self_stream: false });
 });
 
+test('always sends an explicit voice reset when cached state has no flags', async () => {
+  const { client, getSent } = fakeClient();
+  const result = await clearVoiceFlags(client, 'guild-1', 'channel-1', {});
+  assert.equal(result.ok, true);
+  assert.deepEqual(getSent().d, { guild_id: 'guild-1', channel_id: 'channel-1', self_mute: false, self_deaf: false, self_video: false, self_stream: false });
+});
+
 function fakeClient({ ready = true, confirms = true } = {}) {
   const ws = new EventEmitter();
   let sent = null;

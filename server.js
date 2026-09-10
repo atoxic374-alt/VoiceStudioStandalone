@@ -607,7 +607,10 @@ async function waitForMediaSettle(next, current) {
   if ((next?.selfStream || next?.selfVideo) && current?.channelId) await new Promise((resolve) => setTimeout(resolve, MEDIA_SETTLE_DELAY_MS));
 }
 async function clearVoiceFlags(client, guildId, channelId, current = {}) {
-  if (!hasVoiceFlags(current)) return { ok: true, skipped: true };
+  // Clearing is an explicit transition barrier, not an optimization based on
+  // cached state. Discord may still have a media flag when the local session
+  // is stale or when the dedicated streamer owns the most recent transition.
+  // Always send the complete zeroed OP4 payload before applying the next mode.
   return sendVoiceOpConfirmed(client, guildId, channelId, {
     selfMute: false,
     selfDeaf: false,
@@ -1110,9 +1113,15 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
       return primaryResult;
     }
     // A primary StreamConnection timeout is recoverable. Its handshake has
-    // been cleaned above, so continue with the dedicated Streamer transport
-    // instead of returning a failed media state immediately.
-    logMediaEvent('warn', 'media.primary_transport_failed', { account: name, guildId, channelId: session.channelId, mediaKind, error: primaryResult.error, fallback: 'dedicated-streamer' });
+    // been cleaned above, but do not start a second voice handshake on the
+    // same Gateway identity. The old fallback created a Dedicated Streamer
+    // while the primary VoiceConnection was still authoritative; that is the
+    // exact condition behind the missing VOICE_SERVER_UPDATE/token entries in
+    // the production log. Returning the primary error keeps one owner for the
+    // voice session and lets the caller's normal retry/watchdog retry safely.
+    logMediaEvent('warn', 'media.primary_transport_failed', { account: name, guildId, channelId: session.channelId, mediaKind, error: primaryResult.error, fallback: 'blocked' });
+    logMediaEvent('error', 'media.dedicated_fallback_blocked', { account: name, guildId, channelId: session.channelId, mediaKind, reason: 'primary-voice-connection-exists' });
+    return primaryResult;
   }
   logMediaEvent('warn', 'media.primary_transport_unavailable', { account: name, guildId, channelId: session.channelId, mediaKind, hasConnection: !!primaryConnection, connectionChannelId: voiceConnectionChannelId(primaryConnection), hasCreateStreamConnection: typeof primaryConnection?.createStreamConnection === 'function' });
   let lastError;
