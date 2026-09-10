@@ -100,6 +100,8 @@ liveEvents.setMaxListeners(0);
 const accountLocks = new Map();
 const MEDIA_SETTLE_DELAY_MS = 4000;
 const SYNTHETIC_VIDEO_FILE = path.join(DATA_DIR, 'synthetic-stream-black-v2.mp4');
+const DISCORD_REQUEST_GAP_MS = Math.max(0, Number(process.env.DISCORD_REQUEST_GAP_MS || 120));
+let nextDiscordRequestAt = 0;
 
 function ok(res, payload = {}) { return res.json({ success: true, ...payload }); }
 function redact(value) { return String(value ?? '').replace(/(token|authorization|password|cookie)(["']?\s*[:=]\s*["']?)[^"',;\s}]+/gi, '$1$2[redacted]'); }
@@ -225,6 +227,12 @@ function pickPlayingPhrase(value) {
   const choices = String(value || '').split('|').map((item) => item.trim()).filter(Boolean);
   return choices.length ? choices[Math.floor(Math.random() * choices.length)] : '';
 }
+async function waitForDiscordRequestSlot() {
+  const now = Date.now();
+  const scheduled = Math.max(now, nextDiscordRequestAt);
+  nextDiscordRequestAt = scheduled + DISCORD_REQUEST_GAP_MS;
+  if (scheduled > now) await new Promise((resolve) => setTimeout(resolve, scheduled - now));
+}
 function componentLabel(component) { const label = component?.label || component?.data?.label || ''; const emoji = component?.emoji || component?.data?.emoji; const emojiName = typeof emoji === 'string' ? emoji : emoji?.name || emoji?.id || ''; return `${String(label).trim()} ${String(emojiName).trim()}`.trim(); }
 function messageButtons(message) { return (message?.components || []).flatMap((row) => row?.components || []).filter((component) => String(component?.type || '').toUpperCase() === 'BUTTON' || component?.type === 2); }
 function normalizePlayingButton(value) { return String(value || '').normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').replace(/\s+/g, ' ').trim().toLocaleLowerCase(); }
@@ -240,6 +248,7 @@ async function dispatchPlayingButton(message, customId, details) {
   return { ok: true, responded: true };
 }
 async function findPlayingButton(channel, session, step) {
+  await waitForDiscordRequestSlot();
   const messages = await channel.messages.fetch({ limit: 50 }).catch(() => null);
   if (!messages) return null;
   const entries = [...messages.values()].sort((a, b) => Number(b.createdTimestamp || 0) - Number(a.createdTimestamp || 0));
@@ -272,6 +281,7 @@ async function findPlayingButton(channel, session, step) {
   return null;
 }
 async function findAnyPlayingButton(channel, session) {
+  await waitForDiscordRequestSlot();
   const messages = await channel.messages.fetch({ limit: 50 }).catch(() => null);
   if (!messages) return null;
   const entries = [...messages.values()].sort((a, b) => Number(b.createdTimestamp || 0) - Number(a.createdTimestamp || 0));
@@ -306,6 +316,7 @@ async function sendPlayingPhrase(session, canContinue = () => true) {
   const entry = clients.get(session.account); const client = entry?.client;
   if (!client) return { ok: false, error: 'Account is not connected' };
   const safety = playingSafety.get(session.account) || 0; if (Date.now() < safety) { const waitMs = safety - Date.now(); logPlayingEvent('safety.cooldown', { account: session.account, waitMs }); return { ok: false, waiting: true, safety: true, error: `Safety cooldown ${Math.ceil(waitMs / 1000)}s` }; }
+  await waitForDiscordRequestSlot();
   const channel = await client.channels?.fetch?.(session.channelId).catch?.(() => null);
   if (!channel?.messages?.fetch) return { ok: false, error: 'Text channel is not available for this account' };
   const found = await findAnyPlayingButton(channel, session);
@@ -331,6 +342,7 @@ async function sendPlayingPhrase(session, canContinue = () => true) {
   if (!canContinue()) return { ok: false, stopped: true, error: 'Playing session stopped before message' };
   logPlayingEvent('phrase.send.started', { account: session.account, phrase, button: step.button });
   try {
+    await waitForDiscordRequestSlot();
     await channel.send(phrase);
   } catch (error) {
     // Sending the optional follow-up phrase must never stop the Playing loop.
@@ -474,6 +486,12 @@ function summary(results) {
 function retryableError(error) {
   const text = String(error?.error || error?.message || '').toLowerCase();
   return /timeout|timed out|did not confirm|gateway not ready|no active gateway|web.?rtc|media transport|temporar|rate.?limit|connection|socket|network/.test(text);
+}
+function isInvalidCredentialError(error) {
+  const status = Number(error?.status || error?.statusCode || 0);
+  const code = Number(error?.code || 0);
+  const text = String(error?.error || error?.message || '').toLowerCase();
+  return status === 401 || code === 40001 || code === 4004 || /invalid token|improper token|token is invalid|incorrect login details/.test(text);
 }
 async function withResultRetry(worker, maxRetries = 2) {
   let last = null;
@@ -860,12 +878,19 @@ async function connectOneWithRetry(token, name) {
     try { return await connectOne(token, name); }
     catch (error) {
       lastError = error;
+      // A temporary gateway/network/rate-limit failure is not evidence that
+      // Discord rotated or revoked the token. Do not label or destroy the
+      // account for that case; the caller can retry it later.
+      if (isInvalidCredentialError(error)) break;
       if (attempt === 0) await new Promise((resolve) => setTimeout(resolve, 500));
     }
   }
   const finalName = String(name || '').trim().slice(0, 48) || `account-${clients.size + 1}`;
-  markTokenChanged(finalName, String(token || '').trim(), lastError);
-  throw new Error(`Token changed or invalid after retry: ${lastError?.message || 'Login failed'}`);
+  if (isInvalidCredentialError(lastError)) {
+    markTokenChanged(finalName, String(token || '').trim(), lastError);
+    throw new Error(`Token is invalid or was revoked: ${lastError?.message || 'Discord rejected the token'}`);
+  }
+  throw new Error(`Temporary Discord connection failure after retry: ${lastError?.message || 'Gateway unavailable'}`);
 }
 function rotationControlledAccounts(guildId) {
   const controlled = new Set();
