@@ -1425,6 +1425,7 @@ app.post('/api/voice/rotation/start', async (req, res) => {
         return moveAccount(name, task.guildId, ids[targetIndex], normalizeVoiceState(current || {}));
       }));
       task.nextAt = Date.now() + task.intervalMs;
+      persistAutomationTasks();
     } finally { task.running = false; }
   }, delay);
   rotations.set(id, task);
@@ -1508,6 +1509,7 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
       })));
       const roomTask = task.phaseRoomId ? rotations.get(task.phaseRoomId) : null;
       task.nextAt = roomTask ? Number(roomTask.nextAt || Date.now() + task.intervalMs) + Number(task.phaseGapMs || 0) : Date.now() + task.intervalMs;
+      persistAutomationTasks();
     } finally { task.running = false; if (task.active) task.timer = setTimeout(runStateCycle, Math.max(1000, task.nextAt - Date.now())); }
   };
   task.timer = setTimeout(runStateCycle, Math.max(1000, task.nextAt - Date.now()));
@@ -1537,32 +1539,44 @@ async function restoreAutomationTasks() {
     if (!item.id || !item.guildId || !Array.isArray(item.channels) || item.channels.length < 2) continue;
     const accounts = cleanAccounts(item.accounts);
     if (taskAccountConflicts(accounts, item.guildId, 'rotation').length) continue;
-    const task = { ...item, accounts, running: false, active: true };
-    task.timer = setInterval(async () => {
-      if (!task.active || task.running) return;
+    const task = { ...item, accounts, running: false, active: true, intervalMs: Math.max(1000, Number(item.intervalMs || 60000)), nextAt: Number(item.nextAt || Date.now() + Number(item.intervalMs || 60000)) };
+    const runRotation = async () => {
+      if (!task.active) return;
+      if (task.nextAt > Date.now()) { task.timer = setTimeout(runRotation, task.nextAt - Date.now()); return; }
+      if (task.running) { task.timer = setTimeout(runRotation, 1000); return; }
       task.running = true;
       task.currentIdx = (task.currentIdx + 1) % task.channels.length;
-      const ids = task.randomOrder ? [...task.channels].sort(() => Math.random() - 0.5) : task.channels;
+      const randomTargets = task.randomOrder
+        ? randomRotationTargets(task.accounts, task.channels, (name) => voiceSessions.get(sessionKey(name, task.guildId))?.channelId)
+        : null;
       try {
         task.lastResults = await mapWithConcurrency(task.accounts, 8, (name, index) => withResultRetry(() => {
           const current = voiceSessions.get(sessionKey(name, task.guildId));
-          const currentIndex = ids.indexOf(current?.channelId);
-          const targetIndex = currentIndex >= 0 ? (currentIndex + 1) % ids.length : (task.currentIdx + index) % ids.length;
-          return moveAccount(name, task.guildId, ids[targetIndex], normalizeVoiceState(current || {}));
+          const randomTarget = randomTargets?.get(name);
+          if (randomTarget) return moveAccount(name, task.guildId, randomTarget, normalizeVoiceState(current || {}));
+          const currentIndex = task.channels.indexOf(current?.channelId);
+          const targetIndex = currentIndex >= 0 ? (currentIndex + 1) % task.channels.length : (task.currentIdx + index) % task.channels.length;
+          return moveAccount(name, task.guildId, task.channels[targetIndex], normalizeVoiceState(current || {}));
         }));
+      } finally {
+        task.running = false;
         task.nextAt = Date.now() + task.intervalMs;
         persistAutomationTasks();
-      } finally { task.running = false; }
-    }, Math.max(1000, Number(task.intervalMs || 60000)));
+        if (task.active) task.timer = setTimeout(runRotation, task.intervalMs);
+      }
+    };
     rotations.set(task.id, task);
+    task.timer = setTimeout(runRotation, Math.max(0, task.nextAt - Date.now()));
   }
   for (const item of Array.isArray(saved.stateCycles) ? saved.stateCycles : []) {
     if (!item.id || !item.guildId || !Array.isArray(item.states) || item.states.length < 2) continue;
     const accounts = cleanAccounts(item.accounts);
     if (taskAccountConflicts(accounts, item.guildId, 'cycle').length) continue;
-    const task = { ...item, accounts, running: false, active: true };
-    task.timer = setInterval(async () => {
-      if (!task.active || task.running) return;
+    const task = { ...item, accounts, running: false, active: true, intervalMs: Math.max(1000, Number(item.intervalMs || 60000)), nextAt: Number(item.nextAt || Date.now() + Number(item.intervalMs || 60000)) };
+    const runStateCycle = async () => {
+      if (!task.active) return;
+      if (task.nextAt > Date.now()) { task.timer = setTimeout(runStateCycle, task.nextAt - Date.now()); return; }
+      if (task.running) { task.timer = setTimeout(runStateCycle, 1000); return; }
       task.running = true;
       task.currentIdx = (task.currentIdx + 1) % task.states.length;
       const state = normalizeVoiceState(task.states[task.currentIdx]);
@@ -1579,11 +1593,16 @@ async function restoreAutomationTasks() {
           if (result.ok) { Object.assign(current, next, { updatedAt: Date.now() }); persistSessions(); }
           return { name, ok: result.ok, error: result.ok ? null : result.error };
         })));
-        task.nextAt = Date.now() + task.intervalMs;
+      } finally {
+        task.running = false;
+        const roomTask = task.phaseRoomId ? rotations.get(task.phaseRoomId) : null;
+        task.nextAt = roomTask ? Number(roomTask.nextAt || Date.now() + task.intervalMs) + Number(task.phaseGapMs || 0) : Date.now() + task.intervalMs;
         persistAutomationTasks();
-      } finally { task.running = false; }
-    }, Math.max(1000, Number(task.intervalMs || 60000)));
+        if (task.active) task.timer = setTimeout(runStateCycle, Math.max(1000, task.nextAt - Date.now()));
+      }
+    };
     stateCycles.set(task.id, task);
+    task.timer = setTimeout(runStateCycle, Math.max(0, task.nextAt - Date.now()));
   }
 }
 app.get('/{*splat}', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
