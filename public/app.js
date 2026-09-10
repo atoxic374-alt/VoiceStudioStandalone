@@ -644,7 +644,7 @@ async function startRotation() {
   if (!guildId) { toast('اختر السيرفر الذي ستعمل عليه المهمة', 'error'); return; }
   if (channelIds.length < 2) { toast('حدد رومتين على الأقل للتنقل بينهما', 'error'); return; }
   const guild = state.allGroups.find((group) => group.guildId === guildId);
-  const intervalMs = Math.max(1, Number($('#automationMinutes').value || 5)) * 60000;
+  const intervalMs = Math.max(1, Number($('#rotationMinutes').value || 5)) * 60000;
   try { await post('/api/voice/rotation/start', { accounts, guildId, guildName: guild?.guildName || guildId, channelIds, intervalMs, randomOrder: $('#randomRotation').checked }); toast('بدأ التنقل الدوري بين القنوات', 'success'); addActivity('مهمة جديدة', 'التنقل بين القنوات', 'success'); await loadTasks(); }
   catch (error) { toast(error.message, 'error'); }
 }
@@ -657,7 +657,7 @@ async function startCycle() {
   const selected = selectedAutomationStates();
   if (selected.length < 2) { toast('اختر حالتين على الأقل', 'error'); return; }
   const stateMap = { unmute: { selfMute: false, selfDeaf: false, selfVideo: false, selfStream: false }, mute: { selfMute: true, selfDeaf: false, selfVideo: false, selfStream: false }, deaf: { selfMute: true, selfDeaf: true, selfVideo: false, selfStream: false }, cam: { selfMute: false, selfDeaf: false, selfVideo: true, selfStream: false }, stream: { selfMute: false, selfDeaf: false, selfVideo: false, selfStream: true } };
-  const intervalMs = Math.max(1, Number($('#automationMinutes').value || 5)) * 60000;
+  const intervalMs = Math.max(1, Number($('#stateCycleMinutes').value || 5)) * 60000;
   try { await post('/api/voice/state-cycle/start', { accounts, guildId, states: selected.map((key) => stateMap[key]), intervalMs }); toast('بدأ تدوير الحالات الصوتية', 'success'); addActivity('مهمة جديدة', 'تدوير الحالات الصوتية', 'success'); await loadTasks(); }
   catch (error) { toast(error.message, 'error'); }
 }
