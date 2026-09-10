@@ -857,8 +857,11 @@ async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live')
   const signaling = waitForDiscordStreamEvents(client, guildId, session.channelId, 8000);
   try {
     streamConnection = await withTimeout(connection.createStreamConnection(), 8000, 'Discord media connection timed out after 8 seconds');
-    await signaling;
     const dispatcher = streamConnection.playVideo(source.stream, { fps: 15, presetH26x: 'superfast', bitrate: 300, inputFFmpegArgs: ['-re'], outputFFmpegArgs: ['-g', '30'] });
+    // playVideo() sends STREAM_CREATE/STREAM_SERVER_UPDATE. Waiting for those
+    // events before calling it creates a circular wait and forces the code to
+    // fall back to a competing Streamer voice connection.
+    await signaling;
     const active = { connection, streamConnection, dispatcher, sourceProcess: source.sourceProcess, guildId, channelId: session.channelId, mediaKind };
     syntheticStreams.set(name, active);
     dispatcher.on?.('error', (error) => logMediaEvent('error', 'stream.runtime_failed', { account: name, guildId, channelId: session.channelId, error: error?.message || String(error) }));
