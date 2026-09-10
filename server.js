@@ -691,6 +691,58 @@ function withTimeout(promise, timeoutMs, message) {
   let timer;
   return Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), timeoutMs); })]).finally(() => clearTimeout(timer));
 }
+function mediaJoinDiagnostics(client, streamer, guildId, channelId, events = {}) {
+  const connection = streamer?.voiceConnection;
+  const shard = client?.ws?.shards?.first?.() || client?.ws?.shards?.get?.(0);
+  const status = connection?.status || {};
+  return {
+    gatewayStatus: shard?.status ?? null,
+    gatewayReady: shard?.status === undefined ? null : shard.status === 0,
+    targetGuildId: String(guildId),
+    targetChannelId: String(channelId),
+    voiceConnectionCreated: !!connection,
+    voiceGuildId: connection?.guildId ?? null,
+    voiceChannelId: connection?.channelId ?? null,
+    hasSession: !!connection?.session_id || status.hasSession === true,
+    hasVoiceToken: !!connection?.token || status.hasToken === true,
+    voiceSocketStarted: status.started === true,
+    voiceSocketOpen: connection?.ws?.readyState === 1,
+    webRtcReady: connection?.webRtcConn?.ready === true,
+    events,
+  };
+}
+async function joinMediaVoiceWithDiagnostics(client, streamer, guildId, channelId, timeoutMs, context) {
+  const events = { voiceState: 0, voiceServer: 0, rawVoiceState: 0, rawVoiceServer: 0 };
+  const onRaw = (packet) => {
+    if (packet?.t === 'VOICE_STATE_UPDATE' && String(packet.d?.user_id) === String(client.user?.id)) events.rawVoiceState += 1;
+    if (packet?.t === 'VOICE_SERVER_UPDATE' && (!packet.d?.guild_id || String(packet.d.guild_id) === String(guildId))) events.rawVoiceServer += 1;
+  };
+  const onVoiceState = () => { events.voiceState += 1; };
+  const onVoiceServer = () => { events.voiceServer += 1; };
+  client?.on?.('raw', onRaw);
+  streamer?._gatewayEmitter?.on?.('VOICE_STATE_UPDATE', onVoiceState);
+  streamer?._gatewayEmitter?.on?.('VOICE_SERVER_UPDATE', onVoiceServer);
+  logMediaEvent('info', 'media.join.diagnostics_start', { ...context, diagnostics: mediaJoinDiagnostics(client, streamer, guildId, channelId, events) });
+  try {
+    return await withTimeout(streamer.joinVoice(guildId, channelId), timeoutMs, 'Dedicated media voice connection timed out');
+  } catch (error) {
+    const diagnostics = mediaJoinDiagnostics(client, streamer, guildId, channelId, events);
+    logMediaEvent('error', 'media.join.diagnostics_failed', { ...context, error: error?.message || String(error), diagnostics });
+    const waiting = [];
+    if (!diagnostics.gatewayReady) waiting.push('gateway-not-ready');
+    if (!diagnostics.hasSession) waiting.push('VOICE_STATE_UPDATE/session');
+    if (!diagnostics.hasVoiceToken) waiting.push('VOICE_SERVER_UPDATE/token');
+    if (!diagnostics.voiceSocketStarted) waiting.push('voice-socket-not-started');
+    if (diagnostics.voiceSocketStarted && !diagnostics.voiceSocketOpen) waiting.push('voice-socket-not-open');
+    if (diagnostics.voiceSocketOpen && !diagnostics.webRtcReady) waiting.push('voice-websocket/WebRTC');
+    const detail = waiting.length ? waiting.join(', ') : 'unknown-join-stage';
+    throw new Error(`${error?.message || String(error)} [stage=${detail}; diagnostics=${JSON.stringify(diagnostics)}]`);
+  } finally {
+    client?.off?.('raw', onRaw);
+    streamer?._gatewayEmitter?.off?.('VOICE_STATE_UPDATE', onVoiceState);
+    streamer?._gatewayEmitter?.off?.('VOICE_SERVER_UPDATE', onVoiceServer);
+  }
+}
 function waitForWebRtcReady(streamer, timeoutMs = 6000) {
   return withTimeout(new Promise((resolve) => {
     const startedAt = Date.now();
@@ -810,7 +862,7 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
       stage = 'join-voice';
       logMediaEvent('info', 'media.join.start', { account: name, guildId, channelId: session.channelId, mediaKind, attempt });
       logMediaEvent('info', 'media.join.waiting_gateway', { account: name, guildId, channelId: session.channelId, mediaKind, attempt, timeoutMs: MEDIA_JOIN_TIMEOUT_MS });
-      await withTimeout(streamer.joinVoice(guildId, session.channelId), MEDIA_JOIN_TIMEOUT_MS, `Dedicated media voice connection timed out after ${Math.round(MEDIA_JOIN_TIMEOUT_MS / 1000)} seconds`);
+      await joinMediaVoiceWithDiagnostics(client, streamer, guildId, session.channelId, MEDIA_JOIN_TIMEOUT_MS, { account: name, mediaKind, attempt });
       if (!isCurrentRun()) throw new Error('Media start cancelled by a newer account operation');
       logMediaEvent('info', 'media.join.ready', { account: name, guildId, channelId: session.channelId, mediaKind, attempt });
       controller = new AbortController();
