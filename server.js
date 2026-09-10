@@ -1533,7 +1533,7 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
       ? await startRotationMediaWithFallback(name, task.guildId, next)
       : await sendVoiceOpConfirmed(client, task.guildId, current.channelId, next, 6000);
     if (!operationIsCurrent(operation)) { endAccountOperation(operation); return { name, ok: false, stale: true, error: 'State operation was superseded by a newer request' }; }
-    if (result.ok) { Object.assign(current, next, { selfStream: !!next.selfStream, updatedAt: Date.now() }); persistSessions(); }
+    if (result.ok) { const applied = result.appliedState || next; Object.assign(current, applied, { selfStream: !!applied.selfStream, updatedAt: Date.now() }); persistSessions(); }
     endAccountOperation(operation);
     return { name, ok: result.ok, error: result.ok ? null : result.error };
   })));
