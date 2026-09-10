@@ -583,6 +583,8 @@ function stopSyntheticStream(name, { leaveVoice = false } = {}) {
   }
   mediaRestartAttempts.delete(name);
   const active = syntheticStreams.get(name);
+  const trackedStreamer = mediaStreamers.get(name);
+  const streamers = [...new Set([active?.streamer, trackedStreamer].filter(Boolean))];
   if (active) {
     try { active.controller?.abort?.(); } catch {}
     try { active.sourceProcess?.kill?.('SIGTERM'); } catch {}
@@ -597,7 +599,13 @@ function stopSyntheticStream(name, { leaveVoice = false } = {}) {
     }
   }
   syntheticStreams.delete(name);
-  const streamer = mediaStreamers.get(name);
+  for (const streamer of streamers) {
+    try { streamer.stopStream?.(); } catch {}
+    try { streamer.voiceConnection?.stop?.(); } catch {}
+    try { streamer._gatewayEmitter?.removeAllListeners?.(); } catch {}
+    try { streamer._voiceConnection = undefined; } catch {}
+  }
+  const streamer = trackedStreamer;
   if (leaveVoice) {
     try { streamer?.leaveVoice?.(); } catch {}
   }
@@ -645,16 +653,18 @@ function createBlackMediaSource() {
   return { stream: sourceProcess.stdout, sourceProcess };
 }
 function waitForMediaSource(source, timeoutMs = 3000) {
-  return withTimeout(new Promise((resolve, reject) => {
+  let cleanup = () => {};
+  const waiting = new Promise((resolve, reject) => {
     let received = false;
     const onData = (chunk) => {
       if (chunk?.length) { received = true; cleanup(); resolve({ bytes: chunk.length }); }
     };
     const onClose = (code, signal) => { if (!received) { cleanup(); reject(new Error(`FFmpeg exited before producing media (code=${code}, signal=${signal || 'none'})`)); } };
-    const cleanup = () => { source.stream.off('data', onData); source.sourceProcess.off('close', onClose); };
+    cleanup = () => { source.stream.off('data', onData); source.sourceProcess.off('close', onClose); };
     source.stream.on('data', onData);
     source.sourceProcess.once('close', onClose);
-  }), timeoutMs, 'FFmpeg produced no media data within 3 seconds');
+  });
+  return withTimeout(waiting, timeoutMs, 'FFmpeg produced no media data within 3 seconds').catch((error) => { cleanup(); throw error; });
 }
 function waitForDiscordStreamEvents(client, guildId, channelId, timeoutMs = 8000) {
   const expectedKey = `guild:${guildId}:${channelId}:${String(client.user?.id || '')}`;
