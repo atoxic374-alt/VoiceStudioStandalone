@@ -1726,12 +1726,26 @@ async function connectOne(token, name) {
   emitLive('account.connected', { account: accountHealth(finalName, entry) });
 
   // Restore only the channel state; media capture remains browser-owned and must be
-  // explicitly re-enabled by the user after reconnecting.
+  // explicitly re-enabled by the user after reconnecting. Use VoiceManager here
+  // as well: sending OP4 alone restores Discord's visible state but does not
+  // create client.voice.connection, which would force the next media start into
+  // the competing dedicated Streamer fallback.
   setTimeout(() => {
     for (const session of voiceSessions.values()) {
       if (session.name !== finalName) continue;
-      sendVoiceOp(client, session.guildId, session.channelId, {
-        selfMute: session.selfMute, selfDeaf: session.selfDeaf, selfVideo: false, selfStream: false,
+      const channel = client.guilds?.cache?.get?.(session.guildId)?.channels?.cache?.get?.(session.channelId);
+      if (!channel || typeof client.voice?.joinChannel !== 'function') {
+        logMediaEvent('warn', 'voice.restore.unavailable', { account: finalName, guildId: session.guildId, channelId: session.channelId, reason: 'VoiceManager or channel unavailable' });
+        return;
+      }
+      client.voice.joinChannel(channel, {
+        selfMute: !!session.selfMute,
+        selfDeaf: !!session.selfDeaf,
+        selfVideo: false,
+      }).then(() => {
+        logMediaEvent('info', 'voice.restore.ready', { account: finalName, guildId: session.guildId, channelId: session.channelId });
+      }).catch((error) => {
+        logMediaEvent('warn', 'voice.restore.failed', { account: finalName, guildId: session.guildId, channelId: session.channelId, error: error?.message || String(error) });
       });
     }
   }, 1200).unref?.();
