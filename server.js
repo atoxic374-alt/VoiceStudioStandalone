@@ -782,13 +782,6 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
       logMediaEvent('info', 'media.streamer_created', { account: name, guildId, channelId: session.channelId, mediaKind, attempt });
       mediaStreamers.set(name, streamer);
       createdStreamer = true;
-      streamer.signalVideo = (enabled) => streamer.sendOpcode(4, {
-        guild_id: guildId,
-        channel_id: session.channelId,
-        self_mute: !!session.selfMute,
-        self_deaf: false,
-        self_video: !!enabled,
-      });
       const mediaConnection = streamer.voiceConnection;
       if (mediaConnection && (String(mediaConnection.guildId) !== String(guildId) || String(mediaConnection.channelId) !== String(session.channelId))) {
         // Do not send an account-level voice leave while replacing a stale
