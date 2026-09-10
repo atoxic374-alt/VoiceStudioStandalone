@@ -102,6 +102,7 @@ const accountLocks = new Map();
 const MEDIA_SETTLE_DELAY_MS = 4000;
 const MEDIA_JOIN_TIMEOUT_MS = Math.max(10000, Number(process.env.MEDIA_JOIN_TIMEOUT_MS || 20000));
 const MEDIA_WEBRTC_TIMEOUT_MS = Math.max(6000, Number(process.env.MEDIA_WEBRTC_TIMEOUT_MS || 10000));
+const MEDIA_STREAM_TIMEOUT_MS = Math.max(12000, Number(process.env.MEDIA_STREAM_TIMEOUT_MS || 20000));
 // Media starts are serialized through an explicit FIFO queue. The next camera
 // or Go Live account starts only after the previous attempt has reached a
 // terminal result (ready, failed, or cancelled) and its resources are cleaned.
@@ -628,6 +629,9 @@ function stopSyntheticStream(name, { leaveVoice = false, silent = false, invalid
     }
     try { active.dispatcher?.destroy?.(); } catch {}
     try { active.streamConnection?.disconnect?.(); } catch {}
+    if (active.connection?.streamConnection === active.streamConnection) {
+      try { active.connection.streamConnection = null; } catch {}
+    }
     try { active.streamer?.voiceConnection?.stop?.(); } catch {}
     try { active.streamer?._gatewayEmitter?.removeAllListeners?.(); } catch {}
     if (!leaveVoice && active.streamer) {
@@ -907,9 +911,9 @@ async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live',
   let streamConnection;
   let dispatcher;
   let active;
-  const signaling = waitForDiscordStreamEvents(client, guildId, session.channelId, 8000);
+  const signaling = waitForDiscordStreamEvents(client, guildId, session.channelId, MEDIA_STREAM_TIMEOUT_MS);
   try {
-    streamConnection = await withTimeout(connection.createStreamConnection(), 8000, 'Discord media connection timed out after 8 seconds');
+    streamConnection = await withTimeout(connection.createStreamConnection(), MEDIA_STREAM_TIMEOUT_MS, `Discord media connection timed out after ${Math.round(MEDIA_STREAM_TIMEOUT_MS / 1000)} seconds`);
     // playVideo() sends STREAM_CREATE/STREAM_SERVER_UPDATE. Waiting for those
     // events before calling it creates a circular wait and forces the code to
     // fall back to a competing Streamer voice connection.
@@ -940,6 +944,9 @@ async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live',
     else {
       try { dispatcher?.destroy?.(); } catch {}
       try { streamConnection?.disconnect?.(); } catch {}
+      if (connection.streamConnection === streamConnection) {
+        try { connection.streamConnection = null; } catch {}
+      }
     }
     return { ok: false, error: error.message || 'Unable to start Go Live' };
   }
@@ -1046,10 +1053,12 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
       mediaDesired.set(name, { guildId, channelId: session.channelId, mediaKind });
       mediaRestartAttempts.delete(name);
       logMediaEvent('info', 'media.ready', { account: name, guildId, channelId: session.channelId, mediaKind, transport: 'primary-voice', durationMs: Date.now() - startedAt });
-    } else {
-      logMediaEvent('error', 'media.primary_transport_failed', { account: name, guildId, channelId: session.channelId, mediaKind, error: primaryResult.error });
+      return primaryResult;
     }
-    return primaryResult;
+    // A primary StreamConnection timeout is recoverable. Its handshake has
+    // been cleaned above, so continue with the dedicated Streamer transport
+    // instead of returning a failed media state immediately.
+    logMediaEvent('warn', 'media.primary_transport_failed', { account: name, guildId, channelId: session.channelId, mediaKind, error: primaryResult.error, fallback: 'dedicated-streamer' });
   }
   logMediaEvent('warn', 'media.primary_transport_unavailable', { account: name, guildId, channelId: session.channelId, mediaKind, hasConnection: !!primaryConnection, connectionChannelId: voiceConnectionChannelId(primaryConnection), hasCreateStreamConnection: typeof primaryConnection?.createStreamConnection === 'function' });
   let lastError;
