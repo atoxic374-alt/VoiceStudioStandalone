@@ -683,6 +683,7 @@ async function moveRotationAccount(name, task, preferredChannelId, opts = {}) {
   const start = Math.max(0, ids.indexOf(preferredChannelId));
   const ordered = [...ids.slice(start), ...ids.slice(0, start)];
   let last = { name, ok: false, error: 'All rotation rooms failed', attemptedChannels: [] };
+  const wasOutsideRoom = !voiceSessions.has(sessionKey(name, task.guildId));
   for (const channelId of ordered) {
     const result = await withResultRetry(() => moveAccount(name, task.guildId, channelId, opts));
     if (result.ok) {
