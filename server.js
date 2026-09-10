@@ -782,23 +782,16 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
       logMediaEvent('info', 'media.streamer_created', { account: name, guildId, channelId: session.channelId, mediaKind, attempt });
       mediaStreamers.set(name, streamer);
       createdStreamer = true;
-      const mediaConnection = streamer.voiceConnection;
-      if (mediaConnection && (String(mediaConnection.guildId) !== String(guildId) || String(mediaConnection.channelId) !== String(session.channelId))) {
-        // Do not send an account-level voice leave while replacing a stale
-        // dedicated transport. The subsequent joinVoice call selects the
-        // requested room without disturbing the primary voice session.
-        try { streamer.stopStream?.(); } catch {}
-      }
-      if (!streamer.voiceConnection) {
-        stage = 'join-voice';
-        logMediaEvent('info', 'media.join.start', { account: name, guildId, channelId: session.channelId, mediaKind, attempt });
-        logMediaEvent('info', 'media.join.waiting_gateway', { account: name, guildId, channelId: session.channelId, mediaKind, attempt, timeoutMs: MEDIA_JOIN_TIMEOUT_MS });
-        await withTimeout(streamer.joinVoice(guildId, session.channelId), MEDIA_JOIN_TIMEOUT_MS, `Dedicated media voice connection timed out after ${Math.round(MEDIA_JOIN_TIMEOUT_MS / 1000)} seconds`);
+      // A fresh Streamer can expose a placeholder voiceConnection before its
+      // gateway/WebRTC handshake is complete. Always call joinVoice for a new
+      // transport; checking only the object existence can skip the handshake
+      // and leave the media connection waiting until the timeout.
+      stage = 'join-voice';
+      logMediaEvent('info', 'media.join.start', { account: name, guildId, channelId: session.channelId, mediaKind, attempt });
+      logMediaEvent('info', 'media.join.waiting_gateway', { account: name, guildId, channelId: session.channelId, mediaKind, attempt, timeoutMs: MEDIA_JOIN_TIMEOUT_MS });
+      await withTimeout(streamer.joinVoice(guildId, session.channelId), MEDIA_JOIN_TIMEOUT_MS, `Dedicated media voice connection timed out after ${Math.round(MEDIA_JOIN_TIMEOUT_MS / 1000)} seconds`);
       if (!isCurrentRun()) throw new Error('Media start cancelled by a newer account operation');
-        logMediaEvent('info', 'media.join.ready', { account: name, guildId, channelId: session.channelId, mediaKind, attempt });
-      } else {
-        logMediaEvent('info', 'media.join.reuse', { account: name, guildId, channelId: session.channelId, mediaKind, attempt });
-      }
+      logMediaEvent('info', 'media.join.ready', { account: name, guildId, channelId: session.channelId, mediaKind, attempt });
       controller = new AbortController();
       source = createBlackMediaSource();
       stage = 'ffmpeg-output';
