@@ -746,7 +746,16 @@ function mediaJoinDiagnostics(client, streamer, guildId, channelId, events = {})
     gatewayShardId: shard?.id ?? 0,
     targetGuildId: String(guildId),
     targetChannelId: String(channelId),
-    targetValidation,
+    targetValidation: {
+      ok: targetValidation.ok,
+      error: targetValidation.error || null,
+      guildId: targetValidation.guild?.id ?? String(guildId),
+      channelId: targetValidation.channel?.id ?? String(channelId),
+      channelType: targetValidation.channel?.type ?? null,
+      channelName: targetValidation.channel?.name ?? null,
+      userLimit: targetValidation.channel?.userLimit ?? null,
+      memberCount: targetValidation.channel?.members?.size ?? null,
+    },
     voiceConnectionCreated: !!connection,
     voiceGuildId: connection?.guildId ?? null,
     voiceChannelId: connection?.channelId ?? null,
@@ -1485,9 +1494,19 @@ function readGatewayVoiceState(client, guildId) {
 }
 async function confirmLiveMediaTarget(client, guildId, channelId, delayMs = 120) {
   const read = () => {
-    const target = validateMediaTarget(client, guildId, channelId);
+    const rawTarget = validateMediaTarget(client, guildId, channelId);
+    const target = {
+      ok: rawTarget.ok,
+      error: rawTarget.error || null,
+      guildId: rawTarget.guild?.id ?? String(guildId),
+      channelId: rawTarget.channel?.id ?? String(channelId),
+      channelType: rawTarget.channel?.type ?? null,
+      channelName: rawTarget.channel?.name ?? null,
+      userLimit: rawTarget.channel?.userLimit ?? null,
+      memberCount: rawTarget.channel?.members?.size ?? null,
+    };
     const state = readGatewayVoiceState(client, guildId);
-    const matches = target.ok && state?.channelId != null && String(state.channelId) === String(channelId);
+    const matches = rawTarget.ok && state?.channelId != null && String(state.channelId) === String(channelId);
     return { target, state, matches };
   };
   const first = read();
