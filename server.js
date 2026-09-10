@@ -366,6 +366,21 @@ function cleanChannelIds(channelIds) {
   if (!Array.isArray(channelIds)) return [];
   return [...new Set(channelIds.map((value) => String(value || '').trim()).filter(Boolean))].slice(0, 500);
 }
+function randomRotationTargets(accounts, channels, currentChannelFor) {
+  const remainingAccounts = [...accounts].sort(() => Math.random() - 0.5);
+  const usedTargets = new Set();
+  const targets = new Map();
+  for (const name of remainingAccounts) {
+    const current = currentChannelFor(name);
+    const available = channels.filter((channel) => channel !== current && !usedTargets.has(channel));
+    const fallback = channels.filter((channel) => channel !== current);
+    const choices = available.length ? available : fallback.length ? fallback : channels;
+    const target = choices[Math.floor(Math.random() * choices.length)];
+    targets.set(name, target);
+    usedTargets.add(target);
+  }
+  return targets;
+}
 async function mapWithConcurrency(items, limit, worker) {
   const results = new Array(items.length); let cursor = 0;
   const run = async () => { while (true) { const index = cursor++; if (index >= items.length) return; results[index] = await worker(items[index], index); } };
@@ -1367,8 +1382,13 @@ app.post('/api/voice/rotation/start', async (req, res) => {
   if (!accounts.length || !guildId || !Array.isArray(channelIds) || channelIds.length < 2) return fail(res, new Error('At least two channels and one account are required'), 400);
   const conflicts = taskAccountConflicts(accounts, guildId, 'rotation');
   if (conflicts.length) return fail(res, new Error(`These accounts already have a room rotation: ${conflicts.join(', ')}`), 409);
+  const initialTargets = randomOrder
+    ? randomRotationTargets(accounts, channelIds, (name) => voiceSessions.get(sessionKey(name, guildId))?.channelId)
+    : null;
   const initial = await mapWithConcurrency(accounts, 8, (name, index) => withResultRetry(() => {
     const current = voiceSessions.get(sessionKey(name, guildId));
+    const target = initialTargets?.get(name);
+    if (target) return moveAccount(name, guildId, target, normalizeVoiceState(current || {}));
     const currentIndex = channelIds.indexOf(current?.channelId);
     const targetIndex = currentIndex >= 0 ? (currentIndex + 1) % channelIds.length : index % channelIds.length;
     return moveAccount(name, guildId, channelIds[targetIndex], normalizeVoiceState(current || {}));
@@ -1383,10 +1403,15 @@ app.post('/api/voice/rotation/start', async (req, res) => {
     if (!task.active || task.running) return;
     task.running = true;
     task.currentIdx = (task.currentIdx + 1) % task.channels.length;
-    const ids = task.randomOrder ? [...task.channels].sort(() => Math.random() - 0.5) : task.channels;
+    const randomTargets = task.randomOrder
+      ? randomRotationTargets(task.accounts, task.channels, (name) => voiceSessions.get(sessionKey(name, task.guildId))?.channelId)
+      : null;
     try {
       task.lastResults = await mapWithConcurrency(task.accounts, 8, (name, index) => withResultRetry(() => {
         const current = voiceSessions.get(sessionKey(name, task.guildId));
+        const randomTarget = randomTargets?.get(name);
+        if (randomTarget) return moveAccount(name, task.guildId, randomTarget, normalizeVoiceState(current || {}));
+        const ids = task.channels;
         const currentIndex = ids.indexOf(current?.channelId);
         const targetIndex = currentIndex >= 0 ? (currentIndex + 1) % ids.length : (task.currentIdx + index) % ids.length;
         return moveAccount(name, task.guildId, ids[targetIndex], normalizeVoiceState(current || {}));
@@ -1558,4 +1583,4 @@ if (require.main === module) {
   app.listen(PORT, '0.0.0.0', () => { console.log(`Voice Studio listening on http://localhost:${PORT}`); setInterval(() => { try { reconcileVoiceSessions(); } catch (error) { console.warn('[voice] session reconciliation failed:', error.message); } }, 3000).unref?.(); restoreSavedAccounts().then(() => restoreAutomationTasks()).catch((error) => console.warn('[restore] restore failed:', error.message)); });
 }
 
-module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase };
+module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets };

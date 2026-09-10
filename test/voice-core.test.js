@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
-const { sendVoiceOp, sendVoiceOpConfirmed, rotations, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand } = require('../server');
+const { sendVoiceOp, sendVoiceOpConfirmed, rotations, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets } = require('../server');
 
 function fakeClient({ ready = true, confirms = true } = {}) {
   const ws = new EventEmitter();
@@ -247,5 +247,23 @@ test('Discord start and stop commands control every Playing session with one rea
     for (const [account, session] of saved) playingSessions.set(account, session);
     if (previousOwners === undefined) delete process.env.DISCORD_COMMAND_OWNERS;
     else process.env.DISCORD_COMMAND_OWNERS = previousOwners;
+  }
+});
+
+test('random room rotation assigns independent targets and avoids current rooms when possible', () => {
+  const originalRandom = Math.random;
+  Math.random = () => 0;
+  try {
+    const targets = randomRotationTargets(
+      ['account-a', 'account-b', 'account-c'],
+      ['room-1', 'room-2', 'room-3'],
+      (account) => ({ 'account-a': 'room-1', 'account-b': 'room-2', 'account-c': 'room-3' }[account]),
+    );
+    assert.deepEqual([...targets.values()].sort(), ['room-1', 'room-2', 'room-3']);
+    assert.notEqual(targets.get('account-a'), 'room-1');
+    assert.notEqual(targets.get('account-b'), 'room-2');
+    assert.notEqual(targets.get('account-c'), 'room-3');
+  } finally {
+    Math.random = originalRandom;
   }
 });
