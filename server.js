@@ -900,6 +900,12 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
   if (existing) stopSyntheticStream(name);
   const channel = client.guilds?.cache?.get?.(guildId)?.channels?.cache?.get?.(session.channelId);
   if (!channel) return { ok: false, error: 'Voice channel is not available for streaming' };
+  const liveTarget = await confirmLiveMediaTarget(client, guildId, session.channelId);
+  if (!liveTarget.ok) {
+    logMediaEvent('warn', 'media.live_target_changed', { account: name, guildId, channelId: session.channelId, mediaKind, error: liveTarget.error, first: liveTarget.first, second: liveTarget.second });
+    return { ok: false, error: liveTarget.error };
+  }
+  logMediaEvent('info', 'media.live_target_confirmed', { account: name, guildId, channelId: session.channelId, mediaKind, confirmations: 2 });
   const mediaTarget = validateMediaTarget(client, guildId, session.channelId);
   if (!mediaTarget.ok) {
     logMediaEvent('warn', 'media.permission_denied', { account: name, guildId, channelId: session.channelId, mediaKind, error: mediaTarget.error });
@@ -1476,6 +1482,20 @@ function readGatewayVoiceState(client, guildId) {
     selfVideo: !!(state.selfVideo ?? state.self_video),
     selfStream: !!(state.streaming ?? state.selfStream ?? state.self_stream),
   };
+}
+async function confirmLiveMediaTarget(client, guildId, channelId, delayMs = 120) {
+  const read = () => {
+    const target = validateMediaTarget(client, guildId, channelId);
+    const state = readGatewayVoiceState(client, guildId);
+    const matches = target.ok && state?.channelId != null && String(state.channelId) === String(channelId);
+    return { target, state, matches };
+  };
+  const first = read();
+  if (!first.matches) return { ok: false, error: 'Live voice target changed or is no longer available', first };
+  await new Promise((resolve) => setTimeout(resolve, delayMs));
+  const second = read();
+  if (!second.matches) return { ok: false, error: 'Live voice target changed during confirmation', first, second };
+  return { ok: true, guildId: String(guildId), channelId: String(channelId), first, second };
 }
 function upsertSession(name, guildId, channelId, opts = {}) {
   const previous = voiceSessions.get(sessionKey(name, guildId));
@@ -2221,4 +2241,4 @@ if (require.main === module) {
   app.listen(PORT, '0.0.0.0', () => { console.log(`Voice Studio listening on http://localhost:${PORT}`); setInterval(() => { try { reconcileVoiceSessions(); } catch (error) { console.warn('[voice] session reconciliation failed:', error.message); } }, 3000).unref?.(); startVoiceWatchdog(); restoreSavedAccounts().then(() => restoreAutomationTasks()).catch((error) => console.warn('[restore] restore failed:', error.message)); });
 }
 
-module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets };
+module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets };
