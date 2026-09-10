@@ -1878,11 +1878,7 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
   const id = crypto.randomUUID();
   const task = { id, type: 'cycle', accounts, guildId, states, intervalMs: delay, currentIdx: 0, accountStateIdx: {}, runToken: 0, startedAt: Date.now(), nextAt: Date.now() + delay };
   task.running = false; task.active = true;
-  task.lastResults = await mapWithConcurrency(task.accounts, AUTOMATION_CONCURRENCY, (name) => withResultRetry(() => withAccountLock(name, async () => {
-    const index = randomStateIndex(task.states);
-    task.accountStateIdx[name] = index;
-    return recordTaskResult(task, await executeStateForAccount(name, task, task.states[index]));
-  })));
+  task.lastResults = [];
   const runStateCycle = async () => {
     if (task.nextAt > Date.now()) { if (task.active) task.timer = setTimeout(runStateCycle, task.nextAt - Date.now()); return; }
     if (!task.active || task.running) return;
@@ -1903,10 +1899,30 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
       emitLive('task.completed', { id: task.id, taskType: 'cycle', nextAt: task.nextAt, currentIdx: task.currentIdx, results: task.lastResults });
     } finally { task.running = false; if (task.active) task.timer = setTimeout(runStateCycle, Math.max(1000, task.nextAt - Date.now())); }
   };
-  task.timer = setTimeout(runStateCycle, Math.max(1000, task.nextAt - Date.now()));
   stateCycles.set(id, task);
   persistAutomationTasks();
-  return ok(res, { id });
+  // Do not hold the HTTP request open while Stream/WebRTC accounts initialize.
+  // Eight accounts can take minutes through the media queue and otherwise make
+  // the browser report "Failed to fetch" even though the server is working.
+  setImmediate(async () => {
+    task.running = true;
+    try {
+      task.lastResults = await mapWithConcurrency(task.accounts, AUTOMATION_CONCURRENCY, (name) => withResultRetry(() => withAccountLock(name, async () => {
+        const index = randomStateIndex(task.states);
+        task.accountStateIdx[name] = index;
+        return recordTaskResult(task, await executeStateForAccount(name, task, task.states[index]));
+      })));
+      task.nextAt = Date.now() + task.intervalMs;
+      persistAutomationTasks();
+      emitLive('task.initialized', { id: task.id, taskType: 'cycle', nextAt: task.nextAt, results: task.lastResults });
+    } catch (error) {
+      logMediaEvent('error', 'state_cycle.initialization_failed', { taskId: task.id, error: error.message });
+    } finally {
+      task.running = false;
+      if (task.active) task.timer = setTimeout(runStateCycle, Math.max(1000, task.nextAt - Date.now()));
+    }
+  });
+  return ok(res, { id, started: true, initializing: true, summary: { total: accounts.length, ok: 0, failed: 0, pending: accounts.length } });
 });
 app.post('/api/voice/state-cycle/stop', (req, res) => {
   const id = String(req.body?.id || '');
