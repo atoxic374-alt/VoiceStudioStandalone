@@ -574,7 +574,7 @@ function ensureSyntheticVideo() {
     throw new Error(`Unable to create synthetic stream source: ${error.message}`);
   }
 }
-function stopSyntheticStream(name, { leaveVoice = false } = {}) {
+function stopSyntheticStream(name, { leaveVoice = false, silent = false } = {}) {
   mediaRunGenerations.set(name, Number(mediaRunGenerations.get(name) || 0) + 1);
   const pendingRestart = pendingMediaRestarts.get(name);
   if (pendingRestart) {
@@ -588,8 +588,15 @@ function stopSyntheticStream(name, { leaveVoice = false } = {}) {
   if (active) {
     try { active.controller?.abort?.(); } catch {}
     try { active.sourceProcess?.kill?.('SIGTERM'); } catch {}
-    try { active.streamer?.stopStream?.(); } catch {}
-    try { active.streamer?.signalVideo?.(false); } catch {}
+    // During a room move, do not send STREAM_DELETE/OP4 from the dedicated
+    // transport. The primary voice connection is about to send the canonical
+    // state and any extra gateway signal can suppress VOICE_SERVER_UPDATE.
+    if (silent) {
+      try { active.streamer?.voiceConnection?.streamConnection?.stop?.(); } catch {}
+    } else {
+      try { active.streamer?.stopStream?.(); } catch {}
+      try { active.streamer?.signalVideo?.(false); } catch {}
+    }
     try { active.dispatcher?.destroy?.(); } catch {}
     try { active.streamConnection?.disconnect?.(); } catch {}
     try { active.streamer?.voiceConnection?.stop?.(); } catch {}
@@ -1440,7 +1447,11 @@ async function moveAccountLocked(name, guildId, channelId, opts = {}) {
       return { name, ok: true, alreadyIn: true, channelId };
     }
     const desired = normalizeVoiceState({ ...(current || {}), ...opts });
-    if (syntheticStreams.has(name) || mediaStreamers.has(name)) stopSyntheticStream(name, { leaveVoice: true });
+    // The primary discord.js voice state owns room membership. A media
+    // Streamer must be torn down without sending its own OP4 leave request;
+    // doing so races the move below and can suppress VOICE_SERVER_UPDATE for
+    // the next dedicated media connection.
+    if (syntheticStreams.has(name) || mediaStreamers.has(name)) stopSyntheticStream(name, { silent: true });
     const result = await sendVoiceOpConfirmed(client, guildId, channelId, { ...desired, selfVideo: false, selfStream: false });
     if (!operationIsCurrent(operation)) { endAccountOperation(operation); return { name, ok: false, stale: true, error: 'Voice move was superseded by a newer request' }; }
     if (result.ok) {
@@ -1453,6 +1464,12 @@ async function moveAccountLocked(name, guildId, channelId, opts = {}) {
       const actual = confirmed;
       upsertSession(name, guildId, channelId, { ...desired, ...(actual || {}), selfVideo: desired.selfVideo, selfStream: desired.selfStream });
       if (desired.selfStream || desired.selfVideo) {
+        // Discord sends the voice-state and voice-server events asynchronously.
+        // Let the primary voice connection settle after a room move before a
+        // dedicated Streamer starts its second voice handshake. Without this,
+        // the two OP4 requests can race and the media Streamer may receive the
+        // state event but miss VOICE_SERVER_UPDATE entirely.
+        await waitForMediaSettle(desired, current);
         const media = await startSyntheticStream(name, guildId, desired.selfStream ? 'go-live' : 'camera');
         if (!media.ok) { endAccountOperation(operation); return { name, ok: false, error: media.error, channelId }; }
       }
