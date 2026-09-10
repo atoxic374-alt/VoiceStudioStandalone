@@ -1689,6 +1689,18 @@ function readGatewayVoiceState(client, guildId) {
   };
   return { ...observed, ...normalizeExclusiveVoiceState(observed) };
 }
+async function waitForConfirmedVoiceChannel(client, guildId, channelId, connection = null, timeoutMs = 6000) {
+  const deadline = Date.now() + timeoutMs;
+  let last = null;
+  while (Date.now() < deadline) {
+    const observed = readGatewayVoiceState(client, guildId);
+    const returnedChannel = voiceConnectionChannelId(connection);
+    last = observed || (returnedChannel ? { channelId: returnedChannel } : null);
+    if (String(observed?.channelId || returnedChannel || '') === String(channelId)) return { ok: true, state: observed || { channelId } };
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  return { ok: false, state: last, error: `Discord did not confirm the target room ${channelId} in time` };
+}
 async function confirmLiveMediaTarget(client, guildId, channelId, delayMs = 120) {
   const read = () => {
     const rawTarget = validateMediaTarget(client, guildId, channelId);
@@ -1821,10 +1833,12 @@ async function moveAccountLocked(name, guildId, channelId, opts = {}) {
     }
     if (!operationIsCurrent(operation)) { endAccountOperation(operation); return { name, ok: false, stale: true, error: 'Voice move was superseded by a newer request' }; }
     if (result.ok) {
-      const confirmed = readGatewayVoiceState(client, guildId);
-      if (!confirmed?.channelId || String(confirmed.channelId) !== String(channelId)) {
+      const confirmation = await waitForConfirmedVoiceChannel(client, guildId, channelId, result.connection);
+      const confirmed = confirmation.state;
+      if (!confirmation.ok) {
+        logMediaEvent('warn', 'voice.room_move_unconfirmed', { account: name, guildId, channelId, observedChannelId: confirmed?.channelId || null, error: confirmation.error });
         endAccountOperation(operation);
-        return { name, ok: false, error: 'Discord confirmed the request but the account is not in the target room', channelId };
+        return { name, ok: false, error: confirmation.error, channelId };
       }
       for (const key of [...voiceSessions.keys()]) if (key.startsWith(`${name}__`) && key !== sessionKey(name, guildId)) voiceSessions.delete(key);
       const actual = confirmed;
