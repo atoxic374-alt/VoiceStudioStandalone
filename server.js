@@ -684,13 +684,33 @@ async function moveRotationAccount(name, task, preferredChannelId, opts = {}) {
   const ordered = [...ids.slice(start), ...ids.slice(0, start)];
   let last = { name, ok: false, error: 'All rotation rooms failed', attemptedChannels: [] };
   const wasOutsideRoom = !voiceSessions.has(sessionKey(name, task.guildId));
+  const mediaVariants = [opts];
+  if (opts.selfStream === true) mediaVariants.push({ ...opts, selfStream: false, selfVideo: true });
+  else if (opts.selfVideo === true) mediaVariants.push({ ...opts, selfVideo: false, selfStream: true });
   for (const channelId of ordered) {
-    const result = await withResultRetry(() => moveAccount(name, task.guildId, channelId, opts));
-    if (result.ok) {
-      task.accountTargets = { ...(task.accountTargets || {}), [name]: channelId };
-      return { ...result, attemptedChannels: [...last.attemptedChannels, channelId], resumedAfterRemoval: !voiceSessions.has(sessionKey(name, task.guildId)) };
+    for (let mediaIndex = 0; mediaIndex < mediaVariants.length; mediaIndex += 1) {
+      const variant = mediaVariants[mediaIndex];
+      const result = await withResultRetry(() => moveAccount(name, task.guildId, channelId, variant));
+      if (result.ok) {
+        task.accountTargets = { ...(task.accountTargets || {}), [name]: channelId };
+        return { ...result, attemptedChannels: [...last.attemptedChannels, channelId], mediaFallback: mediaIndex > 0 ? (variant.selfVideo ? 'camera' : 'live') : null, resumedAfterRemoval: wasOutsideRoom };
+      }
+      last = { ...result, attemptedChannels: [...last.attemptedChannels, channelId], mediaFallback: mediaIndex > 0 ? (variant.selfVideo ? 'camera' : 'live') : last.mediaFallback };
     }
-    last = { ...result, attemptedChannels: [...last.attemptedChannels, channelId] };
+  }
+  return last;
+}
+async function startRotationMediaWithFallback(name, guildId, next) {
+  const variants = next.selfStream === true
+    ? [{ ...next, selfStream: true, selfVideo: false }, { ...next, selfStream: false, selfVideo: true }]
+    : next.selfVideo === true
+      ? [{ ...next, selfVideo: true, selfStream: false }, { ...next, selfVideo: false, selfStream: true }]
+      : [{ ...next }];
+  let last = { ok: false, error: 'Media start failed' };
+  for (const variant of variants) {
+    const result = await startSyntheticStream(name, guildId, variant.selfStream ? 'go-live' : 'camera');
+    if (result.ok) return { ...result, mediaFallback: variant !== variants[0] ? (variant.selfVideo ? 'camera' : 'live') : null, appliedState: variant };
+    last = result;
   }
   return last;
 }
@@ -1510,7 +1530,7 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
     if (next.selfDeaf && (next.selfVideo || next.selfStream)) { endAccountOperation(operation); return { name, ok: false, error: 'Invalid deafened media state' }; }
     await waitForMediaSettle(next, current);
     const result = (next.selfStream || next.selfVideo)
-      ? await startSyntheticStream(name, task.guildId, next.selfStream ? 'go-live' : 'camera')
+      ? await startRotationMediaWithFallback(name, task.guildId, next)
       : await sendVoiceOpConfirmed(client, task.guildId, current.channelId, next, 6000);
     if (!operationIsCurrent(operation)) { endAccountOperation(operation); return { name, ok: false, stale: true, error: 'State operation was superseded by a newer request' }; }
     if (result.ok) { Object.assign(current, next, { selfStream: !!next.selfStream, updatedAt: Date.now() }); persistSessions(); }
