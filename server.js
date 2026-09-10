@@ -2386,6 +2386,8 @@ app.post('/api/voice/rotation/start', async (req, res) => {
   if (!accounts.length || !guildId || !Array.isArray(channelIds) || channelIds.length < 2) return fail(res, new Error('At least two channels and one account are required'), 400);
   const conflicts = taskAccountConflicts(accounts, guildId, 'rotation');
   if (conflicts.length) return fail(res, new Error(`These accounts already have a room rotation: ${conflicts.join(', ')}`), 409);
+  const stateConflicts = taskConflict(accounts, guildId, 'cycle');
+  if (stateConflicts.length) return fail(res, new Error(`These accounts already have a state/media rotation: ${stateConflicts.flatMap((item) => item.accounts).join(', ')}`), 409);
   const initialTargets = randomOrder
     ? randomRotationTargets(accounts, channelIds, (name) => voiceSessions.get(sessionKey(name, guildId))?.channelId)
     : null;
@@ -2428,6 +2430,9 @@ app.post('/api/voice/rotation/start', async (req, res) => {
   task.timer = setInterval(async () => {
     if (!task.active || task.running) return;
     task.running = true;
+    // Advance the visible deadline before doing network/media work. A slow
+    // Discord operation must not leave the dashboard stuck at 00:00.
+    task.nextAt = Date.now() + task.intervalMs;
     task.currentIdx = (task.currentIdx + 1) % task.channels.length;
     const randomTargets = task.randomOrder
       ? randomRotationTargets(task.accounts, task.channels, (name) => voiceSessions.get(sessionKey(name, task.guildId))?.channelId)
@@ -2538,6 +2543,8 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
   if (!accounts.length || !guildId || !Array.isArray(states) || states.length < 2) return fail(res, new Error('At least two states and one account are required'), 400);
   const conflicts = taskAccountConflicts(accounts, guildId, 'cycle');
   if (conflicts.length) return fail(res, new Error(`These accounts already have a state rotation: ${conflicts.join(', ')}`), 409);
+  const roomConflicts = taskConflict(accounts, guildId, 'rotation');
+  if (roomConflicts.length) return fail(res, new Error(`These accounts already have a room rotation: ${roomConflicts.flatMap((item) => item.accounts).join(', ')}`), 409);
   const validStates = states.every((item) => item && typeof item === 'object'
     && ['selfMute', 'selfDeaf', 'selfVideo', 'selfStream'].every((key) => item[key] === undefined || typeof item[key] === 'boolean')
     && !(item.selfDeaf === true && (item.selfVideo === true || item.selfStream === true)));
@@ -2615,13 +2622,14 @@ async function restoreAutomationTasks() {
   for (const item of Array.isArray(saved.rotations) ? saved.rotations : []) {
     if (!item.id || !item.guildId || !Array.isArray(item.channels) || item.channels.length < 2) continue;
     const accounts = cleanAccounts(item.accounts);
-    if (taskAccountConflicts(accounts, item.guildId, 'rotation').length) continue;
+    if (taskAccountConflicts(accounts, item.guildId, 'rotation').length || taskConflict(accounts, item.guildId, 'cycle').length) continue;
     const task = { ...item, type: 'rotation', accounts, accountTargets: { ...(item.accountTargets || {}) }, running: false, active: true, intervalMs: Math.max(1000, Number(item.intervalMs || 60000)), nextAt: Number(item.nextAt || Date.now() + Number(item.intervalMs || 60000)) };
     const runRotation = async () => {
       if (!task.active) return;
       if (task.nextAt > Date.now()) { task.timer = setTimeout(runRotation, task.nextAt - Date.now()); return; }
       if (task.running) { task.timer = setTimeout(runRotation, 1000); return; }
       task.running = true;
+      task.nextAt = Date.now() + task.intervalMs;
       task.currentIdx = (task.currentIdx + 1) % task.channels.length;
       const randomTargets = task.randomOrder
         ? randomRotationTargets(task.accounts, task.channels, (name) => voiceSessions.get(sessionKey(name, task.guildId))?.channelId)
@@ -2646,13 +2654,14 @@ async function restoreAutomationTasks() {
   for (const item of Array.isArray(saved.stateCycles) ? saved.stateCycles : []) {
     if (!item.id || !item.guildId || !Array.isArray(item.states) || item.states.length < 2) continue;
     const accounts = cleanAccounts(item.accounts);
-    if (taskAccountConflicts(accounts, item.guildId, 'cycle').length) continue;
+    if (taskAccountConflicts(accounts, item.guildId, 'cycle').length || taskConflict(accounts, item.guildId, 'rotation').length) continue;
     const task = { ...item, type: 'cycle', accounts, accountStateIdx: { ...(item.accountStateIdx || {}) }, stateHistory: { ...(item.stateHistory || {}) }, running: false, active: true, intervalMs: Math.max(1000, Number(item.intervalMs || 60000)), nextAt: Number(item.nextAt || Date.now() + Number(item.intervalMs || 60000)) };
     const runStateCycle = async () => {
       if (!task.active) return;
       if (task.nextAt > Date.now()) { task.timer = setTimeout(runStateCycle, task.nextAt - Date.now()); return; }
       if (task.running) { task.timer = setTimeout(runStateCycle, 1000); return; }
       task.running = true;
+      task.nextAt = Date.now() + task.intervalMs;
       task.currentIdx = (task.currentIdx + 1) % task.states.length;
       try {
         task.lastResults = await mapWithConcurrency(task.accounts, AUTOMATION_CONCURRENCY, (name) => withResultRetry(() => withAccountLock(name, async () => {
