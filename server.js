@@ -89,6 +89,7 @@ const stateCycles = new Map();
 const syntheticStreams = new Map();
 const mediaStreamers = new Map();
 const pendingMediaRestarts = new Map();
+const mediaRestartAttempts = new Map();
 const accountOperations = new Map();
 const playingSessions = new Map();
 const playingSafety = new Map();
@@ -106,6 +107,7 @@ const WATCHDOG_INTERVAL_MS = Math.max(5000, Number(process.env.VOICE_WATCHDOG_IN
 const WATCHDOG_CONFIRMATION_MISSES = 2;
 const WATCHDOG_REPAIR_COOLDOWN_MS = Math.max(10000, Number(process.env.VOICE_WATCHDOG_COOLDOWN_MS || 30000));
 const watchdogObservations = new Map();
+const mediaDesired = new Map();
 let watchdogRunning = false;
 
 function ok(res, payload = {}) { return res.json({ success: true, ...payload }); }
@@ -563,11 +565,20 @@ function stopSyntheticStream(name, { leaveVoice = false } = {}) {
   // Every media run gets a fresh Streamer. Releasing the reference here is
   // safe; leaving the primary voice room remains an explicit operation.
   mediaStreamers.delete(name);
+  mediaDesired.delete(name);
 }
 function scheduleMediaRestart(name, active, reason) {
   if (!active || active.restarting || pendingMediaRestarts.has(name)) return;
   active.restarting = true;
-  logMediaEvent('warn', 'media.restart_scheduled', { account: name, guildId: active.guildId, channelId: active.channelId, mediaKind: active.mediaKind, reason });
+  const attempts = Number(mediaRestartAttempts.get(name) || 0) + 1;
+  mediaRestartAttempts.set(name, attempts);
+  if (attempts > 6) {
+    active.restarting = false;
+    logMediaEvent('error', 'media.restart_paused', { account: name, guildId: active.guildId, channelId: active.channelId, mediaKind: active.mediaKind, attempts, reason });
+    return;
+  }
+  const delayMs = Math.min(5 * 60 * 1000, 1000 * (2 ** (attempts - 1)));
+  logMediaEvent('warn', 'media.restart_scheduled', { account: name, guildId: active.guildId, channelId: active.channelId, mediaKind: active.mediaKind, reason, attempts, delayMs });
   const restartTimer = setTimeout(async () => {
     pendingMediaRestarts.delete(name);
     const current = voiceSessions.get(sessionKey(name, active.guildId));
@@ -579,7 +590,7 @@ function scheduleMediaRestart(name, active, reason) {
       if (restored) Object.assign(restored, { selfVideo: active.mediaKind === 'camera', selfStream: active.mediaKind === 'go-live', updatedAt: Date.now() });
       persistSessions();
     }
-  }, 1000);
+  }, delayMs);
   pendingMediaRestarts.set(name, restartTimer);
 }
 function createBlackMediaSource() {
@@ -754,6 +765,8 @@ async function startSyntheticStream(name, guildId, mediaKind = 'go-live', desire
         // here used to force selfDeaf=true and could override the selected state.
         : { ok: true, confirmed: true, source: 'stream-transport' };
       if (!confirmed.ok) throw new Error(confirmed.error || 'Discord did not accept media state');
+      mediaDesired.set(name, { guildId, channelId: session.channelId, mediaKind });
+      mediaRestartAttempts.delete(name);
       logMediaEvent('info', 'media.ready', { account: name, guildId, channelId: session.channelId, mediaKind, durationMs: Date.now() - startedAt, attempt });
       return { ok: true };
     } catch (error) {
@@ -911,6 +924,11 @@ async function watchdogStateCycle(task, account) {
 async function watchdogMedia(session) {
   const client = getClient(session.name);
   if (!client || !session.channelId) return;
+  // Do not revive stale selfVideo/selfStream flags restored from disk after a
+  // process restart. Only repair media that was confirmed successfully during
+  // this process; normal rotation/state tasks can explicitly start it again.
+  const desired = mediaDesired.get(session.name);
+  if (!desired || String(desired.guildId) !== String(session.guildId) || String(desired.channelId) !== String(session.channelId)) return;
   const expectedKind = session.selfStream ? 'go-live' : session.selfVideo ? 'camera' : null;
   const key = watchdogKey('media', session.name, session.guildId);
   const mismatch = !!expectedKind && !syntheticStreams.has(session.name) && !pendingMediaRestarts.has(session.name);
