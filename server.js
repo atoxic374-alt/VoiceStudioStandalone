@@ -698,15 +698,36 @@ function withTimeout(promise, timeoutMs, message) {
   let timer;
   return Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), timeoutMs); })]).finally(() => clearTimeout(timer));
 }
+function voiceFailureHints(diagnostics) {
+  const hints = [];
+  if (diagnostics.gatewayReady !== true) hints.push('gateway-session-not-ready');
+  if (diagnostics.rawVoiceState === 0) hints.push('no-matching-voice-state-dispatch');
+  if (diagnostics.rawVoiceServer === 0) hints.push('no-matching-voice-server-dispatch');
+  if (diagnostics.rawVoiceState > 0 && diagnostics.rawVoiceServer === 0) hints.push('voice-server-update-missing-or-filtered');
+  if (diagnostics.rawVoiceServer > 0 && !diagnostics.hasVoiceToken) hints.push('voice-server-dispatch-without-token');
+  if (diagnostics.rawVoiceServer > 0 && !diagnostics.voiceEndpoint) hints.push('voice-server-dispatch-without-endpoint');
+  if (diagnostics.voiceEventGuildMismatch > 0) hints.push('voice-event-guild-mismatch');
+  if (diagnostics.voiceEventChannelMismatch > 0) hints.push('voice-event-channel-mismatch');
+  if (diagnostics.targetValidation?.ok === false) hints.push('target-channel-validation-failed');
+  if (diagnostics.hasSession && diagnostics.hasVoiceToken && !diagnostics.voiceSocketStarted) hints.push('voice-library-did-not-start-socket');
+  if (diagnostics.voiceSocketStarted && !diagnostics.voiceSocketOpen) hints.push('voice-socket-open-failed');
+  if (diagnostics.voiceSocketOpen && !diagnostics.webRtcReady) hints.push('webrtc-not-ready');
+  return hints;
+}
 function mediaJoinDiagnostics(client, streamer, guildId, channelId, events = {}) {
   const connection = streamer?.voiceConnection;
-  const shard = client?.ws?.shards?.first?.() || client?.ws?.shards?.get?.(0);
+  const shards = client?.ws?.shards;
+  const shard = shards?.first?.() || shards?.get?.(0);
   const status = connection?.status || {};
-  return {
+  const targetValidation = validateMediaTarget(client, guildId, channelId);
+  const diagnostics = {
     gatewayStatus: shard?.status ?? null,
     gatewayReady: shard?.status === undefined ? null : shard.status === 0,
+    gatewayShardCount: shards?.size ?? null,
+    gatewayShardId: shard?.id ?? 0,
     targetGuildId: String(guildId),
     targetChannelId: String(channelId),
+    targetValidation,
     voiceConnectionCreated: !!connection,
     voiceGuildId: connection?.guildId ?? null,
     voiceChannelId: connection?.channelId ?? null,
@@ -715,17 +736,34 @@ function mediaJoinDiagnostics(client, streamer, guildId, channelId, events = {})
     voiceSocketStarted: status.started === true,
     voiceSocketOpen: connection?.ws?.readyState === 1,
     webRtcReady: connection?.webRtcConn?.ready === true,
+    voiceEndpoint: typeof connection?.endpoint === 'string' ? connection.endpoint.replace(/^.*?:\/\//, '').split('/')[0] : null,
     events,
   };
+  diagnostics.rawVoiceState = Number(events.rawVoiceState || 0);
+  diagnostics.rawVoiceServer = Number(events.rawVoiceServer || 0);
+  diagnostics.voiceEventGuildMismatch = Number(events.voiceEventGuildMismatch || 0);
+  diagnostics.voiceEventChannelMismatch = Number(events.voiceEventChannelMismatch || 0);
+  diagnostics.failureHints = voiceFailureHints(diagnostics);
+  return diagnostics;
 }
 async function joinMediaVoiceWithDiagnostics(client, streamer, guildId, channelId, timeoutMs, context) {
-  const events = { voiceState: 0, voiceServer: 0, rawVoiceState: 0, rawVoiceServer: 0 };
+  const events = { voiceState: 0, voiceServer: 0, rawVoiceState: 0, rawVoiceServer: 0, voiceEventGuildMismatch: 0, voiceEventChannelMismatch: 0, samples: [] };
   const onRaw = (packet) => {
-    if (packet?.t === 'VOICE_STATE_UPDATE' && String(packet.d?.user_id) === String(client.user?.id)) events.rawVoiceState += 1;
-    if (packet?.t === 'VOICE_SERVER_UPDATE' && (!packet.d?.guild_id || String(packet.d.guild_id) === String(guildId))) events.rawVoiceServer += 1;
+    if (!['VOICE_STATE_UPDATE', 'VOICE_SERVER_UPDATE'].includes(packet?.t)) return;
+    const data = packet.d || {};
+    const isState = packet.t === 'VOICE_STATE_UPDATE';
+    const isOwn = !isState || String(data.user_id) === String(client.user?.id);
+    const guildMatches = !data.guild_id || String(data.guild_id) === String(guildId);
+    const channelMatches = !isState || data.channel_id == null || String(data.channel_id) === String(channelId);
+    if (!guildMatches) events.voiceEventGuildMismatch += 1;
+    if (!channelMatches) events.voiceEventChannelMismatch += 1;
+    if (isOwn && guildMatches && channelMatches) {
+      if (isState) events.rawVoiceState += 1; else events.rawVoiceServer += 1;
+    }
+    if (events.samples.length < 12) events.samples.push({ type: packet.t, guildId: data.guild_id ?? null, channelId: data.channel_id ?? null, endpoint: data.endpoint ?? null, hasToken: Boolean(data.token), hasSessionId: Boolean(data.session_id), isOwn });
   };
-  const onVoiceState = () => { events.voiceState += 1; };
-  const onVoiceServer = () => { events.voiceServer += 1; };
+  const onVoiceState = (data) => { events.voiceState += 1; if (events.samples.length < 12) events.samples.push({ type: 'streamer:VOICE_STATE_UPDATE', guildId: data?.guild_id ?? null, channelId: data?.channel_id ?? null, hasSessionId: Boolean(data?.session_id) }); };
+  const onVoiceServer = (data) => { events.voiceServer += 1; if (events.samples.length < 12) events.samples.push({ type: 'streamer:VOICE_SERVER_UPDATE', guildId: data?.guild_id ?? null, endpoint: data?.endpoint ?? null, hasToken: Boolean(data?.token) }); };
   client?.on?.('raw', onRaw);
   streamer?._gatewayEmitter?.on?.('VOICE_STATE_UPDATE', onVoiceState);
   streamer?._gatewayEmitter?.on?.('VOICE_SERVER_UPDATE', onVoiceServer);
@@ -743,7 +781,8 @@ async function joinMediaVoiceWithDiagnostics(client, streamer, guildId, channelI
     if (diagnostics.voiceSocketStarted && !diagnostics.voiceSocketOpen) waiting.push('voice-socket-not-open');
     if (diagnostics.voiceSocketOpen && !diagnostics.webRtcReady) waiting.push('voice-websocket/WebRTC');
     const detail = waiting.length ? waiting.join(', ') : 'unknown-join-stage';
-    throw new Error(`${error?.message || String(error)} [stage=${detail}; diagnostics=${JSON.stringify(diagnostics)}]`);
+    logMediaEvent('error', 'media.join.failure_classified', { ...context, stage: detail, hints: diagnostics.failureHints, diagnostics });
+    throw new Error(`${error?.message || String(error)} [stage=${detail}; hints=${diagnostics.failureHints.join('|') || 'none'}; diagnostics=${JSON.stringify(diagnostics)}]`);
   } finally {
     client?.off?.('raw', onRaw);
     streamer?._gatewayEmitter?.off?.('VOICE_STATE_UPDATE', onVoiceState);
@@ -2162,4 +2201,4 @@ if (require.main === module) {
   app.listen(PORT, '0.0.0.0', () => { console.log(`Voice Studio listening on http://localhost:${PORT}`); setInterval(() => { try { reconcileVoiceSessions(); } catch (error) { console.warn('[voice] session reconciliation failed:', error.message); } }, 3000).unref?.(); startVoiceWatchdog(); restoreSavedAccounts().then(() => restoreAutomationTasks()).catch((error) => console.warn('[restore] restore failed:', error.message)); });
 }
 
-module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets };
+module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets };

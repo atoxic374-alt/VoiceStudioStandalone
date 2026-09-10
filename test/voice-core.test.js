@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
-const { sendVoiceOp, sendVoiceOpConfirmed, rotations, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets } = require('../server');
+const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, rotations, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets } = require('../server');
 
 function fakeClient({ ready = true, confirms = true } = {}) {
   const ws = new EventEmitter();
@@ -65,6 +65,11 @@ test('does not accept a voice event that omits requested state flags', async () 
   const result = await pending;
   assert.equal(result.ok, false);
   assert.match(result.error, /did not confirm/);
+});
+
+test('classifies missing Voice Server Update separately from socket and WebRTC failures', () => {
+  assert.deepEqual(voiceFailureHints({ gatewayReady: true, rawVoiceState: 1, rawVoiceServer: 0, hasSession: false, hasVoiceToken: false, voiceSocketStarted: false, voiceSocketOpen: false, webRtcReady: false, voiceEventGuildMismatch: 0, voiceEventChannelMismatch: 0, targetValidation: { ok: true } }), ['no-matching-voice-server-dispatch', 'voice-server-update-missing-or-filtered']);
+  assert.deepEqual(voiceFailureHints({ gatewayReady: true, rawVoiceState: 1, rawVoiceServer: 1, hasSession: true, hasVoiceToken: true, voiceSocketStarted: true, voiceSocketOpen: false, webRtcReady: false, voiceEndpoint: null, voiceEventGuildMismatch: 1, voiceEventChannelMismatch: 1, targetValidation: { ok: false } }), ['voice-server-dispatch-without-endpoint', 'voice-event-guild-mismatch', 'voice-event-channel-mismatch', 'target-channel-validation-failed', 'voice-socket-open-failed']);
 });
 
 test('isolates bulk voice control from accounts managed by rotation in the same guild', () => {
