@@ -440,6 +440,28 @@ function startAllPlayingSessions(reason = 'discord-start') {
   logPlayingEvent('bulk-started', { reason, accounts: results.map((item) => item.account) });
   return { results, started: results.filter((item) => !item.alreadyActive).length, alreadyActive: results.filter((item) => item.alreadyActive).length };
 }
+async function addPlayingAccounts(sessionAccount, accounts) {
+  const source = playingSessions.get(playingKey(sessionAccount));
+  if (!source) return { ok: false, error: 'The source Playing session does not exist' };
+  const names = cleanAccounts(accounts).filter((account) => account !== source.account);
+  if (!names.length) return { ok: false, error: 'Select at least one new account' };
+  const results = [];
+  for (const account of names) {
+    if (playingSessions.has(account)) { results.push({ account, ok: false, error: 'Account already has a Playing session' }); continue; }
+    const entry = clients.get(account);
+    if (!entry) { results.push({ account, ok: false, error: 'Account is not connected' }); continue; }
+    const channel = await entry.client.channels?.fetch?.(source.channelId).catch?.(() => null);
+    if (!channel?.messages?.fetch) { results.push({ account, ok: false, error: `Account "${account}" cannot access the selected text room` }); continue; }
+    const session = { ...source, account, active: !!source.active, status: source.active ? 'running' : 'saved', runToken: 1, currentIndex: 0, createdAt: Date.now(), updatedAt: Date.now(), timer: null, lastAction: null, lastResult: null };
+    playingSessions.set(account, session);
+    if (session.active) schedulePlaying(session);
+    results.push({ account, ok: true, active: session.active });
+  }
+  persistPlayingSessions();
+  emitLive('playing.accounts_added', { sourceAccount: source.account, results });
+  logPlayingEvent('accounts-added', { sourceAccount: source.account, results });
+  return { ok: results.some((item) => item.ok), results, added: results.filter((item) => item.ok).length };
+}
 function stopAllPlayingSessions(reason = 'discord-stop') {
   const accounts = [...playingSessions.keys()];
   const results = accounts.map((account) => ({ account, ok: stopPlayingSession(account, reason) }));
@@ -1969,6 +1991,14 @@ app.post('/api/playing/start', (req, res) => {
   const results = accounts.map((account, index) => { const session = playingSessions.get(account); if (!session) return { account, ok: false, error: 'Save a Playing setup for this account first' }; if (session.active) return { account, ok: true, alreadyActive: true }; session.active = true; session.startDelayMs = accountDelayMs * index; session.updatedAt = Date.now(); schedulePlaying(session); return { account, ok: true, startDelayMs: session.startDelayMs }; });
   persistPlayingSessions(); return ok(res, { results, sessions: [...playingSessions.values()].map(({ timer, ...item }) => item) });
 });
+app.post('/api/playing/add-accounts', async (req, res) => {
+  const sourceAccount = String(req.body?.sourceAccount || '').trim();
+  const accounts = cleanAccounts(req.body?.accounts);
+  if (!sourceAccount || !accounts.length) return fail(res, new Error('sourceAccount and at least one account are required'), 400);
+  const result = await addPlayingAccounts(sourceAccount, accounts);
+  if (!result.ok) return fail(res, new Error(result.error || 'No accounts were added'), 400, { results: result.results || [] });
+  return ok(res, { ...result, sessions: [...playingSessions.values()].map(({ timer, ...item }) => item) });
+});
 app.post('/api/playing/stop', (req, res) => {
   const accounts = cleanAccounts(req.body?.accounts);
   if (!accounts.length) return fail(res, new Error('Select at least one account'), 400);
@@ -2361,4 +2391,4 @@ if (require.main === module) {
   app.listen(PORT, '0.0.0.0', () => { console.log(`Voice Studio listening on http://localhost:${PORT}`); setInterval(() => { try { reconcileVoiceSessions(); } catch (error) { console.warn('[voice] session reconciliation failed:', error.message); } }, 3000).unref?.(); startVoiceWatchdog(); restoreSavedAccounts().then(() => restoreAutomationTasks()).catch((error) => console.warn('[restore] restore failed:', error.message)); });
 }
 
-module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck };
+module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck };

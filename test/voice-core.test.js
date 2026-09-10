@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
-const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey } = require('../server');
+const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts } = require('../server');
 
 function fakeClient({ ready = true, confirms = true } = {}) {
   const ws = new EventEmitter();
@@ -271,6 +271,30 @@ test('starts all saved Playing sessions and does not duplicate active timers', (
     playingSessions.delete(first.account);
     playingSessions.delete(second.account);
     for (const [account, session] of saved) playingSessions.set(account, session);
+  }
+});
+
+test('adds a connected account to an active Playing session and starts it immediately', async () => {
+  const source = 'playing-add-source';
+  const added = 'playing-add-target';
+  const savedSessions = [...playingSessions.entries()];
+  const savedClients = [...clients.entries()];
+  playingSessions.clear();
+  clients.clear();
+  const channel = { messages: { fetch: async () => new Map() } };
+  clients.set(source, { client: { channels: { fetch: async () => channel } } });
+  clients.set(added, { client: { channels: { fetch: async () => channel } } });
+  playingSessions.set(source, { account: source, channelId: 'text-add', steps: [{ button: 'Join' }], intervalMs: 60000, active: true, status: 'running', runToken: 3, timer: null });
+  try {
+    const result = await addPlayingAccounts(source, [added]);
+    assert.equal(result.added, 1);
+    assert.equal(playingSessions.get(added).active, true);
+    clearTimeout(playingSessions.get(added).timer);
+  } finally {
+    for (const session of playingSessions.values()) clearTimeout(session.timer);
+    playingSessions.clear();
+    for (const [account, entry] of savedClients) clients.set(account, entry);
+    for (const [account, session] of savedSessions) playingSessions.set(account, session);
   }
 });
 
