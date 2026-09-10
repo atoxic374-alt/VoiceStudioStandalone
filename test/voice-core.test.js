@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
-const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, rotations, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets } = require('../server');
+const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets } = require('../server');
 
 function fakeClient({ ready = true, confirms = true } = {}) {
   const ws = new EventEmitter();
@@ -70,6 +70,18 @@ test('does not accept a voice event that omits requested state flags', async () 
 test('classifies missing Voice Server Update separately from socket and WebRTC failures', () => {
   assert.deepEqual(voiceFailureHints({ gatewayReady: true, rawVoiceState: 1, rawVoiceServer: 0, hasSession: false, hasVoiceToken: false, voiceSocketStarted: false, voiceSocketOpen: false, webRtcReady: false, voiceEventGuildMismatch: 0, voiceEventChannelMismatch: 0, targetValidation: { ok: true } }), ['no-matching-voice-server-dispatch', 'voice-server-update-missing-or-filtered']);
   assert.deepEqual(voiceFailureHints({ gatewayReady: true, rawVoiceState: 1, rawVoiceServer: 1, hasSession: true, hasVoiceToken: true, voiceSocketStarted: true, voiceSocketOpen: false, webRtcReady: false, voiceEndpoint: null, voiceEventGuildMismatch: 1, voiceEventChannelMismatch: 1, targetValidation: { ok: false } }), ['voice-server-dispatch-without-endpoint', 'voice-event-guild-mismatch', 'voice-event-channel-mismatch', 'target-channel-validation-failed', 'voice-socket-open-failed']);
+});
+
+test('filters Streamer voice events to the requested guild and channel', () => {
+  const { EventEmitter } = require('node:events');
+  const streamer = { _gatewayEmitter: new EventEmitter() };
+  const received = [];
+  streamer._gatewayEmitter.on('VOICE_STATE_UPDATE', (data) => received.push(data));
+  assert.equal(installVoiceEventFilter(streamer, 'user-1', 'guild-1', 'channel-1'), true);
+  streamer._gatewayEmitter.emit('VOICE_STATE_UPDATE', { user_id: 'user-1', guild_id: 'other-guild', channel_id: 'channel-1', session_id: 'wrong' });
+  streamer._gatewayEmitter.emit('VOICE_STATE_UPDATE', { user_id: 'user-1', guild_id: 'guild-1', channel_id: 'other-channel', session_id: 'wrong' });
+  streamer._gatewayEmitter.emit('VOICE_STATE_UPDATE', { user_id: 'user-1', guild_id: 'guild-1', channel_id: 'channel-1', session_id: 'right' });
+  assert.deepEqual(received.map((item) => item.session_id), ['right']);
 });
 
 test('isolates bulk voice control from accounts managed by rotation in the same guild', () => {

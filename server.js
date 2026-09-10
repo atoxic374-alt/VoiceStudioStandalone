@@ -698,6 +698,25 @@ function withTimeout(promise, timeoutMs, message) {
   let timer;
   return Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), timeoutMs); })]).finally(() => clearTimeout(timer));
 }
+function installVoiceEventFilter(streamer, userId, guildId, channelId) {
+  const emitter = streamer?._gatewayEmitter;
+  if (!emitter || typeof emitter.emit !== 'function' || emitter.__voiceEventFilterInstalled) return false;
+  const emit = emitter.emit.bind(emitter);
+  emitter.emit = (type, data, ...args) => {
+    if (type === 'VOICE_STATE_UPDATE') {
+      if (String(data?.user_id) !== String(userId)
+          || String(data?.guild_id) !== String(guildId)
+          || (data?.channel_id != null && String(data.channel_id) !== String(channelId))) return false;
+    }
+    if (type === 'VOICE_SERVER_UPDATE') {
+      if (data?.guild_id != null && String(data.guild_id) !== String(guildId)) return false;
+      if (data?.channel_id != null && String(data.channel_id) !== String(channelId)) return false;
+    }
+    return emit(type, data, ...args);
+  };
+  emitter.__voiceEventFilterInstalled = true;
+  return true;
+}
 function voiceFailureHints(diagnostics) {
   const hints = [];
   if (diagnostics.gatewayReady !== true) hints.push('gateway-session-not-ready');
@@ -921,6 +940,7 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
       logMediaEvent('info', 'media.streamer_created', { account: name, guildId, channelId: session.channelId, mediaKind, attempt });
       mediaStreamers.set(name, streamer);
       createdStreamer = true;
+      installVoiceEventFilter(streamer, client.user?.id, guildId, session.channelId);
       // The library calls signalVideo(false) from joinVoice(). Its default
       // payload also sets self_deaf=true, which can override the account's
       // primary voice state and break the dedicated media handshake. Keep the
@@ -2201,4 +2221,4 @@ if (require.main === module) {
   app.listen(PORT, '0.0.0.0', () => { console.log(`Voice Studio listening on http://localhost:${PORT}`); setInterval(() => { try { reconcileVoiceSessions(); } catch (error) { console.warn('[voice] session reconciliation failed:', error.message); } }, 3000).unref?.(); startVoiceWatchdog(); restoreSavedAccounts().then(() => restoreAutomationTasks()).catch((error) => console.warn('[restore] restore failed:', error.message)); });
 }
 
-module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets };
+module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets };
