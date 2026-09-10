@@ -122,9 +122,9 @@ let mediaStartTail = Promise.resolve();
 
 function ok(res, payload = {}) { return res.json({ success: true, ...payload }); }
 function redact(value) { return String(value ?? '').replace(/(token|authorization|password|cookie)(["']?\s*[:=]\s*["']?)[^"',;\s}]+/gi, '$1$2[redacted]'); }
-function fail(res, error, status = 200) {
+function fail(res, error, status = 200, payload = {}) {
   const message = redact(error?.message || String(error || 'Unknown error'));
-  return res.status(status).json({ success: false, error: message });
+  return res.status(status).json({ success: false, error: message, ...payload });
 }
 function parseCookies(req) { const result = {}; for (const part of String(req.headers.cookie || '').split(';')) { const separator = part.indexOf('='); if (separator < 1) continue; const key = part.slice(0, separator).trim(); const raw = part.slice(separator + 1).trim(); try { result[key] = decodeURIComponent(raw); } catch {} } return result; }
 function authSignature(value, secret = process.env.APP_PASSWORD || 'disabled') { return crypto.createHmac('sha256', secret).update(value).digest('base64url'); }
@@ -2127,6 +2127,84 @@ app.post('/api/voice/rotation/stop', (req, res) => {
   if (!task) return fail(res, new Error('Rotation not found'), 404);
   task.active = false; clearInterval(task.timer); rotations.delete(id); persistAutomationTasks(); return ok(res);
 });
+function findAutomationTask(type, id) {
+  const collection = type === 'rotation' ? rotations : stateCycles;
+  return collection.get(String(id || '')) || null;
+}
+function taskHasAccountElsewhere(name, guildId, type, currentId) {
+  const collection = type === 'rotation' ? rotations : stateCycles;
+  for (const [id, task] of collection) {
+    if (String(id) === String(currentId) || String(task.guildId) !== String(guildId)) continue;
+    if ((task.accounts || []).includes(name)) return true;
+  }
+  return false;
+}
+function automationAccountCheck(name, task, type) {
+  const entry = clients.get(name);
+  if (!entry?.client) return { name, available: false, reason: 'الحساب غير متصل' };
+  const guild = entry.client.guilds?.cache?.get?.(task.guildId);
+  if (!guild) return { name, available: false, reason: 'الحساب ليس عضوًا في السيرفر' };
+  if (type === 'cycle') {
+    const session = voiceSessions.get(sessionKey(name, task.guildId));
+    if (!session?.channelId) return { name, available: false, reason: 'الحساب ليس داخل روم صوتي في هذا السيرفر' };
+    return { name, available: true, current: session.channelId };
+  }
+  for (const channelId of task.channels || []) {
+    const channel = guild.channels?.cache?.get?.(channelId);
+    const me = guild.members?.me || entry.client.user?.id;
+    if (!channel || !isVoiceChannel(channel)) return { name, available: false, reason: 'أحد رومات التدوير غير موجود للحساب' };
+    if (!canJoin(channel, me)) return { name, available: false, reason: `لا يملك صلاحية دخول روم ${channel.name || channelId}` };
+  }
+  return { name, available: true };
+}
+app.get('/api/voice/task/candidates', (req, res) => {
+  const type = String(req.query?.type || '');
+  const id = String(req.query?.id || '');
+  if (!['rotation', 'cycle'].includes(type) || !id) return fail(res, new Error('type and id are required'), 400);
+  const task = findAutomationTask(type, id);
+  if (!task) return fail(res, new Error('Task not found'), 404);
+  const candidates = [...clients.keys()].filter((name) => !(task.accounts || []).includes(name)).map((name) => {
+    const check = automationAccountCheck(name, task, type);
+    if (check.available && taskHasAccountElsewhere(name, task.guildId, type, task.id)) return { name, available: false, reason: 'الحساب موجود في جلسة تدوير أخرى' };
+    return check;
+  });
+  return ok(res, { type, id, candidates });
+});
+app.post('/api/voice/task/add-accounts', async (req, res) => {
+  const type = String(req.body?.type || '');
+  const id = String(req.body?.id || '');
+  const accounts = cleanAccounts(req.body?.accounts);
+  if (!['rotation', 'cycle'].includes(type) || !id || !accounts.length) return fail(res, new Error('type, id and accounts are required'), 400);
+  const task = findAutomationTask(type, id);
+  if (!task) return fail(res, new Error('Task not found'), 404);
+  if (!task.active) return fail(res, new Error('Task is not active'), 409);
+  const checks = accounts.map((name) => {
+    if ((task.accounts || []).includes(name)) return { name, available: false, reason: 'الحساب موجود أصلًا في الجلسة' };
+    if (taskHasAccountElsewhere(name, task.guildId, type, task.id)) return { name, available: false, reason: 'الحساب موجود في جلسة تدوير أخرى' };
+    return automationAccountCheck(name, task, type);
+  });
+  const rejected = checks.filter((item) => !item.available);
+  if (rejected.length) return fail(res, new Error(rejected.map((item) => `${item.name}: ${item.reason}`).join('؛ ')), 409, { rejected });
+  const added = [];
+  for (const name of accounts) {
+    let result;
+    if (type === 'rotation') {
+      const current = voiceSessions.get(sessionKey(name, task.guildId));
+      const preferred = rotationPreferredChannel(name, task, task.accounts.length, null);
+      result = await moveRotationAccount(name, task, preferred, normalizeVoiceState(current || {}));
+    } else {
+      const state = task.states?.[task.currentIdx % (task.states.length || 1)] || {};
+      result = await withResultRetry(() => withAccountLock(name, async () => executeStateForAccount(name, task, state)));
+    }
+    if (!result.ok) return fail(res, new Error(`${name}: ${result.error || 'تعذر تشغيل الحساب'}`), 409, { added, failed: { name, ...result } });
+    task.accounts.push(name);
+    added.push(name);
+    recordTaskResult(task, result);
+  }
+  persistAutomationTasks();
+  emitLive('task.accounts.added', { id: task.id, taskType: type, accounts: added });
+  return ok(res, { id: task.id, type, added, accounts: task.accounts, message: `تمت إضافة ${added.length} حساب`, summary: { total: added.length, ok: added.length, failed: 0, skipped: 0, retries: 0 } });
+});
 app.post('/api/voice/state-cycle/start', async (req, res) => {
   const accounts = cleanAccounts(req.body?.accounts);
   const { guildId, states, intervalMs } = req.body || {};
@@ -2274,4 +2352,4 @@ if (require.main === module) {
   app.listen(PORT, '0.0.0.0', () => { console.log(`Voice Studio listening on http://localhost:${PORT}`); setInterval(() => { try { reconcileVoiceSessions(); } catch (error) { console.warn('[voice] session reconciliation failed:', error.message); } }, 3000).unref?.(); startVoiceWatchdog(); restoreSavedAccounts().then(() => restoreAutomationTasks()).catch((error) => console.warn('[restore] restore failed:', error.message)); });
 }
 
-module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait };
+module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck };

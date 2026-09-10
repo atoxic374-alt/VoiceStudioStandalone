@@ -597,6 +597,8 @@ function openTaskDetails(taskId) {
   const task = state.tasks.find((item) => item.id === taskId);
   if (!task) return;
   const modal = $('#taskDetailsModal');
+  modal.dataset.taskId = taskId;
+  modal.dataset.taskType = task.type;
   const cycleState = task.type === 'cycle' ? (task.states?.[task.currentIdx] || {}) : null;
   const currentRoom = task.type === 'rotation' ? task.channels?.[task.currentIdx % (task.channels?.length || 1)] : null;
   $('#taskDetailsTitle').textContent = task.title;
@@ -613,6 +615,42 @@ function openTaskDetails(taskId) {
   }).join('') || '<div class="task-empty">لا توجد حسابات في هذه المهمة</div>';
   modal.hidden = false;
 }
+async function openTaskAccounts(taskId) {
+  const task = state.tasks.find((item) => item.id === taskId);
+  if (!task) return;
+  const modal = $('#taskAccountsModal');
+  const list = $('#taskAccountsList');
+  modal.dataset.taskId = taskId;
+  modal.dataset.taskType = task.type;
+  list.innerHTML = '<div class="task-empty">جاري فحص الحسابات المتاحة…</div>';
+  modal.hidden = false;
+  try {
+    const data = await api(`/api/voice/task/candidates?type=${encodeURIComponent(task.type)}&id=${encodeURIComponent(taskId)}`);
+    const candidates = data.candidates || [];
+    list.innerHTML = candidates.length ? candidates.map((item) => {
+      const client = state.clients.find((entry) => entry.name === item.name);
+      const label = client?.nickname || item.name;
+      return `<label class="task-add-account ${item.available ? '' : 'is-disabled'}"><input type="checkbox" value="${escapeHTML(item.name)}" ${item.available ? '' : 'disabled'} /><span class="task-add-account-copy"><strong>${escapeHTML(label)}</strong><small>${escapeHTML(item.available ? item.name : item.reason || 'غير متاح')}</small></span></label>`;
+    }).join('') : '<div class="task-empty">لا توجد حسابات متاحة خارج هذه الجلسة</div>';
+  } catch (error) {
+    list.innerHTML = `<div class="task-empty">${escapeHTML(error.message || 'تعذر فحص الحسابات')}</div>`;
+  }
+}
+async function confirmTaskAccounts() {
+  const modal = $('#taskAccountsModal');
+  const accounts = [...modal.querySelectorAll('input[type="checkbox"]:checked')].map((input) => input.value);
+  if (!accounts.length) { toast('اختر حسابًا واحدًا على الأقل', 'error'); return; }
+  const button = $('#taskAccountsConfirm'); button.disabled = true;
+  try {
+    const result = await post('/api/voice/task/add-accounts', { id: modal.dataset.taskId, type: modal.dataset.taskType, accounts });
+    modal.hidden = true;
+    toast(result.message || `تمت إضافة ${accounts.length} حساب`, 'success');
+    addActivity('إضافة حسابات إلى مهمة', `${accounts.length} حساب`, 'success');
+    await loadTasks();
+    openTaskDetails(modal.dataset.taskId);
+  } catch (error) { toast(error.message, 'error'); }
+  finally { button.disabled = false; }
+}
 function taskRemaining(task) { return Math.max(0, Math.ceil((Number(task.nextAt || 0) - Date.now()) / 1000)); }
 function taskCountdownLabel(task) { const seconds = taskRemaining(task); return formatDuration(seconds); }
 function taskLiveSummary(task) { const results = task.accounts || []; const statuses = results.map((name) => task.accountStatus?.[name] || (task.lastResults || []).find((item) => item.name === name)); const failed = statuses.filter((item) => item?.ok === false).length; const passed = statuses.filter((item) => item?.ok === true).length; return `${passed}/${results.length} نجح · ${failed} خطأ` ; }
@@ -620,13 +658,19 @@ function renderTasks(tasks) {
   const list = $('#tasksList');
   if (!list) return;
   if (!tasks.length) { list.innerHTML = '<div class="task-empty">لا توجد مهام قيد التشغيل</div>'; return; }
-  list.innerHTML = tasks.map((task) => { const names = (task.accounts || []).map((name) => state.clients.find((client) => client.name === name)?.nickname || name).join('، '); const failed = (task.accounts || []).filter((name) => (task.accountStatus?.[name] || (task.lastResults || []).find((item) => item.name === name))?.ok === false).length; return `<div class="task-row ${failed ? 'has-task-errors' : ''}"><div class="task-row-copy"><strong>${escapeHTML(task.title)} ${failed ? `<em class="task-error-badge">${failed} خطأ</em>` : ''}</strong><small>${escapeHTML(names || `${task.accounts?.length || 0} حساب`)} · كل ${Math.round((task.intervalMs || 0) / 60000)} دقيقة · <span data-task-countdown="${escapeHTML(task.id)}">${escapeHTML(taskCountdownLabel(task))}</span> · <span data-task-summary="${escapeHTML(task.id)}">${escapeHTML(taskLiveSummary(task))}</span></small></div><button type="button" class="task-details-button" data-task-details="${escapeHTML(task.id)}">عرض التفاصيل</button><button type="button" class="task-stop" data-task-type="${task.type}" data-task-id="${escapeHTML(task.id)}">إيقاف</button></div>`; }).join('');
+  list.innerHTML = tasks.map((task) => { const names = (task.accounts || []).map((name) => state.clients.find((client) => client.name === name)?.nickname || name).join('، '); const failed = (task.accounts || []).filter((name) => (task.accountStatus?.[name] || (task.lastResults || []).find((item) => item.name === name))?.ok === false).length; return `<div class="task-row ${failed ? 'has-task-errors' : ''}"><div class="task-row-copy"><strong>${escapeHTML(task.title)} ${failed ? `<em class="task-error-badge">${failed} خطأ</em>` : ''}</strong><small>${escapeHTML(names || `${task.accounts?.length || 0} حساب`)} · كل ${Math.round((task.intervalMs || 0) / 60000)} دقيقة · <span data-task-countdown="${escapeHTML(task.id)}">${escapeHTML(taskCountdownLabel(task))}</span> · <span data-task-summary="${escapeHTML(task.id)}">${escapeHTML(taskLiveSummary(task))}</span></small></div><button type="button" class="task-details-button" data-task-details="${escapeHTML(task.id)}">عرض التفاصيل</button><button type="button" class="task-add-button" data-task-add="${escapeHTML(task.id)}">إضافة حسابات</button><button type="button" class="task-stop" data-task-type="${task.type}" data-task-id="${escapeHTML(task.id)}">إيقاف</button></div>`; }).join('');
   list.querySelectorAll('[data-task-details]').forEach((button) => button.addEventListener('click', () => openTaskDetails(button.dataset.taskDetails)));
+  list.querySelectorAll('[data-task-add]').forEach((button) => button.addEventListener('click', () => openTaskAccounts(button.dataset.taskAdd)));
   list.querySelectorAll('.task-stop').forEach((button) => button.addEventListener('click', () => stopTask(button.dataset.taskType, button.dataset.taskId)));
 }
 function refreshTaskCountdowns() { state.tasks.forEach((task) => { const countdown = document.querySelector(`[data-task-countdown="${CSS.escape(task.id)}"]`); if (countdown) countdown.textContent = taskCountdownLabel(task); const selector = task.type === 'cycle' ? '[data-profile-state-countdown]' : '[data-profile-rotation-countdown]'; document.querySelectorAll(`${selector}[data-profile-${task.type === 'cycle' ? 'state' : 'rotation'}-countdown="${CSS.escape(task.id)}"]`).forEach((item) => { item.textContent = taskCountdownLabel(task); }); const summary = document.querySelector(`[data-task-summary="${CSS.escape(task.id)}"]`); if (summary) summary.textContent = taskLiveSummary(task); }); }
 $('#taskDetailsClose')?.addEventListener('click', () => { $('#taskDetailsModal').hidden = true; });
 $('#taskDetailsModal')?.addEventListener('click', (event) => { if (event.target.id === 'taskDetailsModal') event.currentTarget.hidden = true; });
+$('#taskAddAccountsButton')?.addEventListener('click', () => { const taskId = $('#taskDetailsModal').dataset.taskId; if (taskId) openTaskAccounts(taskId); });
+$('#taskAccountsClose')?.addEventListener('click', () => { $('#taskAccountsModal').hidden = true; });
+$('#taskAccountsCancel')?.addEventListener('click', () => { $('#taskAccountsModal').hidden = true; });
+$('#taskAccountsConfirm')?.addEventListener('click', confirmTaskAccounts);
+$('#taskAccountsModal')?.addEventListener('click', (event) => { if (event.target.id === 'taskAccountsModal') event.currentTarget.hidden = true; });
 async function bulkJoinSelected() {
   const accounts = selectedAutomationAccounts();
   const guildId = $('#automationGuild').value;

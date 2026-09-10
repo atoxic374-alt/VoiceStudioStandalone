@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
-const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait } = require('../server');
+const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere } = require('../server');
 
 function fakeClient({ ready = true, confirms = true } = {}) {
   const ws = new EventEmitter();
@@ -133,6 +133,23 @@ test('detects duplicate task ownership and supersedes stale account operations',
     endAccountOperation(second);
   } finally {
     rotations.delete(taskId);
+  }
+});
+
+test('filters accounts already owned by another live task', () => {
+  const rotationId = 'candidate-rotation';
+  const cycleId = 'candidate-cycle';
+  rotations.set(rotationId, { id: rotationId, guildId: 'guild-candidates', accounts: ['account-busy'] });
+  stateCycles.set(cycleId, { id: cycleId, guildId: 'guild-candidates', accounts: ['account-cycle-busy'] });
+  try {
+    assert.equal(taskHasAccountElsewhere('account-busy', 'guild-candidates', 'rotation', 'new-task'), true);
+    assert.equal(taskHasAccountElsewhere('account-free', 'guild-candidates', 'rotation', 'new-task'), false);
+    assert.equal(taskHasAccountElsewhere('account-cycle-busy', 'guild-candidates', 'cycle', 'new-task'), true);
+    assert.equal(taskHasAccountElsewhere('account-cycle-busy', 'guild-candidates', 'rotation', 'new-task'), false);
+    assert.equal(taskHasAccountElsewhere('account-busy', 'guild-candidates', 'rotation', rotationId), false);
+  } finally {
+    rotations.delete(rotationId);
+    stateCycles.delete(cycleId);
   }
 });
 

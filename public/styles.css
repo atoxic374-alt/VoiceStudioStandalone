@@ -237,10 +237,13 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .task-row-copy strong, .task-row-copy small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .task-details-button { min-height: 30px; padding: 5px 10px; border: 1px solid rgba(72,217,210,.42); border-radius: 9px; background: rgba(72,217,210,.1); color: var(--cyan); cursor: pointer; font: 700 9px inherit; white-space: nowrap; }
 .task-details-button:hover { border-color: var(--cyan); background: rgba(72,217,210,.18); transform: translateY(-1px); }
+.task-add-button { min-height: 30px; padding: 5px 10px; border: 1px solid rgba(140,124,255,.45); border-radius: 9px; background: rgba(140,124,255,.12); color: var(--violet-bright); cursor: pointer; font: 700 9px inherit; white-space: nowrap; }
+.task-add-button:hover { border-color: var(--violet-bright); background: rgba(140,124,255,.22); transform: translateY(-1px); }
 .task-details-modal { position: fixed; inset: 0; z-index: 90; display: grid; place-items: center; padding: 20px; background: rgba(3,5,14,.82); backdrop-filter: blur(16px); }
 .task-details-modal[hidden] { display: none; }
 .task-details-dialog { width: min(900px, 100%); max-height: min(88vh, 820px); overflow: auto; padding: 25px; border: 1px solid rgba(140,124,255,.38); border-radius: 24px; background: linear-gradient(145deg, rgba(25,29,61,.98), rgba(9,13,29,.99)); box-shadow: 0 30px 110px rgba(0,0,0,.55), 0 0 70px rgba(111,91,255,.12); }
 .task-details-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; margin-bottom: 20px; }
+.task-details-head-actions { display: flex; align-items: center; gap: 8px; }
 .task-details-kicker { color: var(--cyan); font-size: 9px; font-weight: 800; letter-spacing: .18em; }
 .task-details-head h2 { margin: 7px 0 4px; font-size: 22px; }
 .task-details-head p { margin: 0; color: var(--muted); font-size: 10px; }
@@ -260,6 +263,16 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .task-detail-account-state span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .task-detail-account-state .is-ok { color: var(--green); }
 .task-detail-account-state .is-error { color: var(--red); }
+.task-add-accounts-list { display: grid; gap: 8px; max-height: min(55vh, 480px); overflow: auto; margin-bottom: 18px; }
+.task-add-account { display: flex; align-items: center; gap: 10px; padding: 11px 13px; border: 1px solid var(--line); border-radius: 13px; background: rgba(255,255,255,.025); }
+.task-add-account.is-disabled { opacity: .55; }
+.task-add-account input { width: 16px; height: 16px; accent-color: var(--cyan); }
+.task-add-account-copy { min-width: 0; flex: 1; }
+.task-add-account-copy strong, .task-add-account-copy small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.task-add-account-copy strong { font-size: 10px; }
+.task-add-account-copy small { margin-top: 3px; color: var(--muted); font-size: 9px; }
+.task-add-account-copy small.is-error { color: var(--red); }
+.task-accounts-actions { display: flex; justify-content: flex-end; gap: 9px; }
 @media (max-width: 650px) { .task-details-dialog { padding: 17px; }.task-details-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }.task-detail-account { align-items: flex-start; flex-direction: column; }.task-detail-account-state { width: 100%; text-align: right; }.task-row { grid-template-columns: minmax(0, 1fr) auto; }.task-details-button { grid-column: 2; grid-row: 1; }.task-stop { grid-column: 2; grid-row: 2; justify-self: end; } }
 
 .task-details-cycle { margin: 0 0 18px; padding: 14px; border: 1px solid rgba(140,124,255,.28); border-radius: 15px; background: rgba(140,124,255,.06); }
