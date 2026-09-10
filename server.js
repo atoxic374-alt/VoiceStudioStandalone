@@ -102,6 +102,11 @@ const MEDIA_SETTLE_DELAY_MS = 4000;
 const SYNTHETIC_VIDEO_FILE = path.join(DATA_DIR, 'synthetic-stream-black-v2.mp4');
 const DISCORD_REQUEST_GAP_MS = Math.max(0, Number(process.env.DISCORD_REQUEST_GAP_MS || 120));
 let nextDiscordRequestAt = 0;
+const WATCHDOG_INTERVAL_MS = Math.max(5000, Number(process.env.VOICE_WATCHDOG_INTERVAL_MS || 10000));
+const WATCHDOG_CONFIRMATION_MISSES = 2;
+const WATCHDOG_REPAIR_COOLDOWN_MS = Math.max(10000, Number(process.env.VOICE_WATCHDOG_COOLDOWN_MS || 30000));
+const watchdogObservations = new Map();
+let watchdogRunning = false;
 
 function ok(res, payload = {}) { return res.json({ success: true, ...payload }); }
 function redact(value) { return String(value ?? '').replace(/(token|authorization|password|cookie)(["']?\s*[:=]\s*["']?)[^"',;\s}]+/gi, '$1$2[redacted]'); }
@@ -852,6 +857,98 @@ function stopTasksForAccount(name) {
   }
   if (changed) persistAutomationTasks();
 }
+function watchdogKey(kind, id, account) { return `${kind}:${id}:${account}`; }
+function watchdogIsMismatch(key, mismatch) {
+  const previous = watchdogObservations.get(key) || { misses: 0, lastRepairAt: 0 };
+  if (!mismatch) {
+    watchdogObservations.delete(key);
+    return false;
+  }
+  previous.misses += 1;
+  watchdogObservations.set(key, previous);
+  return previous.misses >= WATCHDOG_CONFIRMATION_MISSES
+    && Date.now() - previous.lastRepairAt >= WATCHDOG_REPAIR_COOLDOWN_MS;
+}
+function watchdogMarkRepair(key) {
+  const previous = watchdogObservations.get(key) || { misses: 0 };
+  previous.lastRepairAt = Date.now();
+  previous.misses = 0;
+  watchdogObservations.set(key, previous);
+}
+function voiceStateMatchesExpected(actual, expected) {
+  if (!actual?.channelId || !expected) return false;
+  return ['selfMute', 'selfDeaf', 'selfVideo', 'selfStream']
+    .every((key) => expected[key] === undefined || !!actual[key] === !!expected[key]);
+}
+async function watchdogRotation(task, account) {
+  const client = getClient(account);
+  if (!client || !task.active || task.running) return;
+  const key = watchdogKey('rotation', task.id, account);
+  const actual = readGatewayVoiceState(client, task.guildId);
+  const expectedChannel = task.accountTargets?.[account] || rotationPreferredChannel(account, task, 0);
+  const mismatch = !actual?.channelId || String(actual.channelId) !== String(expectedChannel);
+  if (!watchdogIsMismatch(key, mismatch)) return;
+  logMediaEvent('warn', 'watchdog.rotation_repair', { account, guildId: task.guildId, expectedChannel, actualChannel: actual?.channelId || null });
+  const result = await moveRotationAccount(account, task, expectedChannel, normalizeVoiceState(actual || {}));
+  watchdogMarkRepair(key);
+  emitLive('watchdog.repair', { type: 'rotation', account, taskId: task.id, result });
+}
+async function watchdogStateCycle(task, account) {
+  const client = getClient(account);
+  if (!client || !task.active || task.running) return;
+  const key = watchdogKey('cycle', task.id, account);
+  const actual = readGatewayVoiceState(client, task.guildId);
+  const expected = task.states?.[task.accountStateIdx?.[account]];
+  // A state cycle cannot infer a room that was never joined. It only repairs
+  // flags for an existing confirmed voice session; rotations repair rooms.
+  const mismatch = !!actual?.channelId && !voiceStateMatchesExpected(actual, expected);
+  if (!watchdogIsMismatch(key, mismatch)) return;
+  logMediaEvent('warn', 'watchdog.state_repair', { account, guildId: task.guildId, expected, actual });
+  const result = await withAccountLock(account, () => executeStateForAccount(account, task, expected || {}));
+  watchdogMarkRepair(key);
+  emitLive('watchdog.repair', { type: 'state-cycle', account, taskId: task.id, result });
+}
+async function watchdogMedia(session) {
+  const client = getClient(session.name);
+  if (!client || !session.channelId) return;
+  const expectedKind = session.selfStream ? 'go-live' : session.selfVideo ? 'camera' : null;
+  const key = watchdogKey('media', session.name, session.guildId);
+  const mismatch = !!expectedKind && !syntheticStreams.has(session.name) && !pendingMediaRestarts.has(session.name);
+  if (!watchdogIsMismatch(key, mismatch)) return;
+  logMediaEvent('warn', 'watchdog.media_repair', { account: session.name, guildId: session.guildId, channelId: session.channelId, mediaKind: expectedKind });
+  const result = await withAccountLock(session.name, () => startSyntheticStream(session.name, session.guildId, expectedKind, session));
+  watchdogMarkRepair(key);
+  emitLive('watchdog.repair', { type: 'media', account: session.name, result });
+}
+async function runVoiceWatchdog() {
+  if (watchdogRunning) return;
+  watchdogRunning = true;
+  try {
+    const repairs = [
+      ...[...rotations.values()].flatMap((task) => (task.accounts || []).map((account) => () => watchdogRotation(task, account).catch((error) => logMediaEvent('error', 'watchdog.rotation_failed', { account, taskId: task.id, error: error.message })))),
+      ...[...stateCycles.values()].flatMap((task) => (task.accounts || []).map((account) => () => watchdogStateCycle(task, account).catch((error) => logMediaEvent('error', 'watchdog.state_failed', { account, taskId: task.id, error: error.message })))),
+    ];
+    await mapWithConcurrency(repairs, 4, (repair) => repair());
+    const mediaSessions = [...voiceSessions.values()].filter((session) => session.selfStream || session.selfVideo);
+    await mapWithConcurrency(mediaSessions, 2, (session) => watchdogMedia(session));
+    for (const session of playingSessions.values()) {
+      const key = watchdogKey('playing', session.account, session.account);
+      const mismatch = session.active === true && !session.running && !session.timer;
+      if (watchdogIsMismatch(key, mismatch)) {
+        schedulePlaying(session);
+        watchdogMarkRepair(key);
+        emitLive('watchdog.repair', { type: 'playing', account: session.account });
+      }
+    }
+  } finally {
+    watchdogRunning = false;
+  }
+}
+function startVoiceWatchdog() {
+  const timer = setInterval(() => { runVoiceWatchdog().catch((error) => logMediaEvent('error', 'watchdog.failed', { error: error.message })); }, WATCHDOG_INTERVAL_MS);
+  timer.unref?.();
+  return timer;
+}
 function markTokenChanged(name, token, error) {
   stopTasksForAccount(name);
   playingSessions.delete(name);
@@ -1285,7 +1382,7 @@ function rateLimit(req, res, next) {
 }
 app.use('/api', rateLimit, originGuard, requireAuth);
 app.get('/version', (_req, res) => res.json({ success: true, version: getBuildVersion() }));
-app.get('/api/health', (_req, res) => ok(res, { service: 'voice-studio', connected: clients.size, accounts: [...clients.entries()].map(([name, entry]) => accountHealth(name, entry)) }));
+app.get('/api/health', (_req, res) => ok(res, { service: 'voice-studio', connected: clients.size, watchdog: { enabled: true, intervalMs: WATCHDOG_INTERVAL_MS, running: watchdogRunning, observations: watchdogObservations.size }, accounts: [...clients.entries()].map(([name, entry]) => accountHealth(name, entry)) }));
 const healthTimer = setInterval(() => {
   for (const [name, entry] of clients.entries()) {
     emitLive('health.updated', { account: accountHealth(name, entry) });
@@ -1788,7 +1885,7 @@ async function restoreAutomationTasks() {
 }
 app.get('/{*splat}', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 if (require.main === module) {
-  app.listen(PORT, '0.0.0.0', () => { console.log(`Voice Studio listening on http://localhost:${PORT}`); setInterval(() => { try { reconcileVoiceSessions(); } catch (error) { console.warn('[voice] session reconciliation failed:', error.message); } }, 3000).unref?.(); restoreSavedAccounts().then(() => restoreAutomationTasks()).catch((error) => console.warn('[restore] restore failed:', error.message)); });
+  app.listen(PORT, '0.0.0.0', () => { console.log(`Voice Studio listening on http://localhost:${PORT}`); setInterval(() => { try { reconcileVoiceSessions(); } catch (error) { console.warn('[voice] session reconciliation failed:', error.message); } }, 3000).unref?.(); startVoiceWatchdog(); restoreSavedAccounts().then(() => restoreAutomationTasks()).catch((error) => console.warn('[restore] restore failed:', error.message)); });
 }
 
 module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets };
