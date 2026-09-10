@@ -1485,6 +1485,7 @@ app.post('/api/voice/rotation/start', async (req, res) => {
       });
       task.nextAt = Date.now() + task.intervalMs;
       persistAutomationTasks();
+      emitLive('task.completed', { id: task.id, taskType: 'rotation', nextAt: task.nextAt, currentIdx: task.currentIdx, results: task.lastResults });
     } finally { task.running = false; }
   }, delay);
   rotations.set(id, task);
@@ -1537,6 +1538,7 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
     endAccountOperation(operation);
     return { name, ok: result.ok, error: result.ok ? null : result.error };
   })));
+  if (!linkedRoom) task.nextAt = Date.now() + task.intervalMs;
   const runStateCycle = async () => {
     if (task.nextAt > Date.now()) { if (task.active) task.timer = setTimeout(runStateCycle, task.nextAt - Date.now()); return; }
     if (!task.active || task.running) return;
@@ -1569,6 +1571,7 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
       const roomTask = task.phaseRoomId ? rotations.get(task.phaseRoomId) : null;
       task.nextAt = roomTask ? Number(roomTask.nextAt || Date.now() + task.intervalMs) + Number(task.phaseGapMs || 0) : Date.now() + task.intervalMs;
       persistAutomationTasks();
+      emitLive('task.completed', { id: task.id, taskType: 'cycle', nextAt: task.nextAt, currentIdx: task.currentIdx, results: task.lastResults });
     } finally { task.running = false; if (task.active) task.timer = setTimeout(runStateCycle, Math.max(1000, task.nextAt - Date.now())); }
   };
   task.timer = setTimeout(runStateCycle, Math.max(1000, task.nextAt - Date.now()));
