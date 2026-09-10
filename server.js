@@ -196,6 +196,9 @@ function normalizeExclusiveVoiceState(state = {}) {
   if (requested.selfMute) return { selfMute: true, selfDeaf: false, selfVideo: false, selfStream: false };
   return { selfMute: false, selfDeaf: false, selfVideo: false, selfStream: false };
 }
+function hasVoiceFlags(state = {}) {
+  return !!(state.selfMute || state.selfDeaf || state.selfVideo || state.selfStream);
+}
 function mergeVoiceState(current = {}, requested = {}) {
   const merged = { ...normalizeVoiceState(current) };
   for (const key of ['selfMute', 'selfDeaf', 'selfVideo', 'selfStream']) {
@@ -244,13 +247,15 @@ async function executeStateForAccount(name, task, requestedState) {
   try {
     const next = { ...current, ...mergeVoiceState({}, requestedState) };
     if (next.selfDeaf && (next.selfVideo || next.selfStream)) return { name, ok: false, error: 'Invalid deafened media state' };
+    if (current.selfStream || current.selfVideo || syntheticStreams.has(name)) stopSyntheticStream(name, { leaveVoice: false });
+    const cleared = await clearVoiceFlags(client, task.guildId, current.channelId, current);
+    if (!cleared.ok) return { name, ok: false, error: `Unable to clear previous voice state: ${cleared.error}` };
     await waitForMediaSettle(next, current);
     let result;
     if (next.selfStream || next.selfVideo) {
       result = await startSyntheticStream(name, task.guildId, next.selfStream ? 'go-live' : 'camera', next);
       if (!result.ok) await recoverVoiceAfterStateFailure(name, task.guildId, current);
     } else {
-      if (current.selfStream || current.selfVideo) stopSyntheticStream(name, { leaveVoice: true });
       result = await sendVoiceOpConfirmed(client, task.guildId, current.channelId, next, 6000);
     }
     if (!operationIsCurrent(operation)) return { name, ok: false, stale: true, error: 'State operation was superseded by a newer request' };
@@ -596,6 +601,15 @@ async function withResultRetry(worker, maxRetries = 2) {
 }
 async function waitForMediaSettle(next, current) {
   if ((next?.selfStream || next?.selfVideo) && current?.channelId) await new Promise((resolve) => setTimeout(resolve, MEDIA_SETTLE_DELAY_MS));
+}
+async function clearVoiceFlags(client, guildId, channelId, current = {}) {
+  if (!hasVoiceFlags(current)) return { ok: true, skipped: true };
+  return sendVoiceOpConfirmed(client, guildId, channelId, {
+    selfMute: false,
+    selfDeaf: false,
+    selfVideo: false,
+    selfStream: false,
+  }, 6000);
 }
 function readPersistedSessions() {
   try {
@@ -1634,8 +1648,8 @@ function readGatewayVoiceState(client, guildId) {
     selfStream: !!(connection.voice?.streaming ?? connection.voice?.selfStream ?? connection.voice?.self_stream),
     guildId: connectedGuildId || guildId,
   } : null;
-  if (!state || String(state.guild?.id || state.guildId || guildId) !== String(guildId)) return fallback;
-  return {
+  if (!state || String(state.guild?.id || state.guildId || guildId) !== String(guildId)) return fallback ? { ...fallback, ...normalizeExclusiveVoiceState(fallback) } : fallback;
+  const observed = {
     guildId: state.guild?.id || state.guildId || guildId,
     channelId: state.channelId ?? state.channel_id ?? null,
     selfMute: !!(state.selfMute ?? state.self_mute),
@@ -1643,6 +1657,7 @@ function readGatewayVoiceState(client, guildId) {
     selfVideo: !!(state.selfVideo ?? state.self_video),
     selfStream: !!(state.streaming ?? state.selfStream ?? state.self_stream),
   };
+  return { ...observed, ...normalizeExclusiveVoiceState(observed) };
 }
 async function confirmLiveMediaTarget(client, guildId, channelId, delayMs = 120) {
   const read = () => {
@@ -1670,12 +1685,15 @@ async function confirmLiveMediaTarget(client, guildId, channelId, delayMs = 120)
 }
 function upsertSession(name, guildId, channelId, opts = {}) {
   const previous = voiceSessions.get(sessionKey(name, guildId));
+  const flags = normalizeExclusiveVoiceState({
+    selfMute: opts.selfMute !== undefined ? opts.selfMute : previous?.selfMute,
+    selfDeaf: opts.selfDeaf !== undefined ? opts.selfDeaf : previous?.selfDeaf,
+    selfVideo: opts.selfVideo !== undefined ? opts.selfVideo : previous?.selfVideo,
+    selfStream: opts.selfStream !== undefined ? opts.selfStream : previous?.selfStream,
+  });
   voiceSessions.set(sessionKey(name, guildId), {
     name, guildId, channelId,
-    selfMute: opts.selfMute !== undefined ? !!opts.selfMute : !!previous?.selfMute,
-    selfDeaf: opts.selfDeaf !== undefined ? !!opts.selfDeaf : !!previous?.selfDeaf,
-    selfVideo: opts.selfVideo !== undefined ? !!opts.selfVideo : !!previous?.selfVideo,
-    selfStream: opts.selfStream !== undefined ? !!opts.selfStream : !!previous?.selfStream,
+    ...flags,
     joinedAt: previous?.joinedAt || Date.now(), updatedAt: Date.now(),
   });
   persistSessions();
@@ -2279,17 +2297,18 @@ app.post('/api/voice/state', async (req, res) => {
     // account lock above prevents concurrent operations for this account, and
     // rotationControlledAccounts prevents Quick controls from racing a room
     // rotation in the same guild.
+    if (current.selfStream || current.selfVideo || syntheticStreams.has(name)) stopSyntheticStream(name, { leaveVoice: false });
+    const cleared = await clearVoiceFlags(client, guildId, current.channelId, current);
+    if (!cleared.ok) { endAccountOperation(operation); return { name, ok: false, error: `Unable to clear previous voice state: ${cleared.error}` }; }
     await waitForMediaSettle(next, current);
     let result;
     if (next.selfStream || next.selfVideo) {
       // Stop the previous transport/state before starting the replacement
       // media mode. This prevents a stale mute/deafen or old camera transport
       // from surviving into Go Live.
-      if (current.selfStream || current.selfVideo || syntheticStreams.has(name)) stopSyntheticStream(name, { leaveVoice: false });
       result = await startSyntheticStream(name, guildId, next.selfStream ? 'go-live' : 'camera', next);
     }
     else {
-      if (current.selfStream || current.selfVideo || syntheticStreams.has(name)) stopSyntheticStream(name, { leaveVoice: false });
       result = await sendVoiceOpConfirmed(client, guildId, current.channelId, next, 6000);
     }
     if (!operationIsCurrent(operation)) { endAccountOperation(operation); return { name, ok: false, stale: true, error: 'Voice operation was superseded by a newer request' }; }
