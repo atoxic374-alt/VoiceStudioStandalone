@@ -596,7 +596,7 @@ function ensureSyntheticVideo() {
     throw new Error(`Unable to create synthetic stream source: ${error.message}`);
   }
 }
-function stopSyntheticStream(name, { leaveVoice = false, silent = false, invalidate = true } = {}) {
+function stopSyntheticStream(name, { leaveVoice = false, silent = false, invalidate = true, preserveRestartState = false } = {}) {
   // Replacing an old transport as part of a new start must not invalidate the
   // new start's generation. Previously startSyntheticStreamUnqueued() called
   // this function after capturing its generation, so every camera/Go Live
@@ -607,7 +607,7 @@ function stopSyntheticStream(name, { leaveVoice = false, silent = false, invalid
     clearTimeout(pendingRestart);
     pendingMediaRestarts.delete(name);
   }
-  mediaRestartAttempts.delete(name);
+  if (!preserveRestartState) mediaRestartAttempts.delete(name);
   const active = syntheticStreams.get(name);
   const trackedStreamer = mediaStreamers.get(name);
   const streamers = [...new Set([active?.streamer, trackedStreamer].filter(Boolean))];
@@ -679,6 +679,11 @@ function createBlackMediaSource() {
     '-an', '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-pix_fmt', 'yuv420p',
     '-f', 'nut', 'pipe:1',
   ], { stdio: ['ignore', 'pipe', 'pipe'] });
+  // ChildProcess reports spawn failures asynchronously. Without this listener
+  // errors such as EAGAIN become an unhandled error and terminate Node.
+  sourceProcess.once('error', (error) => {
+    logMediaEvent('error', 'stream.source_failed', { pid: sourceProcess.pid || null, code: error?.code || null, error: error?.message || String(error) });
+  });
   sourceProcess.stderr.on('data', (chunk) => logMediaEvent('warn', 'stream.source_warning', { pid: sourceProcess.pid, error: String(chunk).trim().slice(0, 300) }));
   sourceProcess.once('close', (code, signal) => {
     if (code !== 0) logMediaEvent('error', 'stream.source_exited', { pid: sourceProcess.pid, code, signal });
@@ -692,9 +697,11 @@ function waitForMediaSource(source, timeoutMs = 3000) {
     const onData = (chunk) => {
       if (chunk?.length) { received = true; cleanup(); resolve({ bytes: chunk.length }); }
     };
+    const onError = (error) => { if (!received) { cleanup(); reject(error); } };
     const onClose = (code, signal) => { if (!received) { cleanup(); reject(new Error(`FFmpeg exited before producing media (code=${code}, signal=${signal || 'none'})`)); } };
-    cleanup = () => { source.stream.off('data', onData); source.sourceProcess.off('close', onClose); };
+    cleanup = () => { source.stream.off('data', onData); source.sourceProcess.off('error', onError); source.sourceProcess.off('close', onClose); };
     source.stream.on('data', onData);
+    source.sourceProcess.once('error', onError);
     source.sourceProcess.once('close', onClose);
   });
   return withTimeout(waiting, timeoutMs, 'FFmpeg produced no media data within 3 seconds').catch((error) => { cleanup(); throw error; });
@@ -891,19 +898,31 @@ async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live',
   if (!target.ok) return { ok: false, error: target.error };
   const connection = client?.voice?.connection;
   if (!connection || voiceConnectionChannelId(connection) !== String(session.channelId)) return { ok: false, error: 'The account has no active voice connection' };
-  const source = createBlackMediaSource();
+  // playVideo() starts FFmpeg internally. Feed it the reusable one-hour file
+  // instead of starting a second FFmpeg producer for every account.
+  const source = ensureSyntheticVideo();
   let streamConnection;
+  let dispatcher;
+  let active;
   const signaling = waitForDiscordStreamEvents(client, guildId, session.channelId, 8000);
   try {
     streamConnection = await withTimeout(connection.createStreamConnection(), 8000, 'Discord media connection timed out after 8 seconds');
     // playVideo() sends STREAM_CREATE/STREAM_SERVER_UPDATE. Waiting for those
     // events before calling it creates a circular wait and forces the code to
     // fall back to a competing Streamer voice connection.
-    const dispatcher = await playPrimaryMediaAndWait(streamConnection, source.stream, signaling, isCurrent);
-    const active = { connection, streamConnection, dispatcher, sourceProcess: source.sourceProcess, guildId, channelId: session.channelId, mediaKind };
+    dispatcher = await playPrimaryMediaAndWait(streamConnection, source, signaling, isCurrent);
+    active = { connection, streamConnection, dispatcher, sourceProcess: null, guildId, channelId: session.channelId, mediaKind };
     syntheticStreams.set(name, active);
-    dispatcher.on?.('error', (error) => logMediaEvent('error', 'stream.runtime_failed', { account: name, guildId, channelId: session.channelId, error: error?.message || String(error) }));
-    dispatcher.once?.('finish', () => { if (syntheticStreams.get(name) === active) stopSyntheticStream(name); });
+    const restartPrimaryMedia = (reason, error) => {
+      if (syntheticStreams.get(name) !== active || active.restarting) return;
+      active.restarting = true;
+      if (error) logMediaEvent('error', 'stream.runtime_failed', { account: name, guildId, channelId: session.channelId, error: error?.message || String(error) });
+      stopSyntheticStream(name, { silent: true, preserveRestartState: true });
+      active.restarting = false;
+      scheduleMediaRestart(name, active, reason);
+    };
+    dispatcher.on?.('error', (error) => restartPrimaryMedia('primary dispatcher failed', error));
+    dispatcher.once?.('finish', () => restartPrimaryMedia('primary dispatcher finished'));
     const confirmed = await sendVoiceOpConfirmed(client, guildId, session.channelId, mediaKind === 'camera'
       ? { selfMute: !!session.selfMute, selfDeaf: false, selfVideo: true, selfStream: false }
       : { selfMute: !!session.selfMute, selfDeaf: false, selfVideo: false, selfStream: true }, 3000);
@@ -911,9 +930,14 @@ async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live',
     return { ok: true };
   } catch (error) {
     await signaling.catch(() => {});
-    syntheticStreams.delete(name);
-    try { source.sourceProcess.kill('SIGTERM'); } catch {}
-    try { streamConnection?.disconnect?.(); } catch {}
+    // A failed confirmation must release every object created by this attempt.
+    // Otherwise each retry leaks a dispatcher/FFmpeg child until spawn returns
+    // EAGAIN and the unhandled child error takes down the whole service.
+    if (syntheticStreams.get(name) === active) stopSyntheticStream(name, { silent: true, invalidate: false });
+    else {
+      try { dispatcher?.destroy?.(); } catch {}
+      try { streamConnection?.disconnect?.(); } catch {}
+    }
     return { ok: false, error: error.message || 'Unable to start Go Live' };
   }
 }
@@ -1054,14 +1078,14 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
         if (syntheticStreams.get(name) === active) {
           // The media transport ended; keep the primary voice session alive
           // while a replacement transport is scheduled.
-          stopSyntheticStream(name);
+          stopSyntheticStream(name, { preserveRestartState: true });
           scheduleMediaRestart(name, active, 'media task ended');
         }
       }).catch((error) => {
         logMediaEvent('error', 'media.runtime_failed', { account: name, guildId, channelId: session.channelId, mediaKind, error: error?.message || String(error) });
         if (syntheticStreams.get(name) === active) {
           // Runtime media failures must not turn into a voice-room leave.
-          stopSyntheticStream(name);
+          stopSyntheticStream(name, { preserveRestartState: true });
           scheduleMediaRestart(name, active, error?.message || 'media task failed');
         }
       });
@@ -1276,7 +1300,11 @@ async function watchdogMedia(session) {
     : expectedKind === 'camera'
       ? voiceReady
       : dedicatedTransport?.streamConnection?.webRtcConn?.ready === true;
-  const sourceReady = !!active?.sourceProcess && active.sourceProcess.exitCode === null && !active.sourceProcess.killed;
+  // Primary playVideo owns the FFmpeg process internally and uses the shared
+  // file, so there is no sourceProcess to inspect in that transport.
+  const sourceReady = primaryTransport
+    ? !!active?.dispatcher && active.dispatcher.destroyed !== true
+    : !!active?.sourceProcess && active.sourceProcess.exitCode === null && !active.sourceProcess.killed;
   const mismatch = !!expectedKind && (!active || !voiceReady || !mediaReady || !sourceReady) && !pendingMediaRestarts.has(session.name);
   if (!watchdogIsMismatch(key, mismatch)) return;
   logMediaEvent('warn', 'watchdog.media_repair', { account: session.name, guildId: session.guildId, channelId: session.channelId, mediaKind: expectedKind });
