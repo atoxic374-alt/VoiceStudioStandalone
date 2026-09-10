@@ -100,6 +100,8 @@ const liveEvents = new EventEmitter();
 liveEvents.setMaxListeners(0);
 const accountLocks = new Map();
 const MEDIA_SETTLE_DELAY_MS = 4000;
+const MEDIA_JOIN_TIMEOUT_MS = Math.max(10000, Number(process.env.MEDIA_JOIN_TIMEOUT_MS || 20000));
+const MEDIA_WEBRTC_TIMEOUT_MS = Math.max(6000, Number(process.env.MEDIA_WEBRTC_TIMEOUT_MS || 10000));
 // Media starts are a real queue: the next account waits until the previous
 // account's media attempt returns (ready or failed), then starts immediately.
 // An optional gap can still be configured, but the default is zero.
@@ -572,6 +574,11 @@ function stopSyntheticStream(name, { leaveVoice = false } = {}) {
     try { active.streamer?.signalVideo?.(false); } catch {}
     try { active.dispatcher?.destroy?.(); } catch {}
     try { active.streamConnection?.disconnect?.(); } catch {}
+    try { active.streamer?.voiceConnection?.stop?.(); } catch {}
+    try { active.streamer?._gatewayEmitter?.removeAllListeners?.(); } catch {}
+    if (!leaveVoice && active.streamer) {
+      try { active.streamer._voiceConnection = undefined; } catch {}
+    }
   }
   syntheticStreams.delete(name);
   const streamer = mediaStreamers.get(name);
@@ -771,7 +778,8 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
       if (!streamer.voiceConnection) {
         stage = 'join-voice';
         logMediaEvent('info', 'media.join.start', { account: name, guildId, channelId: session.channelId, mediaKind, attempt });
-      await withTimeout(streamer.joinVoice(guildId, session.channelId), 10000, 'Dedicated media voice connection timed out after 10 seconds');
+        logMediaEvent('info', 'media.join.waiting_gateway', { account: name, guildId, channelId: session.channelId, mediaKind, attempt, timeoutMs: MEDIA_JOIN_TIMEOUT_MS });
+        await withTimeout(streamer.joinVoice(guildId, session.channelId), MEDIA_JOIN_TIMEOUT_MS, `Dedicated media voice connection timed out after ${Math.round(MEDIA_JOIN_TIMEOUT_MS / 1000)} seconds`);
       if (!isCurrentRun()) throw new Error('Media start cancelled by a newer account operation');
         logMediaEvent('info', 'media.join.ready', { account: name, guildId, channelId: session.channelId, mediaKind, attempt });
       } else {
@@ -812,7 +820,7 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
           setTimeout(check, 150);
         };
         check();
-      }), 6000, 'WebRTC media transport was not ready');
+      }), MEDIA_WEBRTC_TIMEOUT_MS, `WebRTC media transport was not ready after ${Math.round(MEDIA_WEBRTC_TIMEOUT_MS / 1000)} seconds`);
       logMediaEvent('info', 'media.webrtc_ready', { account: name, guildId, channelId: session.channelId, mediaKind, attempt });
       if (active.completedAt || syntheticStreams.get(name) !== active) throw new Error('Media transport stopped before activation');
       const mediaState = mediaKind === 'camera'
@@ -839,6 +847,9 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
       // Clean up only this failed media transport. The account may still be
       // connected to the primary voice room.
       try { streamer?.stopStream?.(); } catch {}
+      try { streamer?.voiceConnection?.stop?.(); } catch {}
+      try { streamer?._gatewayEmitter?.removeAllListeners?.(); } catch {}
+      try { if (streamer) streamer._voiceConnection = undefined; } catch {}
       if (syntheticStreams.get(name)?.streamer === streamer) syntheticStreams.delete(name);
       if (createdStreamer && mediaStreamers.get(name) === streamer) mediaStreamers.delete(name);
       logMediaEvent('error', 'media.attempt_failed', { account: name, guildId, channelId: session.channelId, mediaKind, attempt, stage, error: error?.message || String(error) });
