@@ -698,9 +698,17 @@ function withTimeout(promise, timeoutMs, message) {
   let timer;
   return Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), timeoutMs); })]).finally(() => clearTimeout(timer));
 }
-async function playPrimaryMediaAndWait(streamConnection, sourceStream, signaling) {
+async function playPrimaryMediaAndWait(streamConnection, sourceStream, signaling, isCurrent = () => true) {
   const dispatcher = streamConnection.playVideo(sourceStream, { fps: 15, presetH26x: 'superfast', bitrate: 300, inputFFmpegArgs: ['-re'], outputFFmpegArgs: ['-g', '30'] });
+  if (!isCurrent()) {
+    try { dispatcher?.destroy?.(); } catch {}
+    throw new Error('Media start cancelled by a newer account operation');
+  }
   await signaling;
+  if (!isCurrent()) {
+    try { dispatcher?.destroy?.(); } catch {}
+    throw new Error('Media start cancelled by a newer account operation');
+  }
   return dispatcher;
 }
 function installVoiceEventFilter(streamer, userId, guildId, channelId) {
@@ -851,7 +859,7 @@ async function loadVideoStreamModule() {
   videoStreamModulePromise ||= import('@dank074/discord-video-stream');
   return videoStreamModulePromise;
 }
-async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live') {
+async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live', isCurrent = () => true) {
   const client = getClient(name);
   const target = validateMediaTarget(client, guildId, session.channelId);
   if (!target.ok) return { ok: false, error: target.error };
@@ -865,7 +873,7 @@ async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live')
     // playVideo() sends STREAM_CREATE/STREAM_SERVER_UPDATE. Waiting for those
     // events before calling it creates a circular wait and forces the code to
     // fall back to a competing Streamer voice connection.
-    const dispatcher = await playPrimaryMediaAndWait(streamConnection, source.stream, signaling);
+    const dispatcher = await playPrimaryMediaAndWait(streamConnection, source.stream, signaling, isCurrent);
     const active = { connection, streamConnection, dispatcher, sourceProcess: source.sourceProcess, guildId, channelId: session.channelId, mediaKind };
     syntheticStreams.set(name, active);
     dispatcher.on?.('error', (error) => logMediaEvent('error', 'stream.runtime_failed', { account: name, guildId, channelId: session.channelId, error: error?.message || String(error) }));
@@ -944,7 +952,7 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
   // event while omitting VOICE_SERVER_UPDATE for the competing transport.
   if (primaryConnection?.channel?.id === session.channelId
       && typeof primaryConnection.createStreamConnection === 'function') {
-    const primaryResult = await startBuiltInGoLive(name, guildId, session, mediaKind);
+    const primaryResult = await startBuiltInGoLive(name, guildId, session, mediaKind, isCurrentRun);
     if (primaryResult.ok) {
       mediaDesired.set(name, { guildId, channelId: session.channelId, mediaKind });
       mediaRestartAttempts.delete(name);

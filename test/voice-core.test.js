@@ -100,6 +100,16 @@ test('starts primary media before waiting for Discord stream signaling', async (
   assert.deepEqual(dispatcher, { id: 'dispatcher' });
 });
 
+test('destroys a primary dispatcher when media start is cancelled during signaling', async () => {
+  let resolveSignaling;
+  const signaling = new Promise((resolve) => { resolveSignaling = resolve; });
+  let destroyed = 0;
+  const pending = playPrimaryMediaAndWait({ playVideo: () => ({ destroy: () => { destroyed += 1; } }) }, {}, signaling, () => false);
+  resolveSignaling();
+  await assert.rejects(pending, /cancelled by a newer account operation/);
+  assert.equal(destroyed, 1);
+});
+
 test('isolates bulk voice control from accounts managed by rotation in the same guild', () => {
   const taskId = 'test-rotation-isolation';
   rotations.set(taskId, { id: taskId, guildId: 'guild-1', accounts: ['rotating-account'] });
