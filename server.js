@@ -55,6 +55,23 @@ function saveAccounts(records) {
   fs.renameSync(temp, ACCOUNT_FILE);
   try { fs.chmodSync(ACCOUNT_FILE, 0o600); } catch {}
 }
+function cleanAccountRecords(records) {
+  const result = [];
+  const seenTokens = new Set();
+  const seenNames = new Set();
+  for (const item of Array.isArray(records) ? records : []) {
+    const token = String(item?.token || '').trim();
+    const name = String(item?.name || '').trim().slice(0, 48);
+    if (!token || !name) continue;
+    const tokenKey = token.toLowerCase();
+    const nameKey = name.toLocaleLowerCase();
+    if (seenTokens.has(tokenKey) || seenNames.has(nameKey)) continue;
+    seenTokens.add(tokenKey);
+    seenNames.add(nameKey);
+    result.push({ name, token, savedAt: Number(item?.savedAt) || Date.now() });
+  }
+  return result.slice(0, 500);
+}
 function loadAccounts() {
   try {
     const payload = JSON.parse(fs.readFileSync(ACCOUNT_FILE, 'utf8'));
@@ -62,14 +79,14 @@ function loadAccounts() {
     decipher.setAuthTag(Buffer.from(payload.tag, 'base64url'));
     const plain = Buffer.concat([decipher.update(Buffer.from(payload.data, 'base64url')), decipher.final()]);
     const records = JSON.parse(plain.toString('utf8'));
-    return Array.isArray(records) ? records.filter((item) => item?.name && item?.token) : [];
+    return cleanAccountRecords(records);
   } catch (error) {
     if (fs.existsSync(ACCOUNT_FILE)) console.warn('[accounts] saved accounts could not be restored:', error.message);
     return [];
   }
 }
 function persistConnectedAccounts() {
-  try { saveAccounts([...clients.entries()].map(([name, entry]) => ({ name, token: entry.token, savedAt: entry.savedAt || Date.now() })).filter((item) => item.token)); }
+  try { saveAccounts(cleanAccountRecords([...clients.entries()].map(([name, entry]) => ({ name, token: entry.token, savedAt: entry.savedAt || Date.now() })))); }
   catch (error) { console.warn('[accounts] unable to persist encrypted account file:', error.message); }
 }
 
@@ -168,12 +185,23 @@ function cleanAccounts(accounts) {
 function normalizeVoiceState(state = {}) {
   return { selfMute: !!state.selfMute, selfDeaf: !!state.selfDeaf, selfVideo: !!state.selfVideo, selfStream: !!state.selfStream };
 }
+function normalizeExclusiveVoiceState(state = {}) {
+  const requested = normalizeVoiceState(state);
+  // A rotation item represents one mode, not a patch over the previous mode.
+  // Media modes also explicitly clear mute/deafen so Discord cannot retain a
+  // stale voice flag while the streamer is being started.
+  if (requested.selfStream) return { selfMute: false, selfDeaf: false, selfVideo: false, selfStream: true };
+  if (requested.selfVideo) return { selfMute: false, selfDeaf: false, selfVideo: true, selfStream: false };
+  if (requested.selfDeaf) return { selfMute: false, selfDeaf: true, selfVideo: false, selfStream: false };
+  if (requested.selfMute) return { selfMute: true, selfDeaf: false, selfVideo: false, selfStream: false };
+  return { selfMute: false, selfDeaf: false, selfVideo: false, selfStream: false };
+}
 function mergeVoiceState(current = {}, requested = {}) {
-  const merged = { ...current };
+  const merged = { ...normalizeVoiceState(current) };
   for (const key of ['selfMute', 'selfDeaf', 'selfVideo', 'selfStream']) {
     if (typeof requested?.[key] === 'boolean') merged[key] = requested[key];
   }
-  return normalizeVoiceState(merged);
+  return normalizeExclusiveVoiceState(merged);
 }
 function randomStateIndex(states, previous = -1) {
   const count = Array.isArray(states) ? states.length : 0;
@@ -214,7 +242,7 @@ async function executeStateForAccount(name, task, requestedState) {
   if (!client) return { name, ok: false, error: 'Account is not connected' };
   const operation = beginAccountOperation(name, task.guildId, 'cycle');
   try {
-    const next = { ...current, ...mergeVoiceState(current, requestedState) };
+    const next = { ...current, ...mergeVoiceState({}, requestedState) };
     if (next.selfDeaf && (next.selfVideo || next.selfStream)) return { name, ok: false, error: 'Invalid deafened media state' };
     await waitForMediaSettle(next, current);
     let result;
@@ -754,20 +782,27 @@ async function playPrimaryMediaAndWait(streamConnection, sourceStream, signaling
 }
 function installVoiceEventFilter(streamer, userId, guildId, channelId) {
   const emitter = streamer?._gatewayEmitter;
-  if (!emitter || typeof emitter.emit !== 'function' || emitter.__voiceEventFilterInstalled) return false;
+  if (!emitter || typeof emitter.emit !== 'function') return false;
+  if (emitter.__voiceEventFilterInstalled) {
+    Object.assign(emitter.__voiceEventFilterState, { userId: String(userId), guildId: String(guildId), channelId: String(channelId) });
+    return true;
+  }
   const emit = emitter.emit.bind(emitter);
+  const filterState = { userId: String(userId), guildId: String(guildId), channelId: String(channelId) };
   emitter.emit = (type, data, ...args) => {
+    const current = emitter.__voiceEventFilterState;
     if (type === 'VOICE_STATE_UPDATE') {
-      if (String(data?.user_id) !== String(userId)
-          || String(data?.guild_id) !== String(guildId)
-          || (data?.channel_id != null && String(data.channel_id) !== String(channelId))) return false;
+      if (String(data?.user_id) !== current.userId
+          || String(data?.guild_id) !== current.guildId
+          || (data?.channel_id != null && String(data.channel_id) !== current.channelId)) return false;
     }
     if (type === 'VOICE_SERVER_UPDATE') {
-      if (data?.guild_id != null && String(data.guild_id) !== String(guildId)) return false;
-      if (data?.channel_id != null && String(data.channel_id) !== String(channelId)) return false;
+      if (data?.guild_id != null && String(data.guild_id) !== current.guildId) return false;
+      if (data?.channel_id != null && String(data.channel_id) !== current.channelId) return false;
     }
     return emit(type, data, ...args);
   };
+  emitter.__voiceEventFilterState = filterState;
   emitter.__voiceEventFilterInstalled = true;
   return true;
 }
@@ -1807,7 +1842,7 @@ async function connectOne(token, name) {
   if (typeof token !== 'string' || !token.trim()) throw new Error('A Discord token is required');
   let finalName = String(name || '').trim().slice(0, 48);
   const normalizedToken = token.trim();
-  const existing = [...clients.entries()].find(([, entry]) => entry.token === normalizedToken);
+  const existing = [...clients.entries()].find(([, entry]) => String(entry.token || '').trim().toLowerCase() === normalizedToken.toLowerCase());
   if (existing) throw new Error(`Duplicate token: already connected as ${existing[0]}`);
   if (connectingTokens.has(normalizedToken)) throw new Error('Duplicate token: connection already in progress');
   connectingTokens.add(normalizedToken);
@@ -1821,16 +1856,25 @@ async function connectOne(token, name) {
     finalName = String(discordName || `account-${clients.size + 1}`).trim().slice(0, 48);
     if (generatedAlias) renamePersistedAccount(previousName, finalName);
   }
-  if (clients.has(finalName)) {
-    stopTasksForAccount(finalName);
-    stopSyntheticStream(finalName, { leaveVoice: true });
-    try { await clients.get(finalName)?.client?.destroy?.(); } catch {}
-    clients.delete(finalName);
+  const duplicateName = [...clients.keys()].find((accountName) => accountName.toLowerCase() === finalName.toLowerCase());
+  if (duplicateName) {
+    stopTasksForAccount(duplicateName);
+    stopSyntheticStream(duplicateName, { leaveVoice: true });
+    try { await clients.get(duplicateName)?.client?.destroy?.(); } catch {}
+    clients.delete(duplicateName);
   }
   const entry = { client, token: normalizedToken, savedAt: Date.now(), connectedAt: Date.now(), lastSeenAt: Date.now(), lastError: null };
   clients.set(finalName, entry);
   persistConnectedAccounts();
-  const markError = (error) => { entry.lastError = redact(error?.message || String(error || 'Unknown Discord client error')); entry.lastSeenAt = Date.now(); emitLive('account.health.changed', { account: accountHealth(finalName, entry) }); };
+  const markError = (error) => {
+    if (isInvalidCredentialError(error)) {
+      markTokenChanged(finalName, normalizedToken, error);
+      return;
+    }
+    entry.lastError = redact(error?.message || String(error || 'Unknown Discord client error'));
+    entry.lastSeenAt = Date.now();
+    emitLive('account.health.changed', { account: accountHealth(finalName, entry) });
+  };
   client.on?.('error', markError);
   client.on?.('ready', () => { entry.lastError = null; entry.lastSeenAt = Date.now(); emitLive('account.health.changed', { account: accountHealth(finalName, entry) }); });
   client.on?.('disconnect', () => { entry.lastSeenAt = Date.now(); emitLive('account.health.changed', { account: accountHealth(finalName, entry) }); });
@@ -2224,12 +2268,12 @@ app.post('/api/voice/state', async (req, res) => {
     if (!client) { endAccountOperation(operation); return { name, ok: false, error: 'Account is not connected' }; }
     if (!current?.channelId) { endAccountOperation(operation); return { name, ok: false, error: 'Account is not in a voice channel' }; }
     const enablingMedia = selfVideo === true || selfStream === true;
-    const next = {
+    const next = normalizeExclusiveVoiceState({
       selfMute: selfMute !== undefined ? selfMute : !!current.selfMute,
       selfDeaf: selfDeaf !== undefined ? selfDeaf : enablingMedia ? false : !!current.selfDeaf,
       selfVideo: selfVideo !== undefined ? selfVideo : !!current.selfVideo,
       selfStream: selfStream !== undefined ? selfStream : !!current.selfStream,
-    };
+    });
     if (next.selfDeaf && (next.selfVideo || next.selfStream)) { endAccountOperation(operation); return { name, ok: false, error: 'Video or screen share cannot be enabled while deafened' }; }
     // Use the same settle window as state rotation before touching media. The
     // account lock above prevents concurrent operations for this account, and
@@ -2237,12 +2281,19 @@ app.post('/api/voice/state', async (req, res) => {
     // rotation in the same guild.
     await waitForMediaSettle(next, current);
     let result;
-    if (next.selfStream) result = await startSyntheticStream(name, guildId, 'go-live');
-    else if (next.selfVideo) result = await startSyntheticStream(name, guildId, 'camera');
-    else result = await sendVoiceOpConfirmed(client, guildId, current.channelId, next, 6000);
+    if (next.selfStream || next.selfVideo) {
+      // Stop the previous transport/state before starting the replacement
+      // media mode. This prevents a stale mute/deafen or old camera transport
+      // from surviving into Go Live.
+      if (current.selfStream || current.selfVideo || syntheticStreams.has(name)) stopSyntheticStream(name, { leaveVoice: false });
+      result = await startSyntheticStream(name, guildId, next.selfStream ? 'go-live' : 'camera', next);
+    }
+    else {
+      if (current.selfStream || current.selfVideo || syntheticStreams.has(name)) stopSyntheticStream(name, { leaveVoice: false });
+      result = await sendVoiceOpConfirmed(client, guildId, current.channelId, next, 6000);
+    }
     if (!operationIsCurrent(operation)) { endAccountOperation(operation); return { name, ok: false, stale: true, error: 'Voice operation was superseded by a newer request' }; }
     if (result.ok) {
-      if (!next.selfStream && !next.selfVideo && (current.selfStream || current.selfVideo)) stopSyntheticStream(name);
       const actual = readGatewayVoiceState(client, guildId);
       Object.assign(current, actual || {}, next, { selfStream: !!next.selfStream, selfVideo: !!next.selfVideo, updatedAt: Date.now() });
       persistSessions();
@@ -2551,4 +2602,4 @@ if (require.main === module) {
   app.listen(PORT, '0.0.0.0', () => { console.log(`Voice Studio listening on http://localhost:${PORT}`); setInterval(() => { try { reconcileVoiceSessions(); } catch (error) { console.warn('[voice] session reconciliation failed:', error.message); } }, 3000).unref?.(); startVoiceWatchdog(); restoreSavedAccounts().then(() => restoreAutomationTasks()).catch((error) => console.warn('[restore] restore failed:', error.message)); });
 }
 
-module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck };
+module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, normalizeExclusiveVoiceState, cleanAccountRecords, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck };

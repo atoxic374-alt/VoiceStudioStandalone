@@ -1,7 +1,29 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
-const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId } = require('../server');
+const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId, cleanAccountRecords, normalizeExclusiveVoiceState } = require('../server');
+
+test('cleans saved account records before they can affect the account count', () => {
+  const records = cleanAccountRecords([
+    { name: 'Alpha', token: 'token-a' },
+    { name: 'alpha', token: 'token-b' },
+    { name: 'Beta', token: 'TOKEN-A' },
+    { name: 'Gamma', token: '  token-c  ' },
+    { name: '', token: 'token-d' },
+    { name: 'Empty', token: '   ' },
+  ]);
+  assert.deepEqual(records.map(({ name, token }) => ({ name, token })), [
+    { name: 'Alpha', token: 'token-a' },
+    { name: 'Gamma', token: 'token-c' },
+  ]);
+});
+
+test('treats each rotation item as one exclusive voice mode', () => {
+  assert.deepEqual(normalizeExclusiveVoiceState({ selfMute: true, selfDeaf: true }), { selfMute: false, selfDeaf: true, selfVideo: false, selfStream: false });
+  assert.deepEqual(normalizeExclusiveVoiceState({ selfMute: true, selfStream: true }), { selfMute: false, selfDeaf: false, selfVideo: false, selfStream: true });
+  assert.deepEqual(normalizeExclusiveVoiceState({ selfDeaf: true, selfVideo: true }), { selfMute: false, selfDeaf: false, selfVideo: true, selfStream: false });
+  assert.deepEqual(normalizeExclusiveVoiceState({}), { selfMute: false, selfDeaf: false, selfVideo: false, selfStream: false });
+});
 
 function fakeClient({ ready = true, confirms = true } = {}) {
   const ws = new EventEmitter();
@@ -88,6 +110,17 @@ test('filters Streamer voice events to the requested guild and channel', () => {
   streamer._gatewayEmitter.emit('VOICE_STATE_UPDATE', { user_id: 'user-1', guild_id: 'guild-1', channel_id: 'other-channel', session_id: 'wrong' });
   streamer._gatewayEmitter.emit('VOICE_STATE_UPDATE', { user_id: 'user-1', guild_id: 'guild-1', channel_id: 'channel-1', session_id: 'right' });
   assert.deepEqual(received.map((item) => item.session_id), ['right']);
+});
+
+test('re-targets an existing Streamer event filter for the next account', () => {
+  const streamer = { _gatewayEmitter: new EventEmitter() };
+  const received = [];
+  streamer._gatewayEmitter.on('VOICE_STATE_UPDATE', (data) => received.push(data.session_id));
+  assert.equal(installVoiceEventFilter(streamer, 'user-1', 'guild-1', 'channel-1'), true);
+  assert.equal(installVoiceEventFilter(streamer, 'user-2', 'guild-2', 'channel-2'), true);
+  streamer._gatewayEmitter.emit('VOICE_STATE_UPDATE', { user_id: 'user-1', guild_id: 'guild-1', channel_id: 'channel-1', session_id: 'old' });
+  streamer._gatewayEmitter.emit('VOICE_STATE_UPDATE', { user_id: 'user-2', guild_id: 'guild-2', channel_id: 'channel-2', session_id: 'new' });
+  assert.deepEqual(received, ['new']);
 });
 
 test('does not treat a cached voice session as a canonical VoiceManager connection', () => {
