@@ -90,6 +90,12 @@ test('filters Streamer voice events to the requested guild and channel', () => {
   assert.deepEqual(received.map((item) => item.session_id), ['right']);
 });
 
+test('does not treat a cached voice session as a canonical VoiceManager connection', () => {
+  const connection = { channel: { id: 'channel-live' } };
+  assert.equal(voiceConnectionChannelId(connection), 'channel-live');
+  assert.equal(voiceConnectionChannelId(null), null);
+});
+
 test('starts primary media before waiting for Discord stream signaling', async () => {
   const order = [];
   let resolveSignaling;

@@ -1033,7 +1033,6 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
       // transport; checking only the object existence can skip the handshake
       // and leave the media connection waiting until the timeout.
       stage = 'join-voice';
-      await resyncPrimaryVoiceForMedia(client, guildId, session.channelId, session);
       logMediaEvent('info', 'media.join.start', { account: name, guildId, channelId: session.channelId, mediaKind, attempt });
       logMediaEvent('info', 'media.join.waiting_gateway', { account: name, guildId, channelId: session.channelId, mediaKind, attempt, timeoutMs: MEDIA_JOIN_TIMEOUT_MS });
       await joinMediaVoiceWithDiagnostics(client, streamer, guildId, session.channelId, MEDIA_JOIN_TIMEOUT_MS, { account: name, mediaKind, attempt });
@@ -1638,7 +1637,9 @@ async function moveAccountLocked(name, guildId, channelId, opts = {}) {
     const observed = readGatewayVoiceState(client, guildId);
     const current = { ...(saved || {}), ...(observed || {}) };
     for (const key of ['selfMute', 'selfDeaf', 'selfVideo', 'selfStream']) if (typeof observed?.[key] !== 'boolean' && typeof saved?.[key] === 'boolean') current[key] = saved[key];
-    if (current?.channelId === channelId) {
+    const hasCanonicalConnection = client.voice?.connection
+      && String(voiceConnectionChannelId(client.voice.connection)) === String(channelId);
+    if (current?.channelId === channelId && hasCanonicalConnection) {
       endAccountOperation(operation);
       return { name, ok: true, alreadyIn: true, channelId };
     }
@@ -1646,9 +1647,30 @@ async function moveAccountLocked(name, guildId, channelId, opts = {}) {
     // The primary discord.js voice state owns room membership. A media
     // Streamer must be torn down without sending its own OP4 leave request;
     // doing so races the move below and can suppress VOICE_SERVER_UPDATE for
-    // the next dedicated media connection.
+    // the next media connection.
     if (syntheticStreams.has(name) || mediaStreamers.has(name)) stopSyntheticStream(name, { silent: true });
-    const result = await sendVoiceOpConfirmed(client, guildId, channelId, { ...desired, selfVideo: false, selfStream: false });
+    // Prefer VoiceManager.joinChannel(). It owns the complete
+    // VOICE_STATE_UPDATE/VOICE_SERVER_UPDATE handshake and stores the
+    // canonical connection in client.voice.connection. Sending OP4 here and
+    // then creating a Streamer creates competing handshakes on one Gateway
+    // identity; Discord can deliver the state event to one transport and the
+    // server event to the other.
+    let result;
+    const voiceChannel = client.guilds?.cache?.get?.(guildId)?.channels?.cache?.get?.(channelId);
+    if (voiceChannel && typeof client.voice?.joinChannel === 'function') {
+      try {
+        const connection = await withTimeout(client.voice.joinChannel(voiceChannel, {
+          selfMute: !!desired.selfMute,
+          selfDeaf: !!desired.selfDeaf,
+          selfVideo: false,
+        }), MEDIA_JOIN_TIMEOUT_MS, 'Primary voice connection did not become ready');
+        result = { ok: true, connection };
+      } catch (error) {
+        result = { ok: false, error: error?.message || 'Primary voice connection failed' };
+      }
+    } else {
+      result = await sendVoiceOpConfirmed(client, guildId, channelId, { ...desired, selfVideo: false, selfStream: false });
+    }
     if (!operationIsCurrent(operation)) { endAccountOperation(operation); return { name, ok: false, stale: true, error: 'Voice move was superseded by a newer request' }; }
     if (result.ok) {
       const confirmed = readGatewayVoiceState(client, guildId);
