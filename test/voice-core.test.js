@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
-const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId, cleanAccountRecords, normalizeExclusiveVoiceState, clearVoiceFlags } = require('../server');
+const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, cleanAccountRecords, normalizeExclusiveVoiceState, clearVoiceFlags } = require('../server');
 
 test('cleans saved account records before they can affect the account count', () => {
   const records = cleanAccountRecords([
@@ -71,6 +71,35 @@ test('detects the active voice channel from every supported connection shape', (
   assert.equal(voiceConnectionChannelId({ channel: { id: 'channel-a' } }), 'channel-a');
   assert.equal(voiceConnectionChannelId({ channelId: 'channel-b' }), 'channel-b');
   assert.equal(voiceConnectionChannelId({ channel_id: 'channel-c' }), 'channel-c');
+});
+
+test('compacts leaked primary voice closing listeners while retaining active cleanup', () => {
+  const connection = new EventEmitter();
+  connection.channel = { id: 'channel-primary' };
+  let playerDestroyed = 0;
+  let websocketShutdown = 0;
+  let udpShutdown = 0;
+  connection.player = { destroy: () => { playerDestroyed += 1; } };
+  connection.sockets = { ws: { shutdown: () => { websocketShutdown += 1; } }, udp: { shutdown: () => { udpShutdown += 1; } } };
+  connection.setMaxListeners(0); // Construct the already-leaked production state without warning in the test runner.
+  for (let index = 0; index < 11; index += 1) connection.on('closing', () => {});
+  assert.equal(compactPrimaryVoiceClosingListeners(connection), true);
+  assert.equal(connection.listenerCount('closing'), 3);
+  connection.emit('closing');
+  assert.deepEqual({ playerDestroyed, websocketShutdown, udpShutdown }, { playerDestroyed: 1, websocketShutdown: 1, udpShutdown: 1 });
+});
+
+test('backs off repeated failed primary media starts for the same target', () => {
+  const account = 'primary-retry-test';
+  primaryMediaFailures.delete(account);
+  try {
+    assert.equal(primaryMediaRetryError(account, 'guild-1', 'channel-1', 'go-live'), null);
+    recordPrimaryMediaFailure(account, 'guild-1', 'channel-1', 'go-live', 'handshake timed out');
+    assert.match(primaryMediaRetryError(account, 'guild-1', 'channel-1', 'go-live'), /cooling down/);
+    assert.equal(primaryMediaRetryError(account, 'guild-1', 'channel-2', 'go-live'), null);
+  } finally {
+    primaryMediaFailures.delete(account);
+  }
 });
 
 test('confirms a voice state from the gateway', async () => {

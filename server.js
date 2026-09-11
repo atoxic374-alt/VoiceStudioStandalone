@@ -136,6 +136,10 @@ const AUTOMATION_CONCURRENCY = Math.max(1, Math.min(8, Number(process.env.VOICE_
 const watchdogObservations = new Map();
 const mediaDesired = new Map();
 const mediaRunGenerations = new Map();
+// Keep a failed primary stream handshake from being retried by every state
+// cycle tick. Retrying a broken handshake immediately is both ineffective and
+// causes the upstream voice library to retain transport listeners.
+const primaryMediaFailures = new Map();
 const pendingRoomMoves = new Set();
 let watchdogRunning = false;
 const mediaStartQueue = [];
@@ -793,6 +797,35 @@ function waitForDiscordStreamEvents(client, guildId, channelId, timeoutMs = 8000
     client.on?.('raw', onRaw);
   });
 }
+function compactPrimaryVoiceClosingListeners(connection) {
+  if (!connection || typeof connection.listenerCount !== 'function' || typeof connection.removeAllListeners !== 'function') return false;
+  // discord.js-selfbot-v13 creates a WebSocket and UDP object on reconnect,
+  // and each object adds a `closing` listener without removing its predecessor.
+  // Once this reaches 11 Node emits MaxListenersExceededWarning and retains
+  // dead transports. Rebuild the small, current cleanup set instead.
+  if (connection.listenerCount('closing') <= 3) return false;
+  connection.removeAllListeners('closing');
+  connection.on?.('closing', () => connection.player?.destroy?.());
+  connection.on?.('closing', () => connection.sockets?.ws?.shutdown?.());
+  connection.on?.('closing', () => connection.sockets?.udp?.shutdown?.());
+  logMediaEvent('warn', 'media.primary_listener_cleanup', {
+    channelId: voiceConnectionChannelId(connection),
+    listeners: connection.listenerCount('closing'),
+  });
+  return true;
+}
+function primaryMediaRetryError(name, guildId, channelId, mediaKind) {
+  const previous = primaryMediaFailures.get(name);
+  if (!previous || previous.guildId !== guildId || previous.channelId !== channelId || previous.mediaKind !== mediaKind || previous.retryAt <= Date.now()) return null;
+  return `Media transport is cooling down after a failed Discord handshake; retry in ${Math.ceil((previous.retryAt - Date.now()) / 1000)} seconds`;
+}
+function recordPrimaryMediaFailure(name, guildId, channelId, mediaKind, error) {
+  const previous = primaryMediaFailures.get(name);
+  const attempts = previous?.guildId === guildId && previous?.channelId === channelId && previous?.mediaKind === mediaKind ? previous.attempts + 1 : 1;
+  const delayMs = Math.min(5 * 60 * 1000, 30_000 * (2 ** (attempts - 1)));
+  primaryMediaFailures.set(name, { guildId, channelId, mediaKind, attempts, retryAt: Date.now() + delayMs });
+  logMediaEvent('warn', 'media.primary_retry_delayed', { account: name, guildId, channelId, mediaKind, attempts, delayMs, error });
+}
 function withTimeout(promise, timeoutMs, message) {
   let timer;
   return Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), timeoutMs); })]).finally(() => clearTimeout(timer));
@@ -971,6 +1004,9 @@ async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live',
   if (!target.ok) return { ok: false, error: target.error };
   const connection = client?.voice?.connection;
   if (!connection || voiceConnectionChannelId(connection) !== String(session.channelId)) return { ok: false, error: 'The account has no active voice connection' };
+  const cooldownError = primaryMediaRetryError(name, guildId, session.channelId, mediaKind);
+  if (cooldownError) return { ok: false, error: cooldownError, cooldown: true };
+  compactPrimaryVoiceClosingListeners(connection);
   // playVideo() starts FFmpeg internally. Feed it the reusable one-hour file
   // instead of starting a second FFmpeg producer for every account.
   const source = ensureSyntheticVideo();
@@ -1000,6 +1036,7 @@ async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live',
       ? { selfMute: !!session.selfMute, selfDeaf: false, selfVideo: true, selfStream: false }
       : { selfMute: !!session.selfMute, selfDeaf: false, selfVideo: false, selfStream: true }, 3000);
     if (!confirmed.ok) throw new Error(confirmed.error || 'Discord did not confirm Go Live state');
+    primaryMediaFailures.delete(name);
     return { ok: true };
   } catch (error) {
     await signaling.catch(() => {});
@@ -1014,7 +1051,9 @@ async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live',
         try { connection.streamConnection = null; } catch {}
       }
     }
-    return { ok: false, error: error.message || 'Unable to start Go Live' };
+    const message = error.message || 'Unable to start Go Live';
+    recordPrimaryMediaFailure(name, guildId, session.channelId, mediaKind, message);
+    return { ok: false, error: message };
   }
 }
 function voiceConnectionChannelId(connection) {
@@ -1129,7 +1168,10 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
     // the production log. Returning the primary error keeps one owner for the
     // voice session and lets the caller's normal retry/watchdog retry safely.
     logMediaEvent('warn', 'media.primary_transport_failed', { account: name, guildId, channelId: session.channelId, mediaKind, error: primaryResult.error, fallback: 'blocked' });
-    logMediaEvent('error', 'media.dedicated_fallback_blocked', { account: name, guildId, channelId: session.channelId, mediaKind, reason: 'primary-voice-connection-exists' });
+    // This is intentional protection, not an application error: a second
+    // Streamer handshake would compete with the authoritative connection and
+    // is the source of the missing voice-token failures.
+    logMediaEvent('warn', 'media.dedicated_fallback_blocked', { account: name, guildId, channelId: session.channelId, mediaKind, reason: 'primary-voice-connection-exists' });
     return primaryResult;
   }
   logMediaEvent('warn', 'media.primary_transport_unavailable', { account: name, guildId, channelId: session.channelId, mediaKind, hasConnection: !!primaryConnection, connectionChannelId: voiceConnectionChannelId(primaryConnection), hasCreateStreamConnection: typeof primaryConnection?.createStreamConnection === 'function' });
@@ -2684,4 +2726,4 @@ if (require.main === module) {
   app.listen(PORT, '0.0.0.0', () => { console.log(`Voice Studio listening on http://localhost:${PORT}`); setInterval(() => { try { reconcileVoiceSessions(); } catch (error) { console.warn('[voice] session reconciliation failed:', error.message); } }, 3000).unref?.(); startVoiceWatchdog(); restoreSavedAccounts().then(() => restoreAutomationTasks()).catch((error) => console.warn('[restore] restore failed:', error.message)); });
 }
 
-module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, normalizeExclusiveVoiceState, clearVoiceFlags, cleanAccountRecords, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck };
+module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, normalizeExclusiveVoiceState, clearVoiceFlags, cleanAccountRecords, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck };
