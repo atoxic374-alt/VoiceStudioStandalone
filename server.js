@@ -229,7 +229,10 @@ function nextStateIndex(states, history = []) {
 async function recoverVoiceAfterStateFailure(name, guildId, current) {
   const client = getClient(name);
   if (!client || !current?.channelId) return { ok: false, error: 'No confirmed voice session to recover' };
-  stopSyntheticStream(name, { leaveVoice: true });
+  // Recovery restores the same voice room. Leaving it here invalidates the
+  // session/token that the following OP4 needs and turns a recoverable media
+  // failure into a guaranteed voice-state confirmation timeout.
+  stopSyntheticStream(name, { leaveVoice: false });
   const restored = await sendVoiceOpConfirmed(client, guildId, current.channelId, {
     selfMute: !!current.selfMute,
     selfDeaf: !!current.selfDeaf,
@@ -254,7 +257,14 @@ async function executeStateForAccount(name, task, requestedState, expectedRunTok
   try {
     const next = { ...current, ...mergeVoiceState({}, requestedState) };
     if (next.selfDeaf && (next.selfVideo || next.selfStream)) return { name, ok: false, error: 'Invalid deafened media state' };
-    if (current.selfStream || current.selfVideo || syntheticStreams.has(name)) stopSyntheticStream(name, { leaveVoice: false });
+    const stoppingMedia = current.selfStream || current.selfVideo || syntheticStreams.has(name);
+    if (stoppingMedia) {
+      stopSyntheticStream(name, { leaveVoice: false });
+      // STREAM_DELETE is asynchronous on Discord. Do not race its teardown
+      // with an OP4 reset; Discord can otherwise omit the reset update and the
+      // state cycle is left showing the old stream.
+      await new Promise((resolve) => setTimeout(resolve, MEDIA_SETTLE_DELAY_MS));
+    }
     const cleared = await clearVoiceFlags(client, task.guildId, current.channelId, current);
     if (!cleared.ok) return { name, ok: false, error: `Unable to clear previous voice state: ${cleared.error}` };
     if (!taskIsCurrent()) return { name, ok: false, stale: true, error: 'State cycle was stopped or superseded' };
@@ -626,7 +636,13 @@ async function clearVoiceFlags(client, guildId, channelId, current = {}) {
   // torn down. This reset is idempotent, so retry it before aborting rotation.
   let last = null;
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    last = await sendVoiceOpConfirmed(client, guildId, channelId, reset, attempt === 0 ? 6000 : 3000);
+    last = await sendVoiceOpConfirmed(client, guildId, channelId, {
+      ...reset,
+      // Discord may omit disabled media fields from VOICE_STATE_UPDATE after a
+      // STREAM_DELETE. The room and every field it does report must still
+      // match; only these already-disabled fields are optional.
+      confirmOmittedFalseFlags: ['selfVideo', 'selfStream'],
+    }, attempt === 0 ? 6000 : 3000);
     if (last.ok) return last;
     if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 350 * (attempt + 1)));
   }
@@ -1601,6 +1617,7 @@ function sendVoiceOpConfirmed(client, guildId, channelId, opts = {}, timeoutMs =
   return new Promise((resolve) => {
     const userId = client?.user?.id;
     if (!userId) return resolve({ ok: false, error: 'Client not ready (no user id)' });
+    const optionalFalseFlags = new Set(Array.isArray(opts.confirmOmittedFalseFlags) ? opts.confirmOmittedFalseFlags : []);
 
     let settled = false;
     let timer = null;
@@ -1629,14 +1646,18 @@ function sendVoiceOpConfirmed(client, guildId, channelId, opts = {}, timeoutMs =
       const flags = [
         ['self_mute', 'selfMute'], ['self_deaf', 'selfDeaf'], ['self_video', 'selfVideo'], ['self_stream', 'selfStream'],
       ];
-      return flags.every(([wire, local]) => opts[local] === undefined
-        || ((payload[wire] !== undefined || payload[local] !== undefined)
-          && !!(payload[wire] ?? payload[local]) === !!opts[local]));
+      return flags.every(([wire, local]) => {
+        if (opts[local] === undefined) return true;
+        const reported = payload[wire] ?? payload[local];
+        if (reported === undefined) return opts[local] === false && optionalFalseFlags.has(local);
+        return !!reported === !!opts[local];
+      });
     };
     const cachedStateMatches = () => {
       const state = readGatewayVoiceState(client, guildId);
       if (!state || (channelId != null && String(state.channelId) !== String(channelId))) return false;
-      return Object.entries(opts).every(([key, value]) => !['selfMute', 'selfDeaf', 'selfVideo', 'selfStream'].includes(key) || (state[key] !== undefined && !!state[key] === !!value));
+      return Object.entries(opts).every(([key, value]) => !['selfMute', 'selfDeaf', 'selfVideo', 'selfStream'].includes(key)
+        || (state[key] === undefined ? value === false && optionalFalseFlags.has(key) : !!state[key] === !!value));
     };
     const onWsState = (packet) => {
       const data = packet?.d || packet;
@@ -1656,7 +1677,7 @@ function sendVoiceOpConfirmed(client, guildId, channelId, opts = {}, timeoutMs =
       };
       const flagsMatch = Object.entries(opts).every(([key, value]) => {
         if (!['selfMute', 'selfDeaf', 'selfVideo', 'selfStream'].includes(key)) return true;
-        return observed[key] !== undefined && !!observed[key] === !!value;
+        return observed[key] === undefined ? value === false && optionalFalseFlags.has(key) : !!observed[key] === !!value;
       });
       if (flagsMatch) finish({ ok: true, confirmed: true });
     };

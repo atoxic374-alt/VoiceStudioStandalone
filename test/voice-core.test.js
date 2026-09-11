@@ -32,6 +32,12 @@ test('clears every previous voice flag before the next rotation state', async ()
   assert.deepEqual(getSent().d, { guild_id: 'guild-1', channel_id: 'channel-1', self_mute: false, self_deaf: false, self_video: false, self_stream: false });
 });
 
+test('accepts Discord omitting disabled media fields after stopping a stream', async () => {
+  const { client } = fakeClient({ omitFlags: ['self_video', 'self_stream'] });
+  const result = await clearVoiceFlags(client, 'guild-1', 'channel-1', { selfStream: true });
+  assert.equal(result.ok, true);
+});
+
 test('always sends an explicit voice reset when cached state has no flags', async () => {
   const { client, getSent } = fakeClient();
   const result = await clearVoiceFlags(client, 'guild-1', 'channel-1', {});
@@ -39,18 +45,22 @@ test('always sends an explicit voice reset when cached state has no flags', asyn
   assert.deepEqual(getSent().d, { guild_id: 'guild-1', channel_id: 'channel-1', self_mute: false, self_deaf: false, self_video: false, self_stream: false });
 });
 
-function fakeClient({ ready = true, confirms = true } = {}) {
+function fakeClient({ ready = true, confirms = true, omitFlags = [] } = {}) {
   const ws = new EventEmitter();
   let sent = null;
   const shard = {
     status: ready ? 0 : 1,
     send(payload) {
       sent = payload;
-      if (confirms) setImmediate(() => ws.emit('VOICE_STATE_UPDATE', {
+      if (confirms) setImmediate(() => {
+        const update = {
         user_id: 'user-1', guild_id: 'guild-1', channel_id: payload.d.channel_id,
         self_mute: payload.d.self_mute, self_deaf: payload.d.self_deaf,
         self_video: payload.d.self_video, self_stream: payload.d.self_stream,
-      }));
+        };
+        omitFlags.forEach((flag) => delete update[flag]);
+        ws.emit('VOICE_STATE_UPDATE', update);
+      });
     },
   };
   ws.shards = { first: () => shard };
