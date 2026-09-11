@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
-const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, cleanAccountRecords, normalizeExclusiveVoiceState, clearVoiceFlags } = require('../server');
+const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, cleanAccountRecords, normalizeExclusiveVoiceState, clearVoiceFlags, cleanupPrimaryStreamAttempt } = require('../server');
 
 test('cleans saved account records before they can affect the account count', () => {
   const records = cleanAccountRecords([
@@ -193,6 +193,16 @@ test('starts primary media before waiting for Discord stream signaling', async (
   const dispatcher = await playPrimaryMediaAndWait(connection, {}, signaling);
   assert.deepEqual(order, ['playVideo', 'discord-signaling']);
   assert.deepEqual(dispatcher, { id: 'dispatcher' });
+});
+
+test('cleans a half-open primary stream connection after a failed readiness attempt', () => {
+  let disconnected = 0;
+  const streamConnection = { disconnect: () => { disconnected += 1; } };
+  const connection = { streamConnection };
+  assert.equal(cleanupPrimaryStreamAttempt(connection, streamConnection), true);
+  assert.equal(disconnected, 1);
+  assert.equal(connection.streamConnection, null);
+  assert.equal(cleanupPrimaryStreamAttempt(connection, null), false);
 });
 
 test('destroys a primary dispatcher when media start is cancelled during signaling', async () => {
