@@ -7,6 +7,7 @@ const FFMPEG_PATH = require('ffmpeg-static');
 const { EventEmitter } = require('events');
 const { Client } = require('discord.js-selfbot-v13');
 const helmet = require('helmet');
+
 const AUTH_COOKIE = 'voice_studio_auth';
 const CLIENT_DEVICE_COOKIE = 'voice_studio_client_device';
 const AUTH_TTL_MS = 12 * 60 * 60 * 1000;
@@ -228,7 +229,10 @@ function nextStateIndex(states, history = []) {
 async function recoverVoiceAfterStateFailure(name, guildId, current) {
   const client = getClient(name);
   if (!client || !current?.channelId) return { ok: false, error: 'No confirmed voice session to recover' };
-  stopSyntheticStream(name, { leaveVoice: true });
+  // Recovery restores the same voice room. Leaving it here invalidates the
+  // session/token that the following OP4 needs and turns a recoverable media
+  // failure into a guaranteed voice-state confirmation timeout.
+  stopSyntheticStream(name, { leaveVoice: false });
   const restored = await sendVoiceOpConfirmed(client, guildId, current.channelId, {
     selfMute: !!current.selfMute,
     selfDeaf: !!current.selfDeaf,
@@ -253,7 +257,14 @@ async function executeStateForAccount(name, task, requestedState, expectedRunTok
   try {
     const next = { ...current, ...mergeVoiceState({}, requestedState) };
     if (next.selfDeaf && (next.selfVideo || next.selfStream)) return { name, ok: false, error: 'Invalid deafened media state' };
-    if (current.selfStream || current.selfVideo || syntheticStreams.has(name)) stopSyntheticStream(name, { leaveVoice: false });
+    const stoppingMedia = current.selfStream || current.selfVideo || syntheticStreams.has(name);
+    if (stoppingMedia) {
+      stopSyntheticStream(name, { leaveVoice: false });
+      // STREAM_DELETE is asynchronous on Discord. Do not race its teardown
+      // with an OP4 reset; Discord can otherwise omit the reset update and the
+      // state cycle is left showing the old stream.
+      await new Promise((resolve) => setTimeout(resolve, MEDIA_SETTLE_DELAY_MS));
+    }
     const cleared = await clearVoiceFlags(client, task.guildId, current.channelId, current);
     if (!cleared.ok) return { name, ok: false, error: `Unable to clear previous voice state: ${cleared.error}` };
     if (!taskIsCurrent()) return { name, ok: false, stale: true, error: 'State cycle was stopped or superseded' };
@@ -625,7 +636,13 @@ async function clearVoiceFlags(client, guildId, channelId, current = {}) {
   // torn down. This reset is idempotent, so retry it before aborting rotation.
   let last = null;
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    last = await sendVoiceOpConfirmed(client, guildId, channelId, reset, attempt === 0 ? 6000 : 3000);
+    last = await sendVoiceOpConfirmed(client, guildId, channelId, {
+      ...reset,
+      // Discord may omit disabled media fields from VOICE_STATE_UPDATE after a
+      // STREAM_DELETE. The room and every field it does report must still
+      // match; only these already-disabled fields are optional.
+      confirmOmittedFalseFlags: ['selfVideo', 'selfStream'],
+    }, attempt === 0 ? 6000 : 3000);
     if (last.ok) return last;
     if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 350 * (attempt + 1)));
   }
@@ -734,11 +751,17 @@ function scheduleMediaRestart(name, active, reason) {
     const current = voiceSessions.get(sessionKey(name, active.guildId));
     const expectedKind = current?.selfStream ? 'go-live' : current?.selfVideo ? 'camera' : null;
     if (!current || current.channelId !== active.channelId || expectedKind !== active.mediaKind) return;
-    const result = await startSyntheticStream(name, active.guildId, active.mediaKind, current);
-    if (result.ok) {
-      const restored = voiceSessions.get(sessionKey(name, active.guildId));
-      if (restored) Object.assign(restored, { selfVideo: active.mediaKind === 'camera', selfStream: active.mediaKind === 'go-live', updatedAt: Date.now() });
-      persistSessions();
+    try {
+      const result = await startSyntheticStream(name, active.guildId, active.mediaKind, current);
+      if (result.ok) {
+        const restored = voiceSessions.get(sessionKey(name, active.guildId));
+        if (restored) Object.assign(restored, { selfVideo: active.mediaKind === 'camera', selfStream: active.mediaKind === 'go-live', updatedAt: Date.now() });
+        persistSessions();
+      }
+    } catch (error) {
+      // Timers do not have a caller to await them. Contain any unforeseen
+      // failure so a retry never becomes a process-level crash.
+      logMediaEvent('error', 'media.restart_failed', { account: name, guildId: active.guildId, channelId: active.channelId, error: error?.message || String(error) });
     }
   }, delayMs);
   pendingMediaRestarts.set(name, restartTimer);
@@ -776,26 +799,17 @@ function waitForMediaSource(source, timeoutMs = 3000) {
   });
   return withTimeout(waiting, timeoutMs, 'FFmpeg produced no media data within 3 seconds').catch((error) => { cleanup(); throw error; });
 }
-function waitForDiscordStreamEvents(client, guildId, channelId, timeoutMs = 8000) {
-  const expectedKey = `guild:${guildId}:${channelId}:${String(client.user?.id || '')}`;
-  return new Promise((resolve, reject) => {
-    let created = false;
-    let serverUpdated = false;
-    const finish = (error) => {
-      clearTimeout(timer);
-      client.off?.('raw', onRaw);
-      if (error) reject(error); else resolve();
-    };
-    const onRaw = (packet) => {
-      if (!packet || !['STREAM_CREATE', 'STREAM_SERVER_UPDATE'].includes(packet.t)) return;
-      if (String(packet.d?.stream_key || '') !== expectedKey) return;
-      if (packet.t === 'STREAM_CREATE') created = true;
-      if (packet.t === 'STREAM_SERVER_UPDATE' && packet.d?.endpoint && packet.d?.token) serverUpdated = true;
-      if (created && serverUpdated) finish();
-    };
-    const timer = setTimeout(() => finish(new Error(`Discord did not confirm stream signaling (create=${created}, server_update=${serverUpdated})`)), timeoutMs);
-    client.on?.('raw', onRaw);
-  });
+function cleanupPrimaryStreamAttempt(connection, streamConnection = connection?.streamConnection) {
+  if (!streamConnection) return false;
+  // createStreamConnection() creates and stores this object synchronously,
+  // before its WebRTC promise settles. If that promise times out, leaving it
+  // cached makes the next start reuse a half-open transport and can cause
+  // repeated STREAM_SERVER_UPDATE/voice-socket failures.
+  try { streamConnection.disconnect?.(); } catch {}
+  if (connection?.streamConnection === streamConnection) {
+    try { connection.streamConnection = null; } catch {}
+  }
+  return true;
 }
 function compactPrimaryVoiceClosingListeners(connection) {
   if (!connection || typeof connection.listenerCount !== 'function' || typeof connection.removeAllListeners !== 'function') return false;
@@ -1011,15 +1025,19 @@ async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live',
   // instead of starting a second FFmpeg producer for every account.
   const source = ensureSyntheticVideo();
   let streamConnection;
+  let pendingStreamConnection;
   let dispatcher;
   let active;
-  const signaling = waitForDiscordStreamEvents(client, guildId, session.channelId, MEDIA_STREAM_TIMEOUT_MS);
   try {
-    streamConnection = await withTimeout(connection.createStreamConnection(), MEDIA_STREAM_TIMEOUT_MS, `Discord media connection timed out after ${Math.round(MEDIA_STREAM_TIMEOUT_MS / 1000)} seconds`);
-    // playVideo() sends STREAM_CREATE/STREAM_SERVER_UPDATE. Waiting for those
-    // events before calling it creates a circular wait and forces the code to
-    // fall back to a competing Streamer voice connection.
-    dispatcher = await playPrimaryMediaAndWait(streamConnection, source, signaling, isCurrent);
+    // The VoiceConnection implementation sends STREAM_CREATE itself and only
+    // resolves this promise after the stream transport has authenticated and
+    // become ready. Do not run a second, parallel raw-event timeout here: it
+    // can reject first while the library is still cleaning up its transport.
+    const connecting = connection.createStreamConnection();
+    pendingStreamConnection = connection.streamConnection;
+    streamConnection = await withTimeout(connecting, MEDIA_STREAM_TIMEOUT_MS, `Discord media connection timed out after ${Math.round(MEDIA_STREAM_TIMEOUT_MS / 1000)} seconds`);
+    pendingStreamConnection = streamConnection;
+    dispatcher = await playPrimaryMediaAndWait(streamConnection, source, Promise.resolve(), isCurrent);
     active = { connection, streamConnection, dispatcher, sourceProcess: null, guildId, channelId: session.channelId, mediaKind };
     syntheticStreams.set(name, active);
     const restartPrimaryMedia = (reason, error) => {
@@ -1039,17 +1057,14 @@ async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live',
     primaryMediaFailures.delete(name);
     return { ok: true };
   } catch (error) {
-    await signaling.catch(() => {});
     // A failed confirmation must release every object created by this attempt.
-    // Otherwise each retry leaks a dispatcher/FFmpeg child until spawn returns
-    // EAGAIN and the unhandled child error takes down the whole service.
+    // Most importantly, clear the synchronously cached StreamConnection when
+    // its readiness promise times out. Otherwise a later start reuses the
+    // half-open object instead of sending a fresh STREAM_CREATE.
     if (syntheticStreams.get(name) === active) stopSyntheticStream(name, { silent: true, invalidate: false });
     else {
       try { dispatcher?.destroy?.(); } catch {}
-      try { streamConnection?.disconnect?.(); } catch {}
-      if (connection.streamConnection === streamConnection) {
-        try { connection.streamConnection = null; } catch {}
-      }
+      cleanupPrimaryStreamAttempt(connection, streamConnection || pendingStreamConnection);
     }
     const message = error.message || 'Unable to start Go Live';
     recordPrimaryMediaFailure(name, guildId, session.channelId, mediaKind, message);
@@ -1602,6 +1617,7 @@ function sendVoiceOpConfirmed(client, guildId, channelId, opts = {}, timeoutMs =
   return new Promise((resolve) => {
     const userId = client?.user?.id;
     if (!userId) return resolve({ ok: false, error: 'Client not ready (no user id)' });
+    const optionalFalseFlags = new Set(Array.isArray(opts.confirmOmittedFalseFlags) ? opts.confirmOmittedFalseFlags : []);
 
     let settled = false;
     let timer = null;
@@ -1630,14 +1646,18 @@ function sendVoiceOpConfirmed(client, guildId, channelId, opts = {}, timeoutMs =
       const flags = [
         ['self_mute', 'selfMute'], ['self_deaf', 'selfDeaf'], ['self_video', 'selfVideo'], ['self_stream', 'selfStream'],
       ];
-      return flags.every(([wire, local]) => opts[local] === undefined
-        || ((payload[wire] !== undefined || payload[local] !== undefined)
-          && !!(payload[wire] ?? payload[local]) === !!opts[local]));
+      return flags.every(([wire, local]) => {
+        if (opts[local] === undefined) return true;
+        const reported = payload[wire] ?? payload[local];
+        if (reported === undefined) return opts[local] === false && optionalFalseFlags.has(local);
+        return !!reported === !!opts[local];
+      });
     };
     const cachedStateMatches = () => {
       const state = readGatewayVoiceState(client, guildId);
       if (!state || (channelId != null && String(state.channelId) !== String(channelId))) return false;
-      return Object.entries(opts).every(([key, value]) => !['selfMute', 'selfDeaf', 'selfVideo', 'selfStream'].includes(key) || (state[key] !== undefined && !!state[key] === !!value));
+      return Object.entries(opts).every(([key, value]) => !['selfMute', 'selfDeaf', 'selfVideo', 'selfStream'].includes(key)
+        || (state[key] === undefined ? value === false && optionalFalseFlags.has(key) : !!state[key] === !!value));
     };
     const onWsState = (packet) => {
       const data = packet?.d || packet;
@@ -1657,7 +1677,7 @@ function sendVoiceOpConfirmed(client, guildId, channelId, opts = {}, timeoutMs =
       };
       const flagsMatch = Object.entries(opts).every(([key, value]) => {
         if (!['selfMute', 'selfDeaf', 'selfVideo', 'selfStream'].includes(key)) return true;
-        return observed[key] !== undefined && !!observed[key] === !!value;
+        return observed[key] === undefined ? value === false && optionalFalseFlags.has(key) : !!observed[key] === !!value;
       });
       if (flagsMatch) finish({ ok: true, confirmed: true });
     };
@@ -2488,6 +2508,11 @@ app.post('/api/voice/rotation/start', async (req, res) => {
       task.nextAt = Date.now() + task.intervalMs;
       persistAutomationTasks();
       emitLive('task.completed', { id: task.id, taskType: 'rotation', nextAt: task.nextAt, currentIdx: task.currentIdx, results: task.lastResults });
+    } catch (error) {
+      const result = { name: 'rotation', ok: false, error: error?.message || String(error) };
+      task.lastResults = [result];
+      recordTaskResult(task, result);
+      logMediaEvent('error', 'automation.rotation_tick_failed', { id: task.id, guildId: task.guildId, error: result.error });
     } finally { task.running = false; }
   }, delay);
   persistAutomationTasks();
@@ -2726,4 +2751,4 @@ if (require.main === module) {
   app.listen(PORT, '0.0.0.0', () => { console.log(`Voice Studio listening on http://localhost:${PORT}`); setInterval(() => { try { reconcileVoiceSessions(); } catch (error) { console.warn('[voice] session reconciliation failed:', error.message); } }, 3000).unref?.(); startVoiceWatchdog(); restoreSavedAccounts().then(() => restoreAutomationTasks()).catch((error) => console.warn('[restore] restore failed:', error.message)); });
 }
 
-module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, normalizeExclusiveVoiceState, clearVoiceFlags, cleanAccountRecords, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck };
+module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, cleanupPrimaryStreamAttempt, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, normalizeExclusiveVoiceState, clearVoiceFlags, cleanAccountRecords, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck };
