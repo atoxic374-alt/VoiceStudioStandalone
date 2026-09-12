@@ -41,6 +41,20 @@ function logMediaEvent(level, event, details = {}) {
   try { fs.appendFileSync(MEDIA_LOG_FILE, `${JSON.stringify(record)}\n`, { mode: 0o600 }); } catch (error) { console.warn('[media-log] write failed:', error.message); }
   if (level === 'error') console.warn(`[media:${event}]`, details.error || details.stage || 'operation failed');
 }
+function isRecoverableDiscordInteractionError(error) {
+  const message = String(error?.message || error || '');
+  return Number(error?.code) === 50035
+    && (message.includes('Invalid Form Body') || message.includes('Component validation failed'));
+}
+// discord.js-selfbot-v13 can reject a stale/external button interaction after
+// the message has changed. Do not let that rejection terminate Railway.
+process.on('unhandledRejection', (error) => {
+  if (isRecoverableDiscordInteractionError(error)) {
+    console.warn('[discord] ignored stale or invalid component interaction:', String(error.message || error));
+    return;
+  }
+  console.error('[process] unhandled rejection:', error);
+});
 
 // Account tokens are persisted only as an authenticated AES-256-GCM payload.
 // Set DATA_ENCRYPTION_KEY in production to keep this storage independent from
@@ -532,12 +546,19 @@ function playingCommandText(message) {
   return (prefix ? content.slice(prefix.length) : content).trim().toLocaleLowerCase();
 }
 const handledPlayingCommands = new Set();
+const channelMismatchLogs = new Map();
 async function handlePlayingDiscordCommand(client, message) {
   const command = playingCommandText(message);
   if (!['start', 'stop'].includes(command)) return false;
   const configuredChannel = String(process.env.DISCORD_COMMAND_CHANNEL_ID || '').trim();
   if (configuredChannel && String(message.channel?.id || '') !== configuredChannel) {
-    console.log(`[playing-command] ignored: channel mismatch author=${String(message.author?.id || 'unknown')} channel=${String(message.channel?.id || 'unknown')} expected=${configuredChannel}`);
+    const mismatchKey = `${String(message.author?.id || 'unknown')}:${String(message.channel?.id || 'unknown')}:${configuredChannel}`;
+    const lastLoggedAt = channelMismatchLogs.get(mismatchKey) || 0;
+    if (Date.now() - lastLoggedAt >= 60_000) {
+      channelMismatchLogs.set(mismatchKey, Date.now());
+      if (channelMismatchLogs.size > 1000) channelMismatchLogs.delete(channelMismatchLogs.keys().next().value);
+      console.log(`[playing-command] ignored: channel mismatch author=${String(message.author?.id || 'unknown')} channel=${String(message.channel?.id || 'unknown')} expected=${configuredChannel}`);
+    }
     return false;
   }
   const owners = String(process.env.DISCORD_COMMAND_OWNERS || '')
@@ -561,7 +582,13 @@ async function handlePlayingDiscordCommand(client, message) {
   const result = command === 'start' ? startAllPlayingSessions() : stopAllPlayingSessions();
   try {
     await message.react?.('✅');
-  } catch (error) { console.warn('[playing-command] unable to add confirmation reaction:', error.message); }
+  } catch (error) {
+    // Reactions are optional confirmation and may be forbidden in the source
+    // channel. Never turn a successful command into a noisy process error.
+    if (!/Missing Permissions|Missing Access|Unknown Message/i.test(String(error?.message || error))) {
+      console.warn('[playing-command] unable to add confirmation reaction:', error.message);
+    }
+  }
   return true;
 }
 function cleanChannelIds(channelIds) {
@@ -817,6 +844,10 @@ function compactPrimaryVoiceClosingListeners(connection) {
   // and each object adds a `closing` listener without removing its predecessor.
   // Once this reaches 11 Node emits MaxListenersExceededWarning and retains
   // dead transports. Rebuild the small, current cleanup set instead.
+  // This connection owns several short-lived transport objects; listener
+  // count is managed explicitly here so Node's generic warning cannot turn a
+  // reconnect storm into process noise while the stale listeners are removed.
+  connection.setMaxListeners?.(0);
   if (connection.listenerCount('closing') <= 3) return false;
   connection.removeAllListeners('closing');
   connection.on?.('closing', () => connection.player?.destroy?.());
@@ -2751,4 +2782,4 @@ if (require.main === module) {
   app.listen(PORT, '0.0.0.0', () => { console.log(`Voice Studio listening on http://localhost:${PORT}`); setInterval(() => { try { reconcileVoiceSessions(); } catch (error) { console.warn('[voice] session reconciliation failed:', error.message); } }, 3000).unref?.(); startVoiceWatchdog(); restoreSavedAccounts().then(() => restoreAutomationTasks()).catch((error) => console.warn('[restore] restore failed:', error.message)); });
 }
 
-module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, cleanupPrimaryStreamAttempt, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, normalizeExclusiveVoiceState, clearVoiceFlags, cleanAccountRecords, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck };
+module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, cleanupPrimaryStreamAttempt, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, normalizeExclusiveVoiceState, clearVoiceFlags, cleanAccountRecords, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, isRecoverableDiscordInteractionError };

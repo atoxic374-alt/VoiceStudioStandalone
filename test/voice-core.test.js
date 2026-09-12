@@ -1,7 +1,13 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
-const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, cleanAccountRecords, normalizeExclusiveVoiceState, clearVoiceFlags, cleanupPrimaryStreamAttempt } = require('../server');
+const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, cleanAccountRecords, normalizeExclusiveVoiceState, clearVoiceFlags, cleanupPrimaryStreamAttempt, isRecoverableDiscordInteractionError } = require('../server');
+
+test('classifies stale Discord component validation failures as recoverable', () => {
+  assert.equal(isRecoverableDiscordInteractionError({ code: 50035, message: 'DiscordAPIError: Invalid Form Body' }), true);
+  assert.equal(isRecoverableDiscordInteractionError({ code: 50035, message: 'Component validation failed' }), true);
+  assert.equal(isRecoverableDiscordInteractionError({ code: 50013, message: 'Missing Permissions' }), false);
+});
 
 test('cleans saved account records before they can affect the account count', () => {
   const records = cleanAccountRecords([
