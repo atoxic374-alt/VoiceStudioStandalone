@@ -105,6 +105,17 @@ test('compacts leaked primary voice closing listeners while retaining active cle
   assert.deepEqual({ playerDestroyed, websocketShutdown, udpShutdown }, { playerDestroyed: 1, websocketShutdown: 1, udpShutdown: 1 });
 });
 
+test('hardens a voice connection without retaining more than three closing listeners', () => {
+  const connection = new EventEmitter();
+  connection.channel = { id: 'channel-hardened' };
+  connection.setMaxListeners(0);
+  for (let index = 0; index < 20; index += 1) connection.on('closing', () => {});
+  const { hardenVoiceConnection } = require('../server');
+  assert.equal(hardenVoiceConnection(connection), true);
+  assert.equal(connection.listenerCount('closing'), 3);
+  assert.equal(connection.getMaxListeners(), 0);
+});
+
 test('backs off repeated failed primary media starts for the same target', () => {
   const account = 'primary-retry-test';
   primaryMediaFailures.delete(account);

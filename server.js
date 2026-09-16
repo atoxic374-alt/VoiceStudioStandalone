@@ -547,6 +547,7 @@ function playingCommandText(message) {
 }
 const handledPlayingCommands = new Set();
 const channelMismatchLogs = new Map();
+const ownerMismatchLogs = new Map();
 async function handlePlayingDiscordCommand(client, message) {
   const command = playingCommandText(message);
   if (!['start', 'stop'].includes(command)) return false;
@@ -569,7 +570,13 @@ async function handlePlayingDiscordCommand(client, message) {
   // An explicit allow-list is required. Never fall back to the connected
   // account, because every connected account can receive the same command.
   if (!authorId || !owners.includes(authorId)) {
-    console.log(`[playing-command] ignored: owner mismatch author=${authorId || 'unknown'} configured=${owners.length ? owners.join(',') : 'none'} command=${command}`);
+    const mismatchKey = `${authorId || 'unknown'}:${command}`;
+    const lastLoggedAt = ownerMismatchLogs.get(mismatchKey) || 0;
+    if (Date.now() - lastLoggedAt >= 60_000) {
+      ownerMismatchLogs.set(mismatchKey, Date.now());
+      if (ownerMismatchLogs.size > 1000) ownerMismatchLogs.delete(ownerMismatchLogs.keys().next().value);
+      console.log(`[playing-command] ignored: owner mismatch author=${authorId || 'unknown'} configured=${owners.length ? owners.join(',') : 'none'} command=${command}`);
+    }
     return false;
   }
   const messageKey = String(message.id || '');
@@ -858,6 +865,11 @@ function compactPrimaryVoiceClosingListeners(connection) {
     listeners: connection.listenerCount('closing'),
   });
   return true;
+}
+function hardenVoiceConnection(connection) {
+  if (!connection || typeof connection !== 'object') return false;
+  connection.setMaxListeners?.(0);
+  return compactPrimaryVoiceClosingListeners(connection);
 }
 function primaryMediaRetryError(name, guildId, channelId, mediaKind) {
   const previous = primaryMediaFailures.get(name);
@@ -1538,8 +1550,10 @@ async function runVoiceWatchdog() {
   }
 }
 function startVoiceWatchdog() {
+  if (startVoiceWatchdog.timer) return startVoiceWatchdog.timer;
   const timer = setInterval(() => { runVoiceWatchdog().catch((error) => logMediaEvent('error', 'watchdog.failed', { error: error.message })); }, WATCHDOG_INTERVAL_MS);
   timer.unref?.();
+  startVoiceWatchdog.timer = timer;
   return timer;
 }
 function markTokenChanged(name, token, error) {
@@ -1917,6 +1931,7 @@ async function moveAccountLocked(name, guildId, channelId, opts = {}) {
           selfDeaf: !!desired.selfDeaf,
           selfVideo: false,
         }), MEDIA_JOIN_TIMEOUT_MS, 'Primary voice connection did not become ready');
+        hardenVoiceConnection(client.voice?.connection || connection);
         result = { ok: true, connection };
       } catch (error) {
         result = { ok: false, error: error?.message || 'Primary voice connection failed' };
@@ -2025,7 +2040,12 @@ async function connectOne(token, name) {
   client.on?.('error', markError);
   client.on?.('ready', () => { entry.lastError = null; entry.lastSeenAt = Date.now(); emitLive('account.health.changed', { account: accountHealth(finalName, entry) }); });
   client.on?.('disconnect', () => { entry.lastSeenAt = Date.now(); emitLive('account.health.changed', { account: accountHealth(finalName, entry) }); });
-  client.on?.('messageCreate', (message) => { handlePlayingDiscordCommand(client, message).catch((error) => console.warn('[playing-command] failed:', error.message)); });
+  if (!client.__voiceStudioHandlersInstalled) {
+    client.__voiceStudioHandlersInstalled = true;
+    client.on?.('messageCreate', (message) => {
+      Promise.resolve(handlePlayingDiscordCommand(client, message)).catch((error) => console.warn('[playing-command] failed:', redact(error?.message || error)));
+    });
+  }
   emitLive('account.connected', { account: accountHealth(finalName, entry) });
 
   // Restore only the channel state; media capture remains browser-owned and must be
@@ -2046,6 +2066,7 @@ async function connectOne(token, name) {
         selfDeaf: !!session.selfDeaf,
         selfVideo: false,
       }).then(() => {
+        hardenVoiceConnection(client.voice?.connection);
         logMediaEvent('info', 'voice.restore.ready', { account: finalName, guildId: session.guildId, channelId: session.channelId });
       }).catch((error) => {
         logMediaEvent('warn', 'voice.restore.failed', { account: finalName, guildId: session.guildId, channelId: session.channelId, error: error?.message || String(error) });
@@ -2782,4 +2803,4 @@ if (require.main === module) {
   app.listen(PORT, '0.0.0.0', () => { console.log(`Voice Studio listening on http://localhost:${PORT}`); setInterval(() => { try { reconcileVoiceSessions(); } catch (error) { console.warn('[voice] session reconciliation failed:', error.message); } }, 3000).unref?.(); startVoiceWatchdog(); restoreSavedAccounts().then(() => restoreAutomationTasks()).catch((error) => console.warn('[restore] restore failed:', error.message)); });
 }
 
-module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, cleanupPrimaryStreamAttempt, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, normalizeExclusiveVoiceState, clearVoiceFlags, cleanAccountRecords, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, isRecoverableDiscordInteractionError };
+module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, hardenVoiceConnection, cleanupPrimaryStreamAttempt, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, normalizeExclusiveVoiceState, clearVoiceFlags, cleanAccountRecords, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, isRecoverableDiscordInteractionError };
