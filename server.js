@@ -136,6 +136,11 @@ const MEDIA_SETTLE_DELAY_MS = 4000;
 const MEDIA_JOIN_TIMEOUT_MS = Math.max(10000, Number(process.env.MEDIA_JOIN_TIMEOUT_MS || 20000));
 const MEDIA_WEBRTC_TIMEOUT_MS = Math.max(6000, Number(process.env.MEDIA_WEBRTC_TIMEOUT_MS || 10000));
 const MEDIA_STREAM_TIMEOUT_MS = Math.max(12000, Number(process.env.MEDIA_STREAM_TIMEOUT_MS || 20000));
+// Railway's smallest instances cannot keep many Discord Gateway clients alive.
+// Saved accounts remain encrypted on disk, but only a bounded number reconnect
+// automatically; the limit can be increased explicitly when more memory is
+// available.
+const MAX_RESTORED_ACCOUNTS = Math.max(0, Math.min(50, Number(process.env.MAX_RESTORED_ACCOUNTS || 6)));
 // Media starts are serialized through an explicit FIFO queue. The next camera
 // or Go Live account starts only after the previous attempt has reached a
 // terminal result (ready, failed, or cancelled) and its resources are cleaned.
@@ -2727,8 +2732,11 @@ app.post('/api/voice/state-cycle/stop', (req, res) => {
 async function restoreSavedAccounts() {
   const saved = loadAccounts();
   if (!saved.length) return;
-  console.log(`[accounts] restoring ${saved.length} saved account${saved.length === 1 ? '' : 's'}`);
-  for (const account of saved) {
+  const restored = saved.slice(0, MAX_RESTORED_ACCOUNTS);
+  const skipped = saved.length - restored.length;
+  console.log(`[accounts] restoring ${restored.length} of ${saved.length} saved account${saved.length === 1 ? '' : 's'} (MAX_RESTORED_ACCOUNTS=${MAX_RESTORED_ACCOUNTS})`);
+  if (skipped > 0) console.warn(`[accounts] skipped ${skipped} saved account${skipped === 1 ? '' : 's'} during automatic restore; connect them manually or raise MAX_RESTORED_ACCOUNTS`);
+  for (const account of restored) {
     try { await connectOne(account.token, account.name); }
     catch (error) { console.warn(`[accounts] unable to restore ${account.name}:`, redact(error.message)); }
   }
