@@ -16,11 +16,18 @@ const AUTH_TTL_MS = 12 * 60 * 60 * 1000;
 const CLIENT_DEVICE_TTL_MS = 365 * 24 * 60 * 60 * 1000;
 // Fail closed: a production deployment without an owner password must not expose the API.
 const AUTH_ENABLED = true;
-const ACCOUNT_FILE = path.join(__dirname, 'data', 'accounts.enc');
-
 const app = express();
 const PORT = Number(process.env.PORT || 5050);
-const DATA_DIR = path.join(__dirname, 'data');
+const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data'));
+function resolveDataFile(fileName) {
+  const candidates = [fileName, `${fileName}.txt`, `${fileName}.json.txt`];
+  for (const candidate of candidates) {
+    const fullPath = path.join(DATA_DIR, candidate);
+    if (fs.existsSync(fullPath)) return fullPath;
+  }
+  return path.join(DATA_DIR, fileName);
+}
+const ACCOUNT_FILE = path.join(DATA_DIR, 'accounts.enc');
 const VOICE_STATE_FILE = path.join(DATA_DIR, 'voice-sessions.json');
 const AUTOMATION_TASKS_FILE = path.join(DATA_DIR, 'automation-tasks.json');
 const PLAYING_FILE = path.join(DATA_DIR, 'playing-sessions.json');
@@ -59,7 +66,14 @@ process.on('unhandledRejection', (error) => {
 // Account tokens are persisted only as an authenticated AES-256-GCM payload.
 // Set DATA_ENCRYPTION_KEY in production to keep this storage independent from
 // the login password; APP_PASSWORD is retained as a backwards-compatible fallback.
-function persistenceKey() { return crypto.createHash('sha256').update(String(process.env.DATA_ENCRYPTION_KEY || process.env.APP_PASSWORD || 'voice-studio-local-storage')).digest(); }
+function persistenceKey(secret = process.env.DATA_ENCRYPTION_KEY || process.env.APP_PASSWORD || 'voice-studio-local-storage') { return crypto.createHash('sha256').update(String(secret)).digest(); }
+function persistenceKeyCandidates() {
+  return [...new Set([
+    process.env.DATA_ENCRYPTION_KEY,
+    process.env.APP_PASSWORD,
+    'voice-studio-local-storage',
+  ].filter(Boolean).map(String))].map(persistenceKey);
+}
 function saveAccounts(records) {
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', persistenceKey(), iv);
@@ -88,17 +102,27 @@ function cleanAccountRecords(records) {
   return result.slice(0, 500);
 }
 function loadAccounts() {
-  try {
-    const payload = JSON.parse(fs.readFileSync(ACCOUNT_FILE, 'utf8'));
-    const decipher = crypto.createDecipheriv('aes-256-gcm', persistenceKey(), Buffer.from(payload.iv, 'base64url'));
-    decipher.setAuthTag(Buffer.from(payload.tag, 'base64url'));
-    const plain = Buffer.concat([decipher.update(Buffer.from(payload.data, 'base64url')), decipher.final()]);
-    const records = JSON.parse(plain.toString('utf8'));
-    return cleanAccountRecords(records);
-  } catch (error) {
-    if (fs.existsSync(ACCOUNT_FILE)) console.warn('[accounts] saved accounts could not be restored:', error.message);
+  const file = resolveDataFile('accounts.enc');
+  if (!fs.existsSync(file)) {
+    console.warn(`[accounts] no saved account file found in ${DATA_DIR}; expected accounts.enc (also accepts accounts.enc.txt)`);
     return [];
   }
+  let lastError;
+  for (const key of persistenceKeyCandidates()) {
+    try {
+      const payload = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '').trim());
+      const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(payload.iv, 'base64url'));
+      decipher.setAuthTag(Buffer.from(payload.tag, 'base64url'));
+      const plain = Buffer.concat([decipher.update(Buffer.from(payload.data, 'base64url')), decipher.final()]);
+      const records = cleanAccountRecords(JSON.parse(plain.toString('utf8')));
+      if (file !== ACCOUNT_FILE) console.warn(`[accounts] reading uploaded compatibility filename ${path.basename(file)}; canonical filename is accounts.enc`);
+      if (file !== ACCOUNT_FILE || key !== persistenceKey()) saveAccounts(records);
+      console.log(`[accounts] loaded ${records.length} saved account${records.length === 1 ? '' : 's'} from ${path.basename(file)}`);
+      return records;
+    } catch (error) { lastError = error; }
+  }
+  console.warn(`[accounts] saved accounts could not be restored from ${path.basename(file)}: ${lastError?.message || 'unknown encryption or JSON error'}`);
+  return [];
 }
 function persistConnectedAccounts() {
   try { saveAccounts(cleanAccountRecords([...clients.entries()].map(([name, entry]) => ({ name, token: entry.token, savedAt: entry.savedAt || Date.now() })))); }
@@ -140,7 +164,7 @@ const MEDIA_STREAM_TIMEOUT_MS = Math.max(12000, Number(process.env.MEDIA_STREAM_
 // Saved accounts remain encrypted on disk, but only a bounded number reconnect
 // automatically; the limit can be increased explicitly when more memory is
 // available.
-const MAX_RESTORED_ACCOUNTS = Math.max(0, Math.min(50, Number(process.env.MAX_RESTORED_ACCOUNTS || 6)));
+const MAX_RESTORED_ACCOUNTS = Math.max(0, Math.min(500, Number(process.env.MAX_RESTORED_ACCOUNTS || 500)));
 // Media starts are serialized through an explicit FIFO queue. The next camera
 // or Go Live account starts only after the previous attempt has reached a
 // terminal result (ready, failed, or cancelled) and its resources are cleaned.
@@ -311,13 +335,13 @@ function persistAutomationTasks() {
   const temp = `${AUTOMATION_TASKS_FILE}.tmp`;
   try { fs.writeFileSync(temp, JSON.stringify(payload, null, 2), { mode: 0o600 }); fs.renameSync(temp, AUTOMATION_TASKS_FILE); } catch (error) { try { fs.rmSync(temp, { force: true }); } catch {} console.warn('[automation] unable to persist tasks:', error.message); }
 }
-function loadAutomationTasks() { try { const value = JSON.parse(fs.readFileSync(AUTOMATION_TASKS_FILE, 'utf8')); return value && typeof value === 'object' ? value : { rotations: [], stateCycles: [] }; } catch { return { rotations: [], stateCycles: [] }; } }
+function loadAutomationTasks() { try { const value = JSON.parse(fs.readFileSync(resolveDataFile('automation-tasks.json'), 'utf8').replace(/^\uFEFF/, '').trim()); return value && typeof value === 'object' ? value : { rotations: [], stateCycles: [] }; } catch (error) { if (fs.existsSync(resolveDataFile('automation-tasks.json'))) console.warn('[automation] saved tasks could not be restored:', error.message); return { rotations: [], stateCycles: [] }; } }
 function persistPlayingSessions() {
   const safe = [...playingSessions.values()].map(({ timer, running, ...session }) => session);
   const temp = `${PLAYING_FILE}.tmp`;
   try { fs.writeFileSync(temp, JSON.stringify(safe, null, 2), { mode: 0o600 }); fs.renameSync(temp, PLAYING_FILE); } catch (error) { try { fs.rmSync(temp, { force: true }); } catch {} console.warn('[playing] unable to persist sessions:', error.message); }
 }
-function loadPlayingSessions() { try { const value = JSON.parse(fs.readFileSync(PLAYING_FILE, 'utf8')); return Array.isArray(value) ? value : []; } catch { return []; } }
+function loadPlayingSessions() { try { const value = JSON.parse(fs.readFileSync(resolveDataFile('playing-sessions.json'), 'utf8').replace(/^\uFEFF/, '').trim()); return Array.isArray(value) ? value : []; } catch (error) { if (fs.existsSync(resolveDataFile('playing-sessions.json'))) console.warn('[playing] saved sessions could not be restored:', error.message); return []; } }
 function logPlayingEvent(event, details = {}) { const record = { time: new Date().toISOString(), event, ...details }; playingEvents.unshift(record); playingEvents.splice(500); try { fs.appendFileSync(PLAYING_LOG_FILE, `${JSON.stringify(record)}\n`, { mode: 0o600 }); } catch {} emitLive(`playing.${event}`, details); }
 function readPlayingEvents() { try { return fs.readFileSync(PLAYING_LOG_FILE, 'utf8').trim().split('\n').filter(Boolean).slice(-500).reverse().map((line) => JSON.parse(line)); } catch { return [...playingEvents]; } }
 function cleanPlayingSteps(steps) {
@@ -688,10 +712,14 @@ async function clearVoiceFlags(client, guildId, channelId, current = {}) {
   return last || { ok: false, error: 'Unable to reset voice state' };
 }
 function readPersistedSessions() {
+  const file = resolveDataFile('voice-sessions.json');
   try {
-    const value = JSON.parse(fs.readFileSync(VOICE_STATE_FILE, 'utf8'));
+    const value = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '').trim());
     return Array.isArray(value) ? value : [];
-  } catch { return []; }
+  } catch (error) {
+    if (fs.existsSync(file)) console.warn('[voice] saved sessions could not be restored:', error.message);
+    return [];
+  }
 }
 function persistSessions() {
   const safe = [...voiceSessions.values()].map(({ name, guildId, channelId, selfMute, selfDeaf, selfVideo, selfStream }) => ({

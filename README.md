@@ -15,7 +15,7 @@ npm install
 npm start
 ```
 
-Open [http://localhost:5050](http://localhost:5050). Connected Discord tokens are stored encrypted in `data/accounts.enc` and restored automatically after restart; voice sessions are persisted in `data/voice-sessions.json`. To keep small Railway instances within their memory limit, automatic restore is capped at 6 accounts by default; set `MAX_RESTORED_ACCOUNTS` explicitly when the service has more memory. Set `DATA_ENCRYPTION_KEY` to a stable random value in production; otherwise `APP_PASSWORD` is used as the encryption key. Use HTTPS or `localhost` when deploying the browser UI so browser media permissions are available.
+Open [http://localhost:5050](http://localhost:5050). Connected Discord tokens are stored encrypted in `data/accounts.enc` and restored automatically after restart; voice sessions are persisted in `data/voice-sessions.json`. The server also accepts manually uploaded compatibility names such as `accounts.enc.txt`, `voice-sessions.json.txt`, `automation-tasks.json.txt`, and `playing-sessions.json.txt`, then migrates the account file to its canonical name. Automatic account restore supports up to 500 saved accounts by default; set `MAX_RESTORED_ACCOUNTS` lower on small instances if needed. Set `DATA_ENCRYPTION_KEY` to a stable random value in production; the loader also tries the current `APP_PASSWORD` and the local-development fallback so an older export can be migrated when its original key is still available. Set `DATA_DIR` only when the Railway Volume is mounted at a custom path. Use HTTPS or `localhost` when deploying the browser UI so browser media permissions are available.
 
 ## Test and check
 
