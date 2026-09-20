@@ -25,6 +25,21 @@ function resolveDataFile(fileName) {
     const fullPath = path.join(DATA_DIR, candidate);
     if (fs.existsSync(fullPath)) return fullPath;
   }
+  // Railway's file uploader and mobile browsers may rename a duplicate to
+  // names such as accounts.enc(1).txt. Prefer the newest/largest compatible
+  // export when the canonical name is not present.
+  try {
+    const prefix = `${fileName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`;
+    const aliases = fs.readdirSync(DATA_DIR)
+      .filter((name) => new RegExp(`^${prefix}(?:\\(\\d+\\))?(?:\\.txt|\\.json\\.txt)$`).test(name))
+      .map((name) => {
+        const fullPath = path.join(DATA_DIR, name);
+        const stat = fs.statSync(fullPath);
+        return { fullPath, mtimeMs: stat.mtimeMs, size: stat.size };
+      })
+      .sort((a, b) => b.mtimeMs - a.mtimeMs || b.size - a.size);
+    if (aliases.length) return aliases[0].fullPath;
+  } catch (error) { console.warn(`[storage] unable to scan data directory for ${fileName}:`, error.message); }
   return path.join(DATA_DIR, fileName);
 }
 const ACCOUNT_FILE = path.join(DATA_DIR, 'accounts.enc');
@@ -99,7 +114,7 @@ function cleanAccountRecords(records) {
     seenNames.add(nameKey);
     result.push({ name, token, savedAt: Number(item?.savedAt) || Date.now() });
   }
-  return result.slice(0, 500);
+  return result;
 }
 function loadAccounts() {
   const file = resolveDataFile('accounts.enc');
@@ -114,10 +129,12 @@ function loadAccounts() {
       const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(payload.iv, 'base64url'));
       decipher.setAuthTag(Buffer.from(payload.tag, 'base64url'));
       const plain = Buffer.concat([decipher.update(Buffer.from(payload.data, 'base64url')), decipher.final()]);
-      const records = cleanAccountRecords(JSON.parse(plain.toString('utf8')));
+      const plaintext = plain.toString('utf8');
+      const records = cleanAccountRecords(JSON.parse(plaintext));
       if (file !== ACCOUNT_FILE) console.warn(`[accounts] reading uploaded compatibility filename ${path.basename(file)}; canonical filename is accounts.enc`);
       if (file !== ACCOUNT_FILE || key !== persistenceKey()) saveAccounts(records);
-      console.log(`[accounts] loaded ${records.length} saved account${records.length === 1 ? '' : 's'} from ${path.basename(file)}`);
+      const checksum = crypto.createHash('sha256').update(plaintext).digest('hex').slice(0, 16);
+      console.log(`[accounts] loaded ${records.length} saved account${records.length === 1 ? '' : 's'} from ${path.basename(file)}; plaintextBytes=${Buffer.byteLength(plaintext)}; checksum=${checksum}`);
       return records;
     } catch (error) { lastError = error; }
   }
