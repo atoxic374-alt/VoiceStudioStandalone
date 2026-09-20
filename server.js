@@ -1606,10 +1606,10 @@ function markTokenChanged(name, token, error) {
   stopSyntheticStream(name, { leaveVoice: true });
   removeSessionsForAccount(name);
   try { previous?.client?.destroy?.(); } catch {}
-  // Invalid credentials are not accounts. Do not keep a placeholder entry:
-  // clients.size drives the counter, preview, account selector, and persistence.
+  // Remove the live client, but retain the encrypted record so an account is
+  // never silently lost. The owner can explicitly remove it through the
+  // disconnect action after replacing or deleting the credential.
   clients.delete(name);
-  forgetPersistedAccount(name);
   persistConnectedAccounts();
   emitLive('account.removed', { name, reason: 'invalid-token', error: error?.message || String(error || 'Login failed') });
 }
@@ -2187,7 +2187,17 @@ function rateLimit(req, res, next) {
 }
 app.use('/api', rateLimit, originGuard, requireAuth);
 app.get('/version', (_req, res) => res.json({ success: true, version: getBuildVersion() }));
-app.get('/api/health', (_req, res) => ok(res, { service: 'voice-studio', connected: clients.size, watchdog: { enabled: true, intervalMs: WATCHDOG_INTERVAL_MS, running: watchdogRunning, observations: watchdogObservations.size }, accounts: [...clients.entries()].map(([name, entry]) => accountHealth(name, entry)) }));
+app.get('/api/health', (_req, res) => ok(res, { service: 'voice-studio', connected: clients.size, savedAccounts: savedAccountRecords.size, dataDir: DATA_DIR, accountFile: path.basename(resolveDataFile('accounts.enc')), watchdog: { enabled: true, intervalMs: WATCHDOG_INTERVAL_MS, running: watchdogRunning, observations: watchdogObservations.size }, accounts: [...clients.entries()].map(([name, entry]) => accountHealth(name, entry)) }));
+app.get('/api/storage/status', (_req, res) => {
+  const accountFile = resolveDataFile('accounts.enc');
+  const files = ['accounts.enc', 'voice-sessions.json', 'automation-tasks.json', 'playing-sessions.json'].map((name) => {
+    const file = resolveDataFile(name);
+    let bytes = 0;
+    try { bytes = fs.statSync(file).size; } catch {}
+    return { name, path: file, exists: fs.existsSync(file), bytes };
+  });
+  return ok(res, { dataDir: DATA_DIR, accountFile, savedAccounts: savedAccountRecords.size, connectedAccounts: clients.size, files });
+});
 const healthTimer = setInterval(() => {
   for (const [name, entry] of clients.entries()) {
     emitLive('health.updated', { account: accountHealth(name, entry) });
@@ -2849,7 +2859,10 @@ async function restoreAutomationTasks() {
 }
 app.get('/{*splat}', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 if (require.main === module) {
-  app.listen(PORT, '0.0.0.0', () => { console.log(`Voice Studio listening on http://localhost:${PORT}`); setInterval(() => { try { reconcileVoiceSessions(); } catch (error) { console.warn('[voice] session reconciliation failed:', error.message); } }, 3000).unref?.(); startVoiceWatchdog(); restoreSavedAccounts().then(() => restoreAutomationTasks()).catch((error) => console.warn('[restore] restore failed:', error.message)); });
+  app.listen(PORT, '0.0.0.0', () => { console.log(`Voice Studio listening on http://localhost:${PORT}`); console.log(`[storage] dataDir=${DATA_DIR}; accountFile=${resolveDataFile('accounts.enc')}`); setInterval(() => { try { reconcileVoiceSessions(); } catch (error) { console.warn('[voice] session reconciliation failed:', error.message); } }, 3000).unref?.(); startVoiceWatchdog(); restoreSavedAccounts().then(() => restoreAutomationTasks()).catch((error) => console.warn('[restore] restore failed:', error.message)); });
+  const persistBeforeExit = () => { try { persistConnectedAccounts(); persistSessions(); persistAutomationTasks(); persistPlayingSessions(); } catch (error) { console.warn('[storage] final persistence failed:', error.message); } };
+  process.once('SIGTERM', () => { persistBeforeExit(); process.exit(0); });
+  process.once('SIGINT', () => { persistBeforeExit(); process.exit(0); });
 }
 
 module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, hardenVoiceConnection, cleanupPrimaryStreamAttempt, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, normalizeExclusiveVoiceState, clearVoiceFlags, cleanAccountRecords, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, isRecoverableDiscordInteractionError };
