@@ -125,9 +125,16 @@ function loadAccounts() {
   return [];
 }
 function persistConnectedAccounts() {
-  try { saveAccounts(cleanAccountRecords([...clients.entries()].map(([name, entry]) => ({ name, token: entry.token, savedAt: entry.savedAt || Date.now() })))); }
+  try {
+    const merged = new Map(savedAccountRecords);
+    for (const [name, entry] of clients.entries()) merged.set(name, { name, token: entry.token, savedAt: entry.savedAt || Date.now() });
+    const records = cleanAccountRecords([...merged.values()]);
+    savedAccountRecords = new Map(records.map((item) => [item.name, item]));
+    saveAccounts(records);
+  }
   catch (error) { console.warn('[accounts] unable to persist encrypted account file:', error.message); }
 }
+function forgetPersistedAccount(name) { savedAccountRecords.delete(String(name)); }
 
 app.set('trust proxy', 1);
 app.use(helmet({
@@ -139,6 +146,7 @@ app.use(express.static(path.join(__dirname, 'public'), { extensions: ['html'] })
 
 // This standalone app intentionally keeps tokens in memory only.
 const clients = new Map();
+let savedAccountRecords = new Map();
 const connectingTokens = new Set();
 const voiceSessions = new Map();
 const rotations = new Map();
@@ -1601,6 +1609,7 @@ function markTokenChanged(name, token, error) {
   // Invalid credentials are not accounts. Do not keep a placeholder entry:
   // clients.size drives the counter, preview, account selector, and persistence.
   clients.delete(name);
+  forgetPersistedAccount(name);
   persistConnectedAccounts();
   emitLive('account.removed', { name, reason: 'invalid-token', error: error?.message || String(error || 'Login failed') });
 }
@@ -2246,6 +2255,7 @@ app.post('/api/discord/disconnect', async (req, res) => {
   stopSyntheticStream(name, { leaveVoice: true });
   try { await entry.client?.destroy?.(); } catch {}
   clients.delete(name);
+  forgetPersistedAccount(name);
   persistConnectedAccounts();
   emitLive('account.disconnected', { name });
   return ok(res, { name });
@@ -2261,6 +2271,7 @@ app.post('/api/discord/disconnect-bulk', async (req, res) => {
       removeSessionsForAccount(name);
       try { await entry.client?.destroy?.(); } catch (error) { return { name, ok: false, error: error.message }; }
       clients.delete(name);
+      forgetPersistedAccount(name);
       emitLive('account.disconnected', { name });
       return { name, ok: true };
     }));
@@ -2270,6 +2281,7 @@ app.post('/api/discord/disconnect-bulk', async (req, res) => {
 app.post('/api/discord/disconnect-all', async (_req, res) => {
   for (const name of clients.keys()) { stopTasksForAccount(name); stopSyntheticStream(name, { leaveVoice: true }); }
   for (const entry of clients.values()) { try { await entry.client?.destroy?.(); } catch {} }
+  for (const name of clients.keys()) forgetPersistedAccount(name);
   clients.clear();
   persistConnectedAccounts();
   emitLive('account.disconnected-all');
@@ -2759,6 +2771,7 @@ app.post('/api/voice/state-cycle/stop', (req, res) => {
 
 async function restoreSavedAccounts() {
   const saved = loadAccounts();
+  savedAccountRecords = new Map(saved.map((item) => [item.name, item]));
   if (!saved.length) return;
   const restored = saved.slice(0, MAX_RESTORED_ACCOUNTS);
   const skipped = saved.length - restored.length;
