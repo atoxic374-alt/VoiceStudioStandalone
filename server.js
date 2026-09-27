@@ -251,13 +251,9 @@ const MEDIA_SETTLE_DELAY_MS = 4000;
 const MEDIA_JOIN_TIMEOUT_MS = Math.max(10000, Number(process.env.MEDIA_JOIN_TIMEOUT_MS || 20000));
 const MEDIA_WEBRTC_TIMEOUT_MS = Math.max(6000, Number(process.env.MEDIA_WEBRTC_TIMEOUT_MS || 10000));
 const MEDIA_STREAM_TIMEOUT_MS = Math.max(12000, Number(process.env.MEDIA_STREAM_TIMEOUT_MS || 20000));
-// Railway's smallest instances cannot keep many Discord Gateway clients alive.
-// Saved accounts remain encrypted on disk, but only a bounded number reconnect
-// automatically; the limit can be increased explicitly up to a conservative
-// hard ceiling. This ceiling also protects deployments that still have the old
-// MAX_RESTORED_ACCOUNTS=500 variable configured. REST preflight avoids opening
-// a Gateway session for revoked tokens.
-const MAX_RESTORED_ACCOUNTS = Math.max(0, Math.min(30, Number(process.env.MAX_RESTORED_ACCOUNTS || 20)));
+// Saved accounts are all restored, but only a small number connect at once.
+// This keeps 50+ accounts possible without opening every Gateway session at
+// the same instant. REST preflight avoids sessions for revoked tokens.
 const ACCOUNT_RESTORE_CONCURRENCY = Math.max(1, Math.min(3, Number(process.env.ACCOUNT_RESTORE_CONCURRENCY || 2)));
 const ACCOUNT_CONNECT_CONCURRENCY = Math.max(1, Math.min(3, Number(process.env.ACCOUNT_CONNECT_CONCURRENCY || 2)));
 const DISCORD_PREFLIGHT_TIMEOUT_MS = Math.max(3000, Math.min(15000, Number(process.env.DISCORD_PREFLIGHT_TIMEOUT_MS || 8000)));
@@ -2901,18 +2897,8 @@ async function restoreSavedAccounts() {
     persistAccountSnapshots();
     return;
   }
-  const restored = saved.slice(0, MAX_RESTORED_ACCOUNTS);
-  const skipped = saved.length - restored.length;
-  console.log(`[accounts] restoring ${restored.length} of ${saved.length} saved account${saved.length === 1 ? '' : 's'} (MAX_RESTORED_ACCOUNTS=${MAX_RESTORED_ACCOUNTS})`);
-  for (const account of saved.slice(MAX_RESTORED_ACCOUNTS)) {
-    failedAccountRecords.set(account.name, {
-      ...account,
-      status: 'skipped-limit',
-      error: `Automatic restore limit is ${MAX_RESTORED_ACCOUNTS}`,
-      lastAttemptAt: Date.now(),
-    });
-  }
-  if (skipped > 0) console.warn(`[accounts] skipped ${skipped} saved account${skipped === 1 ? '' : 's'} during automatic restore; see failed-tokens.enc or connect them manually`);
+  const restored = saved;
+  console.log(`[accounts] restoring all ${restored.length} saved account${restored.length === 1 ? '' : 's'} with concurrency=${ACCOUNT_RESTORE_CONCURRENCY}`);
   await mapWithConcurrency(restored, ACCOUNT_RESTORE_CONCURRENCY, async (account) => {
     try { await connectOneWithRetry(account.token, account.name); }
     catch (error) { console.warn(`[accounts] unable to restore ${account.name}:`, redact(error.message)); }
