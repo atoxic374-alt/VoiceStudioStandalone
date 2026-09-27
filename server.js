@@ -188,8 +188,11 @@ const MEDIA_STREAM_TIMEOUT_MS = Math.max(12000, Number(process.env.MEDIA_STREAM_
 // Railway's smallest instances cannot keep many Discord Gateway clients alive.
 // Saved accounts remain encrypted on disk, but only a bounded number reconnect
 // automatically; the limit can be increased explicitly when more memory is
-// available.
-const MAX_RESTORED_ACCOUNTS = Math.max(0, Math.min(500, Number(process.env.MAX_RESTORED_ACCOUNTS || 500)));
+// available. REST preflight avoids opening a Gateway session for revoked tokens.
+const MAX_RESTORED_ACCOUNTS = Math.max(0, Math.min(500, Number(process.env.MAX_RESTORED_ACCOUNTS || 20)));
+const ACCOUNT_RESTORE_CONCURRENCY = Math.max(1, Math.min(3, Number(process.env.ACCOUNT_RESTORE_CONCURRENCY || 2)));
+const ACCOUNT_CONNECT_CONCURRENCY = Math.max(1, Math.min(3, Number(process.env.ACCOUNT_CONNECT_CONCURRENCY || 2)));
+const DISCORD_PREFLIGHT_TIMEOUT_MS = Math.max(3000, Math.min(15000, Number(process.env.DISCORD_PREFLIGHT_TIMEOUT_MS || 8000)));
 // Media starts are serialized through an explicit FIFO queue. The next camera
 // or Go Live account starts only after the previous attempt has reached a
 // terminal result (ready, failed, or cancelled) and its resources are cleaned.
@@ -2068,8 +2071,31 @@ async function connectOne(token, name) {
   if (connectingTokens.has(normalizedToken)) throw new Error('Duplicate token: connection already in progress');
   connectingTokens.add(normalizedToken);
   const client = new Client({ checkUpdate: false, fetchAllMembers: false });
-  try { await client.login(normalizedToken); }
-  finally { connectingTokens.delete(normalizedToken); }
+  try {
+    // Validate through REST first. Revoked tokens fail here without allocating
+    // a Gateway/WebSocket session, which is much cheaper during bulk restore.
+    const response = await fetch('https://discord.com/api/v10/users/@me', {
+      headers: { Authorization: normalizedToken },
+      signal: AbortSignal.timeout(DISCORD_PREFLIGHT_TIMEOUT_MS),
+    });
+    if (!response.ok) {
+      const error = new Error(response.status === 401
+        ? 'Invalid Discord token: Discord rejected the token or it was revoked'
+        : `Discord token preflight failed (HTTP ${response.status})`);
+      error.status = response.status;
+      if (response.status === 401) error.code = 40001;
+      throw error;
+    }
+    await client.login(normalizedToken);
+  } catch (error) {
+    // login() can fail before the client reaches the ready state. Always
+    // destroy that partially-created client so failed attempts do not retain
+    // Gateway listeners, sockets, timers, or caches in memory.
+    try { await client.destroy?.(); } catch {}
+    throw error;
+  } finally {
+    connectingTokens.delete(normalizedToken);
+  }
   const generatedAlias = /^account-\d+$/i.test(finalName);
   if (!finalName || generatedAlias) {
     const discordName = client.user?.globalName || client.user?.username || client.user?.tag || client.user?.id;
@@ -2271,7 +2297,7 @@ app.post('/api/discord/connect-bulk', async (req, res) => {
         .catch((error) => ({ ok: false, name: item.name || `bulk-${index + 1}`, error: error.message }));
     }
   };
-  await Promise.all(Array.from({ length: Math.min(3, items.length) }, worker));
+  await Promise.all(Array.from({ length: Math.min(ACCOUNT_CONNECT_CONCURRENCY, items.length) }, worker));
   return ok(res, { results, summary: summary(results) });
 });
 app.post('/api/discord/disconnect', async (req, res) => {
@@ -2804,10 +2830,10 @@ async function restoreSavedAccounts() {
   const skipped = saved.length - restored.length;
   console.log(`[accounts] restoring ${restored.length} of ${saved.length} saved account${saved.length === 1 ? '' : 's'} (MAX_RESTORED_ACCOUNTS=${MAX_RESTORED_ACCOUNTS})`);
   if (skipped > 0) console.warn(`[accounts] skipped ${skipped} saved account${skipped === 1 ? '' : 's'} during automatic restore; connect them manually or raise MAX_RESTORED_ACCOUNTS`);
-  for (const account of restored) {
-    try { await connectOne(account.token, account.name); }
+  await mapWithConcurrency(restored, ACCOUNT_RESTORE_CONCURRENCY, async (account) => {
+    try { await connectOneWithRetry(account.token, account.name); }
     catch (error) { console.warn(`[accounts] unable to restore ${account.name}:`, redact(error.message)); }
-  }
+  });
 }
 async function restoreAutomationTasks() {
   const saved = loadAutomationTasks();
