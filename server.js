@@ -43,6 +43,8 @@ function resolveDataFile(fileName) {
   return path.join(DATA_DIR, fileName);
 }
 const ACCOUNT_FILE = path.join(DATA_DIR, 'accounts.enc');
+const ACTIVE_TOKENS_FILE = path.join(DATA_DIR, 'active-tokens.json');
+const FAILED_TOKENS_FILE = path.join(DATA_DIR, 'failed-tokens.json');
 const VOICE_STATE_FILE = path.join(DATA_DIR, 'voice-sessions.json');
 const AUTOMATION_TASKS_FILE = path.join(DATA_DIR, 'automation-tasks.json');
 const PLAYING_FILE = path.join(DATA_DIR, 'playing-sessions.json');
@@ -89,15 +91,24 @@ function persistenceKeyCandidates() {
     'voice-studio-local-storage',
   ].filter(Boolean).map(String))].map(persistenceKey);
 }
-function saveAccounts(records) {
+function saveEncryptedRecords(file, records) {
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', persistenceKey(), iv);
   const encrypted = Buffer.concat([cipher.update(JSON.stringify(records), 'utf8'), cipher.final()]);
   const payload = JSON.stringify({ version: 1, iv: iv.toString('base64url'), tag: cipher.getAuthTag().toString('base64url'), data: encrypted.toString('base64url') });
-  const temp = `${ACCOUNT_FILE}.tmp`;
+  const temp = `${file}.tmp`;
   fs.writeFileSync(temp, payload, { mode: 0o600 });
-  fs.renameSync(temp, ACCOUNT_FILE);
-  try { fs.chmodSync(ACCOUNT_FILE, 0o600); } catch {}
+  fs.renameSync(temp, file);
+  try { fs.chmodSync(file, 0o600); } catch {}
+}
+function savePlainTokenSnapshot(file, records) {
+  const temp = `${file}.tmp`;
+  fs.writeFileSync(temp, JSON.stringify(records, null, 2) + '\n', { mode: 0o600 });
+  fs.renameSync(temp, file);
+  try { fs.chmodSync(file, 0o600); } catch {}
+}
+function saveAccounts(records) {
+  saveEncryptedRecords(ACCOUNT_FILE, records);
 }
 function cleanAccountRecords(records) {
   const result = [];
@@ -148,10 +159,64 @@ function persistConnectedAccounts() {
     const records = cleanAccountRecords([...merged.values()]);
     savedAccountRecords = new Map(records.map((item) => [item.name, item]));
     saveAccounts(records);
+    persistAccountSnapshots();
   }
   catch (error) { console.warn('[accounts] unable to persist encrypted account file:', error.message); }
 }
-function forgetPersistedAccount(name) { savedAccountRecords.delete(String(name)); }
+function cleanFailedAccountRecords(records) {
+  const result = [];
+  const seen = new Set();
+  for (const item of Array.isArray(records) ? records : []) {
+    const token = String(item?.token || '').trim();
+    const name = String(item?.name || '').trim().slice(0, 48);
+    if (!token || !name || seen.has(token.toLowerCase())) continue;
+    seen.add(token.toLowerCase());
+    result.push({
+      name,
+      token,
+      status: String(item?.status || 'failed').slice(0, 24),
+      error: redact(item?.error || 'Connection failed').slice(0, 300),
+      savedAt: Number(item?.savedAt) || Date.now(),
+      lastAttemptAt: Number(item?.lastAttemptAt) || Date.now(),
+    });
+  }
+  return result;
+}
+function persistAccountSnapshots() {
+  try {
+    const active = cleanAccountRecords([...clients.entries()].map(([name, entry]) => ({
+      name,
+      token: entry.token,
+      savedAt: entry.savedAt,
+    })));
+    const activeTokens = new Set(active.map((item) => item.token.toLowerCase()));
+    const failed = cleanFailedAccountRecords([...failedAccountRecords.values()]
+      .filter((item) => !activeTokens.has(String(item.token || '').toLowerCase())));
+    savePlainTokenSnapshot(ACTIVE_TOKENS_FILE, active);
+    savePlainTokenSnapshot(FAILED_TOKENS_FILE, failed);
+  } catch (error) {
+    console.warn('[accounts] unable to persist active/failed token snapshots:', error.message);
+  }
+}
+function recordFailedAccount(name, token, error, status = 'failed') {
+  const normalizedToken = String(token || '').trim();
+  const normalizedName = String(name || '').trim().slice(0, 48) || `account-${failedAccountRecords.size + 1}`;
+  if (!normalizedToken) return;
+  failedAccountRecords.set(normalizedName, {
+    name: normalizedName,
+    token: normalizedToken,
+    status,
+    error: redact(error?.message || String(error || 'Connection failed')),
+    savedAt: Date.now(),
+    lastAttemptAt: Date.now(),
+  });
+  persistAccountSnapshots();
+}
+function forgetPersistedAccount(name) {
+  const key = String(name);
+  savedAccountRecords.delete(key);
+  failedAccountRecords.delete(key);
+}
 
 app.set('trust proxy', 1);
 app.use(helmet({
@@ -164,6 +229,7 @@ app.use(express.static(path.join(__dirname, 'public'), { extensions: ['html'] })
 // This standalone app intentionally keeps tokens in memory only.
 const clients = new Map();
 let savedAccountRecords = new Map();
+const failedAccountRecords = new Map();
 const connectingTokens = new Set();
 const voiceSessions = new Map();
 const rotations = new Map();
@@ -1632,6 +1698,7 @@ function markTokenChanged(name, token, error) {
   // never silently lost. The owner can explicitly remove it through the
   // disconnect action after replacing or deleting the credential.
   clients.delete(name);
+  recordFailedAccount(name, token, error, 'invalid-token');
   persistConnectedAccounts();
   emitLive('account.removed', { name, reason: 'invalid-token', error: error?.message || String(error || 'Login failed') });
 }
@@ -1653,6 +1720,7 @@ async function connectOneWithRetry(token, name) {
     markTokenChanged(finalName, String(token || '').trim(), lastError);
     throw new Error('Invalid Discord token: Discord rejected the token or it was revoked');
   }
+  recordFailedAccount(finalName, String(token || '').trim(), lastError, 'connection-failed');
   throw new Error(`Temporary Discord connection failure after retry: ${lastError?.message || 'Gateway unavailable'}`);
 }
 function rotationControlledAccounts(guildId) {
@@ -2114,6 +2182,7 @@ async function connectOne(token, name) {
   }
   const entry = { client, token: normalizedToken, savedAt: Date.now(), connectedAt: Date.now(), lastSeenAt: Date.now(), lastError: null };
   clients.set(finalName, entry);
+  failedAccountRecords.delete(finalName);
   persistConnectedAccounts();
   const markError = (error) => {
     if (isInvalidCredentialError(error)) {
@@ -2827,15 +2896,28 @@ app.post('/api/voice/state-cycle/stop', (req, res) => {
 async function restoreSavedAccounts() {
   const saved = loadAccounts();
   savedAccountRecords = new Map(saved.map((item) => [item.name, item]));
-  if (!saved.length) return;
+  failedAccountRecords.clear();
+  if (!saved.length) {
+    persistAccountSnapshots();
+    return;
+  }
   const restored = saved.slice(0, MAX_RESTORED_ACCOUNTS);
   const skipped = saved.length - restored.length;
   console.log(`[accounts] restoring ${restored.length} of ${saved.length} saved account${saved.length === 1 ? '' : 's'} (MAX_RESTORED_ACCOUNTS=${MAX_RESTORED_ACCOUNTS})`);
-  if (skipped > 0) console.warn(`[accounts] skipped ${skipped} saved account${skipped === 1 ? '' : 's'} during automatic restore; connect them manually or raise MAX_RESTORED_ACCOUNTS`);
+  for (const account of saved.slice(MAX_RESTORED_ACCOUNTS)) {
+    failedAccountRecords.set(account.name, {
+      ...account,
+      status: 'skipped-limit',
+      error: `Automatic restore limit is ${MAX_RESTORED_ACCOUNTS}`,
+      lastAttemptAt: Date.now(),
+    });
+  }
+  if (skipped > 0) console.warn(`[accounts] skipped ${skipped} saved account${skipped === 1 ? '' : 's'} during automatic restore; see failed-tokens.enc or connect them manually`);
   await mapWithConcurrency(restored, ACCOUNT_RESTORE_CONCURRENCY, async (account) => {
     try { await connectOneWithRetry(account.token, account.name); }
     catch (error) { console.warn(`[accounts] unable to restore ${account.name}:`, redact(error.message)); }
   });
+  persistAccountSnapshots();
 }
 async function restoreAutomationTasks() {
   const saved = loadAutomationTasks();
@@ -2904,8 +2986,8 @@ async function restoreAutomationTasks() {
 }
 app.get('/{*splat}', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 if (require.main === module) {
-  app.listen(PORT, '0.0.0.0', () => { console.log(`Voice Studio listening on http://localhost:${PORT}`); console.log(`[storage] dataDir=${DATA_DIR}; accountFile=${resolveDataFile('accounts.enc')}`); setInterval(() => { try { reconcileVoiceSessions(); } catch (error) { console.warn('[voice] session reconciliation failed:', error.message); } }, 3000).unref?.(); startVoiceWatchdog(); restoreSavedAccounts().then(() => restoreAutomationTasks()).catch((error) => console.warn('[restore] restore failed:', error.message)); });
-  const persistBeforeExit = () => { try { persistConnectedAccounts(); persistSessions(); persistAutomationTasks(); persistPlayingSessions(); } catch (error) { console.warn('[storage] final persistence failed:', error.message); } };
+  app.listen(PORT, '0.0.0.0', () => { console.log(`Voice Studio listening on http://localhost:${PORT}`); console.log(`[storage] dataDir=${DATA_DIR}; accountFile=${resolveDataFile('accounts.enc')}; activeTokensFile=${ACTIVE_TOKENS_FILE}; failedTokensFile=${FAILED_TOKENS_FILE}`); persistAccountSnapshots(); setInterval(() => { try { reconcileVoiceSessions(); } catch (error) { console.warn('[voice] session reconciliation failed:', error.message); } }, 3000).unref?.(); startVoiceWatchdog(); restoreSavedAccounts().then(() => restoreAutomationTasks()).catch((error) => console.warn('[restore] restore failed:', error.message)); });
+  const persistBeforeExit = () => { try { persistConnectedAccounts(); persistAccountSnapshots(); persistSessions(); persistAutomationTasks(); persistPlayingSessions(); } catch (error) { console.warn('[storage] final persistence failed:', error.message); } };
   process.once('SIGTERM', () => { persistBeforeExit(); process.exit(0); });
   process.once('SIGINT', () => { persistBeforeExit(); process.exit(0); });
 }
