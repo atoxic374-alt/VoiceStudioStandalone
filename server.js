@@ -187,9 +187,11 @@ const MEDIA_WEBRTC_TIMEOUT_MS = Math.max(6000, Number(process.env.MEDIA_WEBRTC_T
 const MEDIA_STREAM_TIMEOUT_MS = Math.max(12000, Number(process.env.MEDIA_STREAM_TIMEOUT_MS || 20000));
 // Railway's smallest instances cannot keep many Discord Gateway clients alive.
 // Saved accounts remain encrypted on disk, but only a bounded number reconnect
-// automatically; the limit can be increased explicitly when more memory is
-// available. REST preflight avoids opening a Gateway session for revoked tokens.
-const MAX_RESTORED_ACCOUNTS = Math.max(0, Math.min(500, Number(process.env.MAX_RESTORED_ACCOUNTS || 20)));
+// automatically; the limit can be increased explicitly up to a conservative
+// hard ceiling. This ceiling also protects deployments that still have the old
+// MAX_RESTORED_ACCOUNTS=500 variable configured. REST preflight avoids opening
+// a Gateway session for revoked tokens.
+const MAX_RESTORED_ACCOUNTS = Math.max(0, Math.min(30, Number(process.env.MAX_RESTORED_ACCOUNTS || 20)));
 const ACCOUNT_RESTORE_CONCURRENCY = Math.max(1, Math.min(3, Number(process.env.ACCOUNT_RESTORE_CONCURRENCY || 2)));
 const ACCOUNT_CONNECT_CONCURRENCY = Math.max(1, Math.min(3, Number(process.env.ACCOUNT_CONNECT_CONCURRENCY || 2)));
 const DISCORD_PREFLIGHT_TIMEOUT_MS = Math.max(3000, Math.min(15000, Number(process.env.DISCORD_PREFLIGHT_TIMEOUT_MS || 8000)));
