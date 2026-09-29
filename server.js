@@ -49,6 +49,7 @@ const VOICE_STATE_FILE = path.join(DATA_DIR, 'voice-sessions.json');
 const AUTOMATION_TASKS_FILE = path.join(DATA_DIR, 'automation-tasks.json');
 const PLAYING_FILE = path.join(DATA_DIR, 'playing-sessions.json');
 const PLAYING_LOG_FILE = path.join(DATA_DIR, 'playing-events.log');
+const PLAYING_LOG_MAX_BYTES = 5 * 1024 * 1024;
 const CLIENT_BIND_FILE = path.join(DATA_DIR, 'client-binding.json');
 const MEDIA_LOG_FILE = path.join(DATA_DIR, 'media-events.log');
 fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -240,7 +241,9 @@ const pendingMediaRestarts = new Map();
 const mediaRestartAttempts = new Map();
 const accountOperations = new Map();
 const playingSessions = new Map();
+const playingReservations = new Set();
 const playingSafety = new Map();
+let playingRestoreReady = false;
 const PLAYING_MIN_INTERACTION_GAP_MS = 2500;
 const playingEvents = [];
 let videoStreamModulePromise;
@@ -434,11 +437,51 @@ function persistPlayingSessions() {
   try { fs.writeFileSync(temp, JSON.stringify(safe, null, 2), { mode: 0o600 }); fs.renameSync(temp, PLAYING_FILE); } catch (error) { try { fs.rmSync(temp, { force: true }); } catch {} console.warn('[playing] unable to persist sessions:', error.message); }
 }
 function loadPlayingSessions() { try { const value = JSON.parse(fs.readFileSync(resolveDataFile('playing-sessions.json'), 'utf8').replace(/^\uFEFF/, '').trim()); return Array.isArray(value) ? value : []; } catch (error) { if (fs.existsSync(resolveDataFile('playing-sessions.json'))) console.warn('[playing] saved sessions could not be restored:', error.message); return []; } }
-function logPlayingEvent(event, details = {}) { const record = { time: new Date().toISOString(), event, ...details }; playingEvents.unshift(record); playingEvents.splice(500); try { fs.appendFileSync(PLAYING_LOG_FILE, `${JSON.stringify(record)}\n`, { mode: 0o600 }); } catch {} emitLive(`playing.${event}`, details); }
-function readPlayingEvents() { try { return fs.readFileSync(PLAYING_LOG_FILE, 'utf8').trim().split('\n').filter(Boolean).slice(-500).reverse().map((line) => JSON.parse(line)); } catch { return [...playingEvents]; } }
+function appendPlayingEventRecord(record, file = PLAYING_LOG_FILE, maxBytes = PLAYING_LOG_MAX_BYTES) {
+  const line = `${JSON.stringify(record)}\n`;
+  try {
+    let size = 0;
+    try { size = fs.statSync(file).size; } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    if (size > 0 && size + Buffer.byteLength(line) > maxBytes) {
+      try { fs.renameSync(file, `${file}.1`); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    }
+    fs.appendFileSync(file, line, { mode: 0o600 });
+  } catch (error) { console.warn('[playing-log] write failed:', error.message); }
+}
+function readPlayingEventRecords(file = PLAYING_LOG_FILE, limit = 500) {
+  const records = [];
+  for (const source of [`${file}.1`, file]) {
+    let lines;
+    try { lines = fs.readFileSync(source, 'utf8').split('\n').filter(Boolean); } catch { continue; }
+    for (const line of lines) { try { records.push(JSON.parse(line)); } catch {} }
+  }
+  return records.slice(-Math.max(0, Number(limit) || 0)).reverse();
+}
+function logPlayingEvent(event, details = {}) { const record = { time: new Date().toISOString(), event, ...details }; playingEvents.unshift(record); playingEvents.splice(500); appendPlayingEventRecord(record); emitLive(`playing.${event}`, details); }
+function readPlayingEvents() { const records = readPlayingEventRecords(); return records.length ? records : [...playingEvents]; }
 function cleanPlayingSteps(steps) {
   if (!Array.isArray(steps)) return [];
-  return steps.map((step) => { const button = String(step?.button || '').trim().slice(0, 80); return { button, buttons: button.split(/[|,]/).map((item) => item.trim()).filter(Boolean).slice(0, 10), messageId: String(step?.messageId || '').trim().slice(0, 40), customId: String(step?.customId || '').trim().slice(0, 100), phrase: String(step?.phrase || '').trim().slice(0, 500) }; }).filter((step) => step.button).slice(0, 30);
+  return steps.map((step) => { const button = String(step?.button || '').trim().slice(0, 80); const customId = String(step?.customId || '').trim().slice(0, 100); return { button, buttons: button.split(/[|,]/).map((item) => item.trim()).filter(Boolean).slice(0, 10), messageId: String(step?.messageId || '').trim().slice(0, 40), customId, phrase: String(step?.phrase || '').trim().slice(0, 500) }; }).filter((step) => step.button || step.customId).slice(0, 30);
+}
+function playingSaveState(existing, channelId, steps) {
+  const sameChannel = !!existing && String(existing.channelId) === String(channelId);
+  const sameSteps = sameChannel && JSON.stringify(existing.steps || []) === JSON.stringify(steps);
+  return {
+    currentIndex: sameSteps && steps.length ? ((Number(existing.currentIndex || 0) % steps.length) + steps.length) % steps.length : 0,
+    handledButtonKeys: sameChannel && Array.isArray(existing.handledButtonKeys) ? existing.handledButtonKeys.slice(-500) : [],
+    lastActionKey: sameChannel ? existing.lastActionKey : undefined,
+    lastActionAt: sameChannel ? existing.lastActionAt : undefined,
+    lastMessageId: sameChannel ? existing.lastMessageId : undefined,
+    lastAction: sameSteps ? existing.lastAction : null,
+    lastResult: sameSteps ? existing.lastResult : null,
+  };
+}
+function parsePlayingDuration(value, fallback, min, max, name) {
+  if (value === undefined || value === null || value === '') return fallback;
+  const number = Number(value);
+  if (!Number.isFinite(number)) throw new Error(`${name} must be a finite number`);
+  if (number < min || number > max) throw new Error(`${name} must be between ${min} and ${max} milliseconds`);
+  return Math.round(number);
 }
 function playingKey(account) { return String(account || ''); }
 function pickPlayingPhrase(value) {
@@ -452,124 +495,131 @@ async function waitForDiscordRequestSlot() {
   if (scheduled > now) await new Promise((resolve) => setTimeout(resolve, scheduled - now));
 }
 function componentLabel(component) { const label = component?.label || component?.data?.label || ''; const emoji = component?.emoji || component?.data?.emoji; const emojiName = typeof emoji === 'string' ? emoji : emoji?.name || emoji?.id || ''; return `${String(label).trim()} ${String(emojiName).trim()}`.trim(); }
-function messageButtons(message) { return (message?.components || []).flatMap((row) => row?.components || []).filter((component) => String(component?.type || '').toUpperCase() === 'BUTTON' || component?.type === 2); }
-function normalizePlayingButton(value) { return String(value || '').normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').replace(/\s+/g, ' ').trim().toLocaleLowerCase(); }
+function messageButtons(message) { return (message?.components || []).flatMap((row) => row?.components || row?.data?.components || []).filter((component) => String(component?.type ?? component?.data?.type ?? '').toUpperCase() === 'BUTTON' || (component?.type ?? component?.data?.type) === 2); }
+function normalizePlayingButton(value) { return String(value || '').normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').replace(/[\u064B-\u065F\u0670\u0640]/g, '').replace(/\s+/g, ' ').trim().toLocaleLowerCase(); }
+function playingComponentTarget(component) { return { customId: String(component?.customId ?? component?.custom_id ?? component?.data?.customId ?? component?.data?.custom_id ?? '').trim(), disabled: component?.disabled === true || component?.data?.disabled === true, label: componentLabel(component), rawLabel: String(component?.label ?? component?.data?.label ?? '').trim() }; }
+function isNewerPlayingMessage(message, session) {
+  if (!session.lastMessageId) return true;
+  if (String(message.id) === String(session.lastMessageId)) return false;
+  try { return BigInt(String(message.id)) > BigInt(String(session.lastMessageId)); }
+  catch { return Number(message.createdTimestamp || 0) > Number(session.lastActionAt || 0) - 5000; }
+}
+function playingButtonKey(message, customId) {
+  const revision = crypto.createHash('sha1').update(JSON.stringify({ edited: message.editedTimestamp || message.editedAt?.toISOString?.() || '', buttons: messageButtons(message).map((component) => { const target = playingComponentTarget(component); return [target.customId, target.rawLabel, target.disabled]; }) })).digest('hex').slice(0, 12);
+  return `${message.id}:${revision}:${customId}`;
+}
+function playingStepMatchesComponent(step, component) {
+  const target = playingComponentTarget(component);
+  if (!target.customId || target.disabled) return false;
+  if (step.customId) return target.customId === step.customId;
+  const wantedLabels = (step.buttons?.length ? step.buttons : String(step.button || '').split(/[|,]/)).map(normalizePlayingButton).filter(Boolean);
+  const normalizedLabel = normalizePlayingButton(target.label);
+  const normalizedRawLabel = normalizePlayingButton(target.rawLabel);
+  return wantedLabels.some((wanted) => normalizedRawLabel === wanted || normalizedLabel === wanted || normalizedRawLabel.replace(/^(?:[\p{Extended_Pictographic}\p{Emoji_Presentation}\uFE0F\u200D]\s*)+/u, '').trim() === wanted);
+}
 async function dispatchPlayingButton(message, customId, details, canContinue = () => true) {
   if (!canContinue()) return { ok: false, stopped: true, error: 'Playing session stopped before click' };
   let interaction;
-  try { interaction = message.clickButton(customId); } catch (error) { const messageText = error.message || String(error); const rateLimited = error.status === 429 || /429|rate.?limit|too many requests/i.test(messageText); logPlayingEvent(rateLimited ? 'safety.rate-limited' : 'button.click.failed', { ...details, error: messageText }); return { ok: false, skip: true, rateLimited, error: messageText }; }
+  try { interaction = message.clickButton(customId); } catch (error) { const messageText = error.message || String(error); const rateLimited = error.status === 429 || /429|rate.?limit|too many requests/i.test(messageText); logPlayingEvent(rateLimited ? 'safety.rate-limited' : 'button.click.failed', { ...details, error: messageText }); return { ok: false, rateLimited, error: messageText }; }
   const response = await Promise.race([
     Promise.resolve(interaction).then(() => ({ responded: true })).catch((error) => ({ error })),
     new Promise((resolve) => setTimeout(() => resolve({ timedOut: true }), 1500)),
   ]);
-  if (response.timedOut) { logPlayingEvent('button.click.no-response', { ...details, error: 'No response from Application; interaction was dispatched' }); return { ok: true, noResponse: true }; }
-  if (response.error) { const error = response.error.message || String(response.error); const rateLimited = response.error.status === 429 || /429|rate.?limit|too many requests/i.test(error); logPlayingEvent(rateLimited ? 'safety.rate-limited' : 'button.click.failed', { ...details, error }); return { ok: false, skip: true, rateLimited, error }; }
+  if (response.timedOut) return { ok: true, noResponse: true };
+  if (response.error) { const error = response.error.message || String(response.error); const rateLimited = response.error.status === 429 || /429|rate.?limit|too many requests/i.test(error); logPlayingEvent(rateLimited ? 'safety.rate-limited' : 'button.click.failed', { ...details, error }); return { ok: false, rateLimited, error }; }
   return { ok: true, responded: true };
-}
-async function findPlayingButton(channel, session, step, canContinue = () => true) {
-  if (!canContinue()) return null;
-  await waitForDiscordRequestSlot();
-  if (!canContinue()) return null;
-  const messages = await channel.messages.fetch({ limit: 50 }).catch(() => null);
-  if (!canContinue()) return null;
-  if (!messages) return null;
-  const entries = [...messages.values()].sort((a, b) => Number(b.createdTimestamp || 0) - Number(a.createdTimestamp || 0));
-  session.lastScan = entries.slice(0, 10).map((message) => ({ messageId: String(message.id), labels: messageButtons(message).map(componentLabel).filter(Boolean) }));
-  const candidates = entries.filter((message) => !session.lastActionAt || Number(message.createdTimestamp || 0) > Number(session.lastActionAt));
-  const sameMessage = session.lastMessageId ? entries.filter((message) => String(message.id) === String(session.lastMessageId)) : [];
-  const requestedButtons = (step.buttons || [step.button]).map(normalizePlayingButton).filter(Boolean);
-  // Every configured value is an explicit target. Never reinterpret a label
-  // as permission to click an unrelated button.
-  const explicitButtons = requestedButtons;
-  for (const message of [...candidates, ...sameMessage.filter((message) => !candidates.includes(message))]) {
-    if (step.messageId && String(message.id) !== step.messageId) continue;
-    for (const component of messageButtons(message)) {
-      const customId = String(component.customId ?? component.custom_id ?? '').trim();
-      if (step.customId && customId !== step.customId) continue;
-      const label = componentLabel(component);
-      const rawLabel = component?.label || component?.data?.label || '';
-      const normalizedLabel = normalizePlayingButton(label);
-      const normalizedRawLabel = normalizePlayingButton(rawLabel);
-      const labelWithoutLeadingEmoji = normalizedRawLabel.replace(/^(?:[\p{Extended_Pictographic}\p{Emoji_Presentation}\uFE0F\u200D]\s*)+/u, '').trim();
-      // Never use substring matching here: with buttons such as "Join",
-      // "Join now", and "Re-join", a partial match can click the wrong one.
-      const explicitMatch = explicitButtons.some((wanted) => normalizedRawLabel === wanted || normalizedLabel === wanted || labelWithoutLeadingEmoji === wanted);
-      if (!step.customId && !explicitMatch) continue;
-      if (component.disabled || !customId) continue;
-      const key = `${message.id}:${customId}`;
-      return { message, customId, key, label };
-    }
-  }
-  return null;
 }
 async function findAnyPlayingButton(channel, session, canContinue = () => true) {
   if (!canContinue()) return null;
   await waitForDiscordRequestSlot();
   if (!canContinue()) return null;
-  const messages = await channel.messages.fetch({ limit: 50 }).catch(() => null);
+  let messages;
+  try { messages = await withTimeout(Promise.resolve(channel.messages.fetch({ limit: 50 })), 10000, 'Reading game messages timed out'); }
+  catch (error) { session.lastScan = null; session.lastScanError = error.message || String(error); return { scanError: session.lastScanError }; }
   if (!canContinue()) return null;
-  if (!messages) return null;
+  if (!messages) { session.lastScan = null; return { scanError: 'No message collection was returned for the game room' }; }
+  session.lastScanError = null;
   const entries = [...messages.values()].sort((a, b) => Number(b.createdTimestamp || 0) - Number(a.createdTimestamp || 0));
   session.lastScan = entries.slice(0, 10).map((message) => ({ messageId: String(message.id), labels: messageButtons(message).map(componentLabel).filter(Boolean) }));
-  const candidates = entries.filter((message) => !session.lastActionAt || Number(message.createdTimestamp || 0) > Number(session.lastActionAt));
+  const candidates = entries.filter((message) => isNewerPlayingMessage(message, session));
   const sameMessage = session.lastMessageId ? entries.filter((message) => String(message.id) === String(session.lastMessageId)) : [];
   const orderedMessages = [...candidates, ...sameMessage.filter((message) => !candidates.includes(message))];
+  const steps = Array.isArray(session.steps) ? session.steps : [];
+  if (!steps.length) return null;
+  const stepIndex = ((Number(session.currentIndex) || 0) % steps.length + steps.length) % steps.length;
+  const step = steps[stepIndex];
+  const handledKeys = new Set(Array.isArray(session.handledButtonKeys) ? session.handledButtonKeys : []);
+  let alreadyHandled = null;
   for (const message of orderedMessages) {
+    if (step.messageId && String(message.id) !== String(step.messageId)) continue;
     for (const component of messageButtons(message)) {
-      const customId = String(component.customId ?? component.custom_id ?? '').trim();
-      if (component.disabled || !customId) continue;
-      const key = `${message.id}:${customId}`;
-      if (key === session.lastActionKey) continue;
-      const label = componentLabel(component);
-      const rawLabel = component?.label || component?.data?.label || '';
-      const normalizedLabel = normalizePlayingButton(label);
-      const normalizedRawLabel = normalizePlayingButton(rawLabel);
-      const labelWithoutLeadingEmoji = normalizedRawLabel.replace(/^(?:[\p{Extended_Pictographic}\p{Emoji_Presentation}\uFE0F\u200D]\s*)+/u, '').trim();
-      const stepIndex = session.steps.findIndex((step) => {
-        if (step.customId) return customId === step.customId;
-        const requested = (step.buttons || [step.button]).map(normalizePlayingButton).filter(Boolean);
-        return requested.some((wanted) => normalizedRawLabel === wanted || normalizedLabel === wanted || labelWithoutLeadingEmoji === wanted);
-      });
-      if (stepIndex >= 0) return { message, customId, key, label, step: session.steps[stepIndex], stepIndex };
+      const target = playingComponentTarget(component);
+      if (!playingStepMatchesComponent(step, component)) continue;
+      const key = playingButtonKey(message, target.customId);
+      const legacyKey = `${message.id}:${target.customId}`;
+      const legacyLastAction = session.lastActionKey === legacyKey;
+      const editedAfterLegacyClick = Number(message.editedTimestamp || 0) > Number(session.lastActionAt || 0);
+      if (handledKeys.has(key) || session.lastActionKey === key || handledKeys.has(legacyKey) || (legacyLastAction && !editedAfterLegacyClick)) {
+        alreadyHandled = { message, customId: target.customId, key, label: target.label, step, stepIndex };
+        continue;
+      }
+      return { message, customId: target.customId, key, label: target.label, step, stepIndex };
     }
   }
-  return null;
+  return alreadyHandled ? { ...alreadyHandled, alreadyHandled: true } : null;
 }
-function stopPlayingSession(account, reason = 'manual') { const session = playingSessions.get(playingKey(account)); if (!session) return false; session.active = false; session.status = 'stopped'; session.startDelayMs = 0; session.runToken = Number(session.runToken || 0) + 1; clearTimeout(session.timer); session.timer = null; persistPlayingSessions(); logPlayingEvent('stopped', { account, reason }); return true; }
-function skipPlayingStep(session, step, stepIndex, found, details = {}) { session.lastActionAt = Date.now(); if (found?.message?.id) session.lastMessageId = String(found.message.id); session.currentIndex = (stepIndex + 1) % session.steps.length; session.lastAction = { button: step.button, phrase: null, skipped: true, clickFailed: true, error: details.error || '', at: Date.now() }; return { ok: true, skipped: true, clickFailed: true, button: step.button, error: details.error || '' }; }
+function stopPlayingSession(account, reason = 'manual') { const session = playingSessions.get(playingKey(account)); if (!session) return false; const wasActive = session.active === true; session.active = false; session.status = 'stopped'; session.startDelayMs = 0; session.runToken = Number(session.runToken || 0) + 1; clearTimeout(session.timer); session.timer = null; session.nextAt = null; session.updatedAt = Date.now(); persistPlayingSessions(); if (wasActive) logPlayingEvent('stopped', { account, reason }); return wasActive; }
+function markPlayingButtonHandled(session, found) { const keys = new Set(Array.isArray(session.handledButtonKeys) ? session.handledButtonKeys : []); keys.add(found.key); session.handledButtonKeys = [...keys].slice(-500); session.lastActionKey = found.key; session.lastActionAt = Date.now(); if (found.message?.id) session.lastMessageId = String(found.message.id); }
 async function sendPlayingPhrase(session, canContinue = () => true) {
   const entry = clients.get(session.account); const client = entry?.client;
-  if (!client) return { ok: false, error: 'Account is not connected' };
+  if (!client) return { ok: false, disconnected: true, error: 'Account is not connected' };
   const safety = playingSafety.get(session.account) || 0; if (Date.now() < safety) { const waitMs = safety - Date.now(); logPlayingEvent('safety.cooldown', { account: session.account, waitMs }); return { ok: false, waiting: true, safety: true, error: `Safety cooldown ${Math.ceil(waitMs / 1000)}s` }; }
   await waitForDiscordRequestSlot();
-  const channel = await client.channels?.fetch?.(session.channelId).catch?.(() => null);
-  if (!channel?.messages?.fetch) return { ok: false, error: 'Text channel is not available for this account' };
+  if (!canContinue()) return { ok: false, stopped: true, error: 'Playing session stopped before channel lookup' };
+  let channel;
+  try { channel = await withTimeout(Promise.resolve(client.channels?.fetch?.(session.channelId)), 10000, 'Loading the game room timed out'); }
+  catch (error) { logPlayingEvent('channel.fetch.failed', { account: session.account, channelId: session.channelId, error: error.message || String(error) }); return { ok: false, waiting: true, readError: true, error: `Could not load game room: ${error.message || error}` }; }
+  if (!canContinue()) return { ok: false, stopped: true, error: 'Playing session stopped after channel lookup' };
+  if (!channel?.messages?.fetch) return { ok: false, waiting: true, readError: true, error: 'Text channel is not available for this account' };
   const found = await findAnyPlayingButton(channel, session, canContinue);
   const step = found?.step;
   const stepIndex = found?.stepIndex ?? 0;
-  if (!found) { const available = session.lastScan?.flatMap((item) => item.labels).filter(Boolean).slice(0, 20) || []; logPlayingEvent('button.waiting', { account: session.account, requested: session.steps.map((item) => item.button), available }); return { ok: false, waiting: true, error: 'Waiting for any configured button', available }; }
+  if (found?.scanError) { logPlayingEvent('messages.fetch.failed', { account: session.account, channelId: session.channelId, error: found.scanError }); return { ok: false, waiting: true, readError: true, error: `Could not read game messages: ${found.scanError}` }; }
+  if (found?.alreadyHandled) {
+    const available = session.lastScan?.flatMap((item) => item.labels).filter(Boolean).slice(0, 20) || [];
+    logPlayingEvent('button.already-clicked', { account: session.account, stepIndex, requested: step.button || step.customId, label: found.label, messageId: String(found.message.id), customId: found.customId });
+    return { ok: false, waiting: true, alreadyClicked: true, error: 'Matching button was already clicked in this message; waiting for a new game button', available };
+  }
+  if (!found) { const currentStep = session.steps[stepIndex]; const available = session.lastScan?.flatMap((item) => item.labels).filter(Boolean).slice(0, 20) || []; logPlayingEvent('button.waiting', { account: session.account, stepIndex, requested: currentStep?.button || currentStep?.customId, available }); return { ok: false, waiting: true, error: `Waiting for step ${stepIndex + 1} button`, available }; }
   if (!canContinue()) return { ok: false, stopped: true, error: 'Playing session stopped before click' };
-  logPlayingEvent('button.click.started', { account: session.account, requested: step.button, label: found.label, messageId: String(found.message.id), customId: found.customId });
-  const click = await dispatchPlayingButton(found.message, found.customId, { account: session.account, requested: step.button, label: found.label, messageId: String(found.message.id), customId: found.customId }, canContinue);
+  logPlayingEvent('button.click.started', { account: session.account, stepIndex, requested: step.button || step.customId, label: found.label, messageId: String(found.message.id), customId: found.customId });
+  const click = await dispatchPlayingButton(found.message, found.customId, { account: session.account, stepIndex, requested: step.button || step.customId, label: found.label, messageId: String(found.message.id), customId: found.customId }, canContinue);
   if (click.stopped) return click;
-  session.lastActionKey = found.key;
-  playingSafety.set(session.account, Date.now() + (click.rateLimited ? 15000 : PLAYING_MIN_INTERACTION_GAP_MS));
-  if (!click.ok) return skipPlayingStep(session, step, stepIndex, found, { error: `Button "${step.button}" click failed: ${click.error}` });
-  if (click.noResponse) return skipPlayingStep(session, step, stepIndex, found, { error: 'No response from Application' });
-  logPlayingEvent('button.click.completed', { account: session.account, requested: step.button, label: found.label, messageId: String(found.message.id), customId: found.customId });
-  session.lastActionAt = Date.now(); session.lastMessageId = String(found.message.id);
-  logPlayingEvent('button.found', { account: session.account, button: step.button, label: found.label, messageId: String(found.message.id) });
+  if (!click.ok) { if (click.rateLimited) playingSafety.set(session.account, Date.now() + 15000); return { ok: false, clickFailed: true, rateLimited: click.rateLimited, error: `Button "${step.button || step.customId}" click failed: ${click.error}` }; }
+  if (!canContinue()) return { ok: false, stopped: true, error: 'Playing session stopped during button interaction' };
+  markPlayingButtonHandled(session, found);
+  const advance = () => { session.currentIndex = (stepIndex + 1) % session.steps.length; };
+  advance();
+  session.lastAction = { button: step.button || step.customId, phrase: null, outcome: click.noResponse ? 'unknown' : 'interaction-acknowledged', noResponse: !!click.noResponse, gameOutcomeVerified: false, at: Date.now() };
+  persistPlayingSessions();
+  playingSafety.set(session.account, Date.now() + PLAYING_MIN_INTERACTION_GAP_MS);
+  logPlayingEvent(click.noResponse ? 'button.click.no-response' : 'button.click.acknowledged', { account: session.account, stepIndex, requested: step.button || step.customId, label: found.label, messageId: String(found.message.id), customId: found.customId, gameOutcomeVerified: false });
+  if (click.noResponse) {
+    session.lastAction = { button: step.button || step.customId, phrase: null, outcome: 'unknown', noResponse: true, gameOutcomeVerified: false, at: Date.now() };
+    return { ok: true, dispatched: true, outcome: 'unknown', noResponse: true, button: step.button || step.customId, error: 'Click was sent, but the game did not confirm the result' };
+  }
+  logPlayingEvent('button.found', { account: session.account, button: step.button || step.customId, label: found.label, messageId: String(found.message.id), gameOutcomeVerified: false });
   const phrase = pickPlayingPhrase(step.phrase);
   if (!phrase) {
-    session.currentIndex = (stepIndex + 1) % session.steps.length;
-    session.lastAction = { button: step.button, phrase: null, skipped: true, at: Date.now() };
-    return { ok: true, button: step.button, skipped: true };
+    session.lastAction = { button: step.button || step.customId, phrase: null, outcome: 'interaction-acknowledged', gameOutcomeVerified: false, at: Date.now() };
+    return { ok: true, dispatched: true, outcome: 'interaction-acknowledged', gameOutcomeVerified: false, button: step.button || step.customId };
   }
   if (!canContinue()) return { ok: false, stopped: true, error: 'Playing session stopped before message' };
   logPlayingEvent('phrase.send.started', { account: session.account, phrase, button: step.button });
   try {
     await waitForDiscordRequestSlot();
-    await channel.send(phrase);
+    if (!canContinue()) return { ok: false, stopped: true, error: 'Playing session stopped before follow-up message' };
+    await withTimeout(Promise.resolve(channel.send(phrase)), 10000, 'Sending the follow-up message timed out');
   } catch (error) {
     // Sending the optional follow-up phrase must never stop the Playing loop.
     // The button action already happened, so record the failure, advance the
@@ -578,59 +628,122 @@ async function sendPlayingPhrase(session, canContinue = () => true) {
     const rateLimited = error.status === 429 || /429|rate.?limit|too many requests/i.test(messageText);
     logPlayingEvent(rateLimited ? 'safety.rate-limited' : 'phrase.send.failed', { account: session.account, phrase, button: step.button, error: messageText });
     if (rateLimited) playingSafety.set(session.account, Date.now() + 15000);
-    session.currentIndex = (stepIndex + 1) % session.steps.length;
-    session.lastAction = { button: step.button, phrase, phraseSkipped: true, messageFailed: true, rateLimited, error: messageText, at: Date.now() };
-    return { ok: true, skipped: true, phraseSkipped: true, messageFailed: true, rateLimited, button: step.button, error: `Message skipped: ${messageText}` };
+    session.lastAction = { button: step.button || step.customId, phrase, outcome: 'interaction-acknowledged-follow-up-failed', phraseSkipped: true, messageFailed: true, rateLimited, gameOutcomeVerified: false, error: messageText, at: Date.now() };
+    return { ok: false, dispatched: true, phraseSkipped: true, messageFailed: true, rateLimited, outcome: 'interaction-acknowledged-follow-up-failed', button: step.button || step.customId, error: `Button interaction was acknowledged; follow-up message failed: ${messageText}` };
   }
   logPlayingEvent('phrase.send.completed', { account: session.account, phrase, button: step.button });
-  session.currentIndex = (stepIndex + 1) % session.steps.length;
-  session.lastAction = { button: step.button, phrase, noResponse: !!click.noResponse, at: Date.now() };
-  return { ok: true, button: step.button, phrase, noResponse: !!click.noResponse };
+  session.lastAction = { button: step.button || step.customId, phrase, outcome: 'interaction-acknowledged', phraseSent: true, gameOutcomeVerified: false, at: Date.now() };
+  return { ok: true, dispatched: true, outcome: 'interaction-acknowledged', phraseSent: true, gameOutcomeVerified: false, button: step.button || step.customId, phrase };
 }
 function schedulePlaying(session, restoreDelayMs = null) {
+  clearTimeout(session.timer);
+  const runToken = Number(session.runToken || 0);
+  const isCurrent = () => session.active === true
+    && playingSessions.get(session.account) === session
+    && Number(session.runToken || 0) === runToken;
+  const baseInterval = Number.isFinite(Number(session.intervalMs)) ? Math.max(1500, Number(session.intervalMs)) : 5000;
+  const delay = restoreDelayMs === null ? Math.max(0, Number(session.startDelayMs || 250)) : Math.max(0, Number(restoreDelayMs));
+  session.status = 'starting';
+  session.nextAt = Date.now() + delay;
   const run = async () => {
-    if (!session.active || !playingSessions.has(session.account)) return;
-    const runToken = Number(session.runToken || 0);
-    const canContinue = () => session.active && Number(session.runToken || 0) === runToken;
+    if (!isCurrent()) return;
+    if (session.running) { session.nextAt = Date.now() + 1000; session.timer = setTimeout(run, 1000); return; }
+    const attemptedStepIndex = ((Number(session.currentIndex || 0) % session.steps.length) + session.steps.length) % session.steps.length;
     session.running = true;
-    try { session.status = 'running'; session.lastResult = await withAccountLock(session.account, () => sendPlayingPhrase(session, canContinue)); if (session.lastResult?.stopped) return; logPlayingEvent(session.lastResult.skipped ? 'action.skipped' : session.lastResult.ok ? 'action.completed' : session.lastResult.waiting ? 'action.waiting' : 'action.failed', { account: session.account, result: session.lastResult, step: session.steps[session.currentIndex % session.steps.length]?.button }); }
-    catch (error) { session.lastResult = { ok: false, error: error.message || String(error) }; }
-    finally { session.running = false; if (session.lastResult?.fatal) { session.active = false; session.status = 'error'; logPlayingEvent('paused', { account: session.account, reason: session.lastResult.error }); } else if (session.lastResult?.waiting) session.status = 'waiting'; session.nextAt = Date.now() + session.intervalMs; if (session.active && canContinue()) session.timer = setTimeout(run, session.intervalMs); persistPlayingSessions(); }
+    session.runningToken = runToken;
+    session.status = 'running';
+    session.lastAttemptAt = Date.now();
+    try {
+      session.lastResult = await withAccountLock(session.account, () => sendPlayingPhrase(session, isCurrent));
+      if (isCurrent() && !session.lastResult?.stopped) {
+        const event = session.lastResult?.waiting ? 'action.waiting' : session.lastResult?.ok ? 'action.interaction-acknowledged' : 'action.failed';
+        logPlayingEvent(event, { account: session.account, result: session.lastResult, stepIndex: attemptedStepIndex, step: session.steps[attemptedStepIndex]?.button || session.steps[attemptedStepIndex]?.customId });
+      }
+    } catch (error) {
+      session.lastResult = { ok: false, error: error.message || String(error) };
+      if (isCurrent()) logPlayingEvent('action.failed', { account: session.account, error: session.lastResult.error, stepIndex: attemptedStepIndex, step: session.steps[attemptedStepIndex]?.button || session.steps[attemptedStepIndex]?.customId });
+    } finally {
+      if (session.runningToken === runToken) { session.running = false; session.runningToken = null; }
+      if (playingSessions.get(session.account) !== session || Number(session.runToken || 0) !== runToken) return;
+      if (!session.active) return;
+      const result = session.lastResult || {};
+      if (result.waiting && !result.readError && !result.disconnected) {
+        session.status = 'waiting';
+        session.failureCount = 0;
+      } else if (result.ok) {
+        session.status = 'running';
+        session.failureCount = 0;
+      } else {
+        session.status = 'degraded';
+        session.failureCount = Math.min(10, Number(session.failureCount || 0) + 1);
+      }
+      const backoff = result.waiting && !result.readError && !result.disconnected
+        ? baseInterval
+        : Math.min(5 * 60 * 1000, baseInterval * (2 ** Math.min(6, Math.max(0, Number(session.failureCount || 0) - 1))));
+      session.nextAt = Date.now() + backoff;
+      session.updatedAt = Date.now();
+      if (session.active && isCurrent()) session.timer = setTimeout(run, backoff);
+      persistPlayingSessions();
+    }
   };
-  session.runToken = Number(session.runToken || 0);
-  const delay = restoreDelayMs === null ? Number(session.startDelayMs || 250) : restoreDelayMs;
   session.timer = setTimeout(run, Math.max(0, delay));
 }
 for (const saved of loadPlayingSessions()) {
-  if (saved?.account && saved?.channelId && Array.isArray(saved.steps) && saved.steps.length) {
-    // Restore the persisted state exactly. A manually stopped session must stay stopped
-    // after a server restart; only an explicit Start/Restart action may activate it again.
-    const session = { ...saved, active: saved.active === true, running: false, timer: null, runToken: Number(saved.runToken || 0) };
-    playingSessions.set(playingKey(session.account), session);
-    if (session.active) {
-      const savedNextAt = Number(session.nextAt);
-      const restoreDelay = Number.isFinite(savedNextAt) ? savedNextAt - Date.now() : 250;
-      schedulePlaying(session, restoreDelay);
-    }
+  if (!saved?.account || !saved?.channelId) continue;
+  const steps = cleanPlayingSteps(saved.steps);
+  if (!steps.length) continue;
+  const interval = Number(saved.intervalMs);
+  const delay = Number(saved.accountDelayMs);
+  const currentIndex = Number(saved.currentIndex);
+  const session = {
+    ...saved,
+    steps,
+    intervalMs: Number.isFinite(interval) ? Math.max(1500, Math.min(24 * 60 * 60 * 1000, interval)) : 5000,
+    accountDelayMs: Number.isFinite(delay) ? Math.max(0, Math.min(600000, delay)) : 0,
+    currentIndex: Number.isFinite(currentIndex) ? ((Math.trunc(currentIndex) % steps.length) + steps.length) % steps.length : 0,
+    active: saved.active === true,
+    status: saved.active === true ? 'starting' : (saved.status === 'error' ? 'error' : 'stopped'),
+    handledButtonKeys: Array.isArray(saved.handledButtonKeys) ? saved.handledButtonKeys.slice(-500) : [],
+    running: false,
+    runningToken: null,
+    timer: null,
+    runToken: Number(saved.runToken || 0),
+  };
+  playingSessions.set(playingKey(session.account), session);
+}
+function resumeRestoredPlayingSessions() {
+  playingRestoreReady = true;
+  let offlineChanged = false;
+  for (const session of playingSessions.values()) {
+    if (!session.active) continue;
+    if (!clients.has(session.account)) { session.active = false; session.status = 'error'; session.lastResult = { ok: false, disconnected: true, error: 'Account was not connected during Playing restore' }; session.nextAt = null; session.updatedAt = Date.now(); offlineChanged = true; logPlayingEvent('action.failed', { account: session.account, error: session.lastResult.error }); continue; }
+    const savedNextAt = Number(session.nextAt);
+    const restoreDelay = Number.isFinite(savedNextAt) ? savedNextAt - Date.now() : session.startDelayMs || 250;
+    schedulePlaying(session, restoreDelay);
   }
+  if (offlineChanged) persistPlayingSessions();
 }
 function startAllPlayingSessions(reason = 'discord-start') {
   const results = [];
+  let startOrdinal = 0;
   for (const session of playingSessions.values()) {
+    if (!clients.has(session.account)) { if (session.active) stopPlayingSession(session.account, 'account-not-connected'); results.push({ account: session.account, ok: false, error: 'Account is not connected' }); continue; }
     if (session.active) {
       results.push({ account: session.account, ok: true, alreadyActive: true });
       continue;
     }
     session.active = true;
     session.status = 'starting';
-    session.startDelayMs = 0;
+    session.startDelayMs = Math.max(0, Number(session.accountDelayMs) || 0) * startOrdinal;
+    startOrdinal += 1;
     session.updatedAt = Date.now();
-    schedulePlaying(session);
-    results.push({ account: session.account, ok: true });
+    session.failureCount = 0;
+    schedulePlaying(session, session.startDelayMs);
+    results.push({ account: session.account, ok: true, startDelayMs: session.startDelayMs });
   }
   persistPlayingSessions();
   logPlayingEvent('bulk-started', { reason, accounts: results.map((item) => item.account) });
-  return { results, started: results.filter((item) => !item.alreadyActive).length, alreadyActive: results.filter((item) => item.alreadyActive).length };
+  return { results, started: results.filter((item) => item.ok && !item.alreadyActive).length, alreadyActive: results.filter((item) => item.ok && item.alreadyActive).length, failed: results.filter((item) => !item.ok).length };
 }
 async function addPlayingAccounts(sessionAccount, accounts) {
   const source = playingSessions.get(playingKey(sessionAccount));
@@ -639,15 +752,45 @@ async function addPlayingAccounts(sessionAccount, accounts) {
   if (!names.length) return { ok: false, error: 'Select at least one new account' };
   const results = [];
   for (const account of names) {
+    if (playingReservations.has(account)) { results.push({ account, ok: false, error: 'Another request is already adding this account' }); continue; }
     if (playingSessions.has(account)) { results.push({ account, ok: false, error: 'Account already has a Playing session' }); continue; }
-    const entry = clients.get(account);
-    if (!entry) { results.push({ account, ok: false, error: 'Account is not connected' }); continue; }
-    const channel = await entry.client.channels?.fetch?.(source.channelId).catch?.(() => null);
-    if (!channel?.messages?.fetch) { results.push({ account, ok: false, error: `Account "${account}" cannot access the selected text room` }); continue; }
-    const session = { ...source, account, active: !!source.active, status: source.active ? 'running' : 'saved', runToken: 1, currentIndex: 0, createdAt: Date.now(), updatedAt: Date.now(), timer: null, lastAction: null, lastResult: null };
-    playingSessions.set(account, session);
-    if (session.active) schedulePlaying(session);
-    results.push({ account, ok: true, active: session.active });
+    playingReservations.add(account);
+    try {
+      const entry = clients.get(account);
+      if (!entry) { results.push({ account, ok: false, error: 'Account is not connected' }); continue; }
+      let channel;
+      try { channel = await withTimeout(Promise.resolve(entry.client.channels?.fetch?.(source.channelId)), 10000, 'Loading the game room timed out'); }
+      catch (error) { results.push({ account, ok: false, error: `Account "${account}" cannot access the selected text room: ${error.message || error}` }); continue; }
+      if (!channel?.messages?.fetch) { results.push({ account, ok: false, error: `Account "${account}" cannot access the selected text room` }); continue; }
+      if (playingSessions.get(source.account) !== source) { results.push({ account, ok: false, error: 'The source Playing session changed while accounts were being added' }); continue; }
+      const session = {
+        account,
+        scenarioName: source.scenarioName,
+        guildId: source.guildId,
+        channelId: source.channelId,
+        channelName: source.channelName,
+        steps: source.steps.map((step) => ({ ...step, buttons: [...(step.buttons || [])] })),
+        intervalMs: source.intervalMs,
+        accountDelayMs: source.accountDelayMs || 0,
+        currentIndex: 0,
+        active: source.active === true,
+        status: source.active ? 'starting' : 'saved',
+        runToken: 1,
+        failureCount: 0,
+        handledButtonKeys: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        timer: null,
+        running: false,
+        runningToken: null,
+        lastAction: null,
+        lastResult: null,
+        startDelayMs: source.active ? (Number(source.accountDelayMs || 0) * results.filter((item) => item.ok).length) : 0,
+      };
+      playingSessions.set(account, session);
+      if (session.active) schedulePlaying(session);
+      results.push({ account, ok: true, active: session.active, startDelayMs: session.startDelayMs });
+    } finally { playingReservations.delete(account); }
   }
   persistPlayingSessions();
   emitLive('playing.accounts_added', { sourceAccount: source.account, results });
@@ -656,9 +799,9 @@ async function addPlayingAccounts(sessionAccount, accounts) {
 }
 function stopAllPlayingSessions(reason = 'discord-stop') {
   const accounts = [...playingSessions.keys()];
-  const results = accounts.map((account) => ({ account, ok: stopPlayingSession(account, reason) }));
+  const results = accounts.map((account) => { const stopped = stopPlayingSession(account, reason); return { account, ok: true, stopped, alreadyStopped: !stopped }; });
   logPlayingEvent('bulk-stopped', { reason, accounts });
-  return { results, stopped: results.filter((item) => item.ok).length };
+  return { results, stopped: results.filter((item) => item.stopped).length, alreadyStopped: results.filter((item) => item.alreadyStopped).length };
 }
 function playingCommandText(message) {
   const prefix = String(process.env.DISCORD_COMMAND_PREFIX || '').trim();
@@ -708,8 +851,9 @@ async function handlePlayingDiscordCommand(client, message) {
   }
   console.log(`[playing-command] accepted command=${command} author=${authorId} listener=${String(client?.user?.id || 'unknown')} sessions=${playingSessions.size}`);
   const result = command === 'start' ? startAllPlayingSessions() : stopAllPlayingSessions();
+  const failed = (result.results || []).filter((item) => !item.ok);
   try {
-    await message.react?.('✅');
+    await message.react?.(failed.length ? '⚠️' : '✅');
   } catch (error) {
     // Reactions are optional confirmation and may be forbidden in the source
     // channel. Never turn a successful command into a noisy process error.
@@ -2103,10 +2247,24 @@ function renamePersistedAccount(oldName, newName) {
       delete task.accountStatus[oldName];
     }
   }
+  const savedAccount = savedAccountRecords.get(oldName);
+  if (savedAccount) { savedAccountRecords.delete(oldName); savedAccountRecords.set(newName, { ...savedAccount, name: newName }); }
+  const failedAccount = failedAccountRecords.get(oldName);
+  if (failedAccount) { failedAccountRecords.delete(oldName); failedAccountRecords.set(newName, { ...failedAccount, name: newName }); }
+  if (playingSafety.has(oldName)) { playingSafety.set(newName, playingSafety.get(oldName)); playingSafety.delete(oldName); }
+  const oldLock = accountLocks.get(oldName);
+  if (oldLock) { accountLocks.set(newName, oldLock); oldLock.finally(() => { if (accountLocks.get(newName) === oldLock) accountLocks.delete(newName); }); }
   const playing = playingSessions.get(oldName);
   if (playing) {
+    const wasActive = playing.active === true;
+    const delay = Number.isFinite(Number(playing.nextAt)) ? Math.max(0, Number(playing.nextAt) - Date.now()) : 250;
+    playing.active = false;
+    playing.runToken = Number(playing.runToken || 0) + 1;
+    clearTimeout(playing.timer);
     playingSessions.delete(oldName);
-    playingSessions.set(newName, { ...playing, account: newName });
+    const renamed = { ...playing, account: newName, active: wasActive, status: wasActive ? 'starting' : playing.status, runToken: Number(playing.runToken || 0) + 1, timer: null, running: false, runningToken: null, updatedAt: Date.now() };
+    playingSessions.set(newName, renamed);
+    if (renamed.active && playingRestoreReady) schedulePlaying(renamed, delay);
   }
   persistSessions();
   persistAutomationTasks();
@@ -2476,7 +2634,7 @@ app.get('/api/voice/target-accounts', (req, res) => {
 });
 app.get('/api/voice/rotations', (_req, res) => ok(res, { rotations: [...rotations.values()].map(({ timer, ...item }) => item) }));
 app.get('/api/voice/state-cycles', (_req, res) => ok(res, { cycles: [...stateCycles.values()].map(({ timer, ...item }) => item) }));
-app.get('/api/playing/sessions', (_req, res) => ok(res, { sessions: [...playingSessions.values()].map(({ timer, ...item }) => item), active: [...playingSessions.values()].filter((item) => item.active).length }));
+app.get('/api/playing/sessions', (_req, res) => ok(res, { sessions: [...playingSessions.values()].map(({ timer, runningToken, ...item }) => item), active: [...playingSessions.values()].filter((item) => item.active).length }));
 app.get('/api/playing/channels', (req, res) => {
   const channels = new Map();
   for (const [account, entry] of clients.entries()) {
@@ -2498,7 +2656,7 @@ app.get('/api/playing/channels', (req, res) => {
   return ok(res, { channels: filtered.sort((a, b) => a.name.localeCompare(b.name)), guilds });
 });
 app.get('/api/playing/events', (_req, res) => ok(res, { events: readPlayingEvents() }));
-app.post('/api/playing/preview', (req, res) => { const steps = cleanPlayingSteps(req.body?.steps); if (!steps.length) return fail(res, new Error('At least one complete action is required'), 400); return ok(res, { preview: steps.map((step, index) => ({ order: index + 1, button: step.button, phrase: step.phrase || null, messageId: step.messageId || 'auto-detect', customId: step.customId || 'auto-detect' })) }); });
+app.post('/api/playing/preview', (req, res) => { const steps = cleanPlayingSteps(req.body?.steps); if (!steps.length) return fail(res, new Error('At least one button label or custom ID is required'), 400); return ok(res, { preview: steps.map((step, index) => ({ order: index + 1, button: step.button || '(custom ID match)', phrase: step.phrase || null, messageId: step.messageId || 'auto-detect', customId: step.customId || 'label match' })) }); });
 app.post('/api/playing/save', async (req, res) => {
   const account = String(req.body?.account || '').trim();
   const channelId = String(req.body?.channelId || '').trim();
@@ -2506,27 +2664,42 @@ app.post('/api/playing/save', async (req, res) => {
   const guildId = String(req.body?.guildId || '').trim().slice(0, 40);
   const scenarioName = String(req.body?.scenarioName || 'Playing scenario').trim().slice(0, 100) || 'Playing scenario';
   const steps = cleanPlayingSteps(req.body?.steps);
-  const intervalMs = Math.max(1500, Math.min(24 * 60 * 60 * 1000, Number(req.body?.intervalMs || 5000)));
+  let intervalMs; let accountDelayMs;
+  try { intervalMs = parsePlayingDuration(req.body?.intervalMs, 5000, 1500, 24 * 60 * 60 * 1000, 'Action interval'); accountDelayMs = parsePlayingDuration(req.body?.accountDelayMs, 0, 0, 600000, 'Account delay'); }
+  catch (error) { return fail(res, error, 400); }
   if (!account || !channelId || steps.length < 1) return fail(res, new Error('account, channelId and at least one button action are required'), 400);
   const entry = clients.get(account);
   if (!entry) return fail(res, new Error('Account is not connected'), 400);
-  const channel = await entry.client.channels?.fetch?.(channelId).catch?.(() => null);
+  let channel;
+  try { channel = await withTimeout(Promise.resolve(entry.client.channels?.fetch?.(channelId)), 10000, 'Loading the selected game room timed out'); }
+  catch (error) { return fail(res, new Error(`Account "${account}" cannot access the selected text room: ${error.message || error}`), 400); }
   if (!channel?.messages?.fetch) return fail(res, new Error(`Account "${account}" cannot access the selected text room`), 400);
+  const actualGuildId = String(channel.guild?.id || channel.guildId || '');
+  if (guildId && actualGuildId && guildId !== actualGuildId) return fail(res, new Error('The selected game room does not belong to the selected server'), 400);
   const existing = playingSessions.get(account);
   const wasActive = !!existing?.active;
   const nextRunToken = Number(existing?.runToken || 0) + 1;
   if (existing) { existing.active = false; existing.runToken = nextRunToken; clearTimeout(existing.timer); existing.timer = null; }
-  const session = { account, scenarioName, guildId: guildId || existing?.guildId || '', channelId, channelName: channelName || channelId, steps, intervalMs, currentIndex: existing?.currentIndex || 0, active: wasActive, status: wasActive ? 'running' : (existing?.status || 'saved'), runToken: nextRunToken, createdAt: existing?.createdAt || Date.now(), updatedAt: Date.now() };
-  if (existing) session.lastAction = existing.lastAction;
+  const saveState = playingSaveState(existing, channelId, steps);
+  const session = {
+    account, scenarioName, guildId: guildId || actualGuildId || existing?.guildId || '', channelId,
+    channelName: channelName || channel.name || channelId, steps, intervalMs, accountDelayMs,
+    ...saveState, active: wasActive, status: wasActive ? 'starting' : 'saved', runToken: nextRunToken,
+    failureCount: 0, createdAt: existing?.createdAt || Date.now(), updatedAt: Date.now(),
+    running: false, runningToken: null, timer: null,
+  };
   playingSessions.set(account, session); if (session.active) schedulePlaying(session); persistPlayingSessions();
-  return ok(res, { session: { ...session, timer: undefined } });
+  return ok(res, { session: { ...session, timer: undefined, runningToken: undefined } });
 });
 app.post('/api/playing/start', (req, res) => {
   const accounts = cleanAccounts(req.body?.accounts);
-  const accountDelayMs = Math.max(0, Math.min(600000, Number(req.body?.accountDelayMs || 0)));
+  let accountDelayMs;
+  try { accountDelayMs = req.body?.accountDelayMs === undefined ? null : parsePlayingDuration(req.body.accountDelayMs, 0, 0, 600000, 'Account delay'); }
+  catch (error) { return fail(res, error, 400); }
   if (!accounts.length) return fail(res, new Error('Select at least one account'), 400);
-  const results = accounts.map((account, index) => { const session = playingSessions.get(account); if (!session) return { account, ok: false, error: 'Save a Playing setup for this account first' }; if (session.active) return { account, ok: true, alreadyActive: true }; session.active = true; session.startDelayMs = accountDelayMs * index; session.updatedAt = Date.now(); schedulePlaying(session); return { account, ok: true, startDelayMs: session.startDelayMs }; });
-  persistPlayingSessions(); return ok(res, { results, sessions: [...playingSessions.values()].map(({ timer, ...item }) => item) });
+  let startOrdinal = 0;
+  const results = accounts.map((account) => { const session = playingSessions.get(account); if (!session) return { account, ok: false, error: 'Save a Playing setup for this account first' }; if (!clients.has(account)) { if (session.active) stopPlayingSession(account, 'account-not-connected'); return { account, ok: false, error: 'Account is not connected' }; } if (session.active) return { account, ok: true, alreadyActive: true }; session.active = true; session.status = 'starting'; session.failureCount = 0; if (accountDelayMs !== null) session.accountDelayMs = accountDelayMs; session.startDelayMs = Number(session.accountDelayMs || 0) * startOrdinal; startOrdinal += 1; session.updatedAt = Date.now(); schedulePlaying(session); return { account, ok: true, startDelayMs: session.startDelayMs }; });
+  persistPlayingSessions(); return ok(res, { results, sessions: [...playingSessions.values()].map(({ timer, runningToken, ...item }) => item) });
 });
 app.post('/api/playing/add-accounts', async (req, res) => {
   const sourceAccount = String(req.body?.sourceAccount || '').trim();
@@ -2539,13 +2712,15 @@ app.post('/api/playing/add-accounts', async (req, res) => {
 app.post('/api/playing/stop', (req, res) => {
   const accounts = cleanAccounts(req.body?.accounts);
   if (!accounts.length) return fail(res, new Error('Select at least one account'), 400);
-  return ok(res, { results: accounts.map((account) => ({ account, ok: stopPlayingSession(account), alreadyStopped: !playingSessions.has(account) })) });
+  const results = accounts.map((account) => { const exists = playingSessions.has(account); const stopped = stopPlayingSession(account); return { account, ok: exists, stopped, alreadyStopped: exists && !stopped, notFound: !exists, error: exists ? null : 'Playing session not found' }; });
+  return ok(res, { results });
 });
-app.post('/api/playing/emergency-stop', (_req, res) => { const accounts = [...playingSessions.keys()]; accounts.forEach((account) => stopPlayingSession(account, 'emergency-stop')); logPlayingEvent('emergency-stop', { accounts }); return ok(res, { stopped: accounts.length }); });
+app.post('/api/playing/emergency-stop', (_req, res) => { const accounts = [...playingSessions.values()].filter((session) => session.active).map((session) => session.account); accounts.forEach((account) => stopPlayingSession(account, 'emergency-stop')); logPlayingEvent('emergency-stop', { accounts }); return ok(res, { stopped: accounts.length, accounts }); });
 app.post('/api/playing/delete', (req, res) => {
   const account = String(req.body?.account || '').trim();
   if (!account) return fail(res, new Error('account is required'), 400);
-  stopPlayingSession(account); playingSessions.delete(account); persistPlayingSessions(); return ok(res);
+  if (!playingSessions.has(account)) return fail(res, new Error('Playing session not found'), 404);
+  stopPlayingSession(account, 'deleted'); playingSessions.delete(account); persistPlayingSessions(); logPlayingEvent('deleted', { account }); return ok(res);
 });
 
 app.post('/api/voice/join', async (req, res) => {
@@ -2972,10 +3147,21 @@ async function restoreAutomationTasks() {
 }
 app.get('/{*splat}', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 if (require.main === module) {
-  app.listen(PORT, '0.0.0.0', () => { console.log(`Voice Studio listening on http://localhost:${PORT}`); console.log(`[storage] dataDir=${DATA_DIR}; accountFile=${resolveDataFile('accounts.enc')}; activeTokensFile=${ACTIVE_TOKENS_FILE}; failedTokensFile=${FAILED_TOKENS_FILE}`); persistAccountSnapshots(); setInterval(() => { try { reconcileVoiceSessions(); } catch (error) { console.warn('[voice] session reconciliation failed:', error.message); } }, 3000).unref?.(); startVoiceWatchdog(); restoreSavedAccounts().then(() => restoreAutomationTasks()).catch((error) => console.warn('[restore] restore failed:', error.message)); });
+  app.listen(PORT, '0.0.0.0', () => { console.log(`Voice Studio listening on http://localhost:${PORT}`); console.log(`[storage] dataDir=${DATA_DIR}; accountFile=${resolveDataFile('accounts.enc')}; activeTokensFile=${ACTIVE_TOKENS_FILE}; failedTokensFile=${FAILED_TOKENS_FILE}`); persistAccountSnapshots(); setInterval(() => { try { reconcileVoiceSessions(); } catch (error) { console.warn('[voice] session reconciliation failed:', error.message); } }, 3000).unref?.(); restoreSavedAccounts().then(() => { resumeRestoredPlayingSessions(); return restoreAutomationTasks(); }).then(() => startVoiceWatchdog()).catch((error) => { console.warn('[restore] restore failed:', error.message); resumeRestoredPlayingSessions(); startVoiceWatchdog(); }); });
   const persistBeforeExit = () => { try { persistConnectedAccounts(); persistAccountSnapshots(); persistSessions(); persistAutomationTasks(); persistPlayingSessions(); } catch (error) { console.warn('[storage] final persistence failed:', error.message); } };
   process.once('SIGTERM', () => { persistBeforeExit(); process.exit(0); });
   process.once('SIGINT', () => { persistBeforeExit(); process.exit(0); });
 }
 
-module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, hardenVoiceConnection, cleanupPrimaryStreamAttempt, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, normalizeExclusiveVoiceState, clearVoiceFlags, cleanAccountRecords, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, isRecoverableDiscordInteractionError };
+module.exports = {
+  app, clients, voiceSessions, rotations, stateCycles, playingSessions,
+  stopPlayingSession, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand,
+  rotationControlledAccounts, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation,
+  sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics,
+  installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners,
+  hardenVoiceConnection, cleanupPrimaryStreamAttempt, primaryMediaRetryError, recordPrimaryMediaFailure,
+  primaryMediaFailures, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, normalizeExclusiveVoiceState,
+  clearVoiceFlags, cleanAccountRecords, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase,
+  appendPlayingEventRecord, readPlayingEventRecords, playingSaveState, randomRotationTargets,
+  playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, isRecoverableDiscordInteractionError,
+};
