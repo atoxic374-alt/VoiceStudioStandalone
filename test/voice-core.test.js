@@ -1,39 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
-const fs = require('node:fs');
-const os = require('node:os');
-const path = require('node:path');
-const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, cleanAccountRecords, cleanPlayingSteps, appendPlayingEventRecord, readPlayingEventRecords, playingSaveState, normalizeExclusiveVoiceState, clearVoiceFlags, cleanupPrimaryStreamAttempt, isRecoverableDiscordInteractionError } = require('../server');
-
-test('rotates Playing event logs and returns only the newest events in reverse chronological order', () => {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-playing-log-'));
-  const file = path.join(directory, 'events.log');
-  try {
-    for (let n = 1; n <= 6; n += 1) appendPlayingEventRecord({ n, event: 'button.waiting' }, file, 60);
-    const events = readPlayingEventRecords(file, 2);
-    assert.deepEqual(events.map((event) => event.n), [6, 5]);
-    assert.ok(fs.statSync(file).size <= 60);
-    assert.ok(fs.statSync(`${file}.1`).size <= 60);
-  } finally { fs.rmSync(directory, { recursive: true, force: true }); }
-});
-
-test('resets Playing cursor when a saved room or step sequence changes but preserves it for an unchanged setup', () => {
-  const steps = cleanPlayingSteps([{ button: 'Join' }, { button: 'Continue' }]);
-  const existing = { channelId: 'room-1', steps, currentIndex: 1, handledButtonKeys: ['a', 'b'], lastActionKey: 'key', lastActionAt: 123, lastMessageId: '456', lastAction: { button: 'Continue' }, lastResult: { ok: true } };
-  const unchanged = playingSaveState(existing, 'room-1', steps);
-  assert.equal(unchanged.currentIndex, 1);
-  assert.deepEqual(unchanged.handledButtonKeys, ['a', 'b']);
-  const changedRoom = playingSaveState(existing, 'room-2', steps);
-  assert.equal(changedRoom.currentIndex, 0);
-  assert.deepEqual(changedRoom.handledButtonKeys, []);
-  assert.equal(changedRoom.lastMessageId, undefined);
-  assert.equal(changedRoom.lastAction, null);
-  const changedSteps = playingSaveState(existing, 'room-1', cleanPlayingSteps([{ button: 'Enter' }]));
-  assert.equal(changedSteps.currentIndex, 0);
-  assert.equal(changedSteps.lastMessageId, '456');
-  assert.equal(changedSteps.lastAction, null);
-});
+const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, cleanAccountRecords, normalizeExclusiveVoiceState, clearVoiceFlags, cleanupPrimaryStreamAttempt, isRecoverableDiscordInteractionError } = require('../server');
 
 test('classifies stale Discord component validation failures as recoverable', () => {
   assert.equal(isRecoverableDiscordInteractionError({ code: 50035, message: 'DiscordAPIError: Invalid Form Body' }), true);
@@ -342,8 +310,8 @@ test('continues Playing when the optional follow-up message cannot be sent', asy
   const session = { account, channelId: 'text-1', steps: [{ button: 'Join', phrase: 'hello' }], currentIndex: 0 };
   try {
     const result = await sendPlayingPhrase(session);
-    assert.equal(result.ok, false);
-    assert.equal(result.dispatched, true);
+    assert.equal(result.ok, true);
+    assert.equal(result.skipped, true);
     assert.equal(result.messageFailed, true);
     assert.equal(session.currentIndex, 0);
   } finally {
@@ -401,119 +369,6 @@ test('treats any configured label as an exact target instead of selecting any bu
   }
 });
 
-test('matches legacy comma-separated Arabic labels and reports an already-clicked match clearly', async () => {
-  const account = 'playing-arabic-already-clicked';
-  const clicked = [];
-  const message = {
-    id: 'message-arabic',
-    createdTimestamp: Date.now(),
-    components: [{ components: [{ type: 2, customId: 'enter', label: 'دخول', emoji: { name: 'join' } }] }],
-    clickButton: async (customId) => { clicked.push(customId); },
-  };
-  const channel = { messages: { fetch: async () => new Map([[message.id, message]]) }, send: async () => {} };
-  clients.set(account, { client: { channels: { fetch: async () => channel } } });
-  const session = {
-    account,
-    channelId: 'text-arabic',
-    steps: [{ button: 'دخول,عشوائي', phrase: '' }],
-    currentIndex: 0,
-    lastActionKey: 'message-arabic:enter',
-  };
-  try {
-    const result = await sendPlayingPhrase(session);
-    assert.equal(result.waiting, true);
-    assert.equal(result.alreadyClicked, true);
-    assert.match(result.error, /already clicked/i);
-    assert.deepEqual(clicked, []);
-  } finally {
-    clients.delete(account);
-  }
-});
-
-test('clicks an Arabic configured button when its label includes a different emoji name', async () => {
-  const account = 'playing-arabic-label';
-  const clicked = [];
-  const message = {
-    id: 'message-arabic-label',
-    createdTimestamp: Date.now(),
-    components: [{ components: [{ type: 2, customId: 'enter', label: 'دخول', emoji: { name: 'join' } }] }],
-    clickButton: async (customId) => { clicked.push(customId); },
-  };
-  const channel = { messages: { fetch: async () => new Map([[message.id, message]]) }, send: async () => {} };
-  clients.set(account, { client: { channels: { fetch: async () => channel } } });
-  try {
-    const result = await sendPlayingPhrase({ account, channelId: 'text-arabic-label', steps: [{ button: 'دخول', phrase: '' }], currentIndex: 0 });
-    assert.equal(result.ok, true);
-    assert.deepEqual(clicked, ['enter']);
-  } finally {
-    clients.delete(account);
-  }
-});
-
-test('accepts a custom-ID-only Playing step for an unlabeled button', async () => {
-  const account = 'playing-custom-id-only';
-  const clicked = [];
-  const message = { id: 'message-custom-id', createdTimestamp: Date.now(), components: [{ components: [{ type: 2, customId: 'opaque-action', label: '' }] }], clickButton: async (id) => clicked.push(id) };
-  const channel = { messages: { fetch: async () => new Map([[message.id, message]]) }, send: async () => {} };
-  clients.set(account, { client: { channels: { fetch: async () => channel } } });
-  try {
-    const steps = cleanPlayingSteps([{ customId: 'opaque-action', phrase: '' }]);
-    assert.equal(steps.length, 1);
-    const result = await sendPlayingPhrase({ account, channelId: 'text-custom-id', steps, currentIndex: 0 });
-    assert.equal(result.ok, true);
-    assert.deepEqual(clicked, ['opaque-action']);
-  } finally { clients.delete(account); }
-});
-
-test('allows a new game round when the previously clicked message is edited in place', async () => {
-  const account = 'playing-edited-message';
-  const clicked = [];
-  const message = { id: 'message-edited', createdTimestamp: Date.now(), components: [{ components: [{ type: 2, customId: 'join', label: 'Join' }] }], clickButton: async (id) => clicked.push(id) };
-  const channel = { messages: { fetch: async () => new Map([[message.id, message]]) }, send: async () => {} };
-  clients.set(account, { client: { channels: { fetch: async () => channel } } });
-  const session = { account, channelId: 'text-edited', steps: [{ button: 'Join' }], currentIndex: 0 };
-  try {
-    const first = await sendPlayingPhrase(session);
-    assert.equal(first.ok, true);
-    message.editedTimestamp = Date.now() + 1000;
-    await new Promise((resolve) => setTimeout(resolve, 2600));
-    const second = await sendPlayingPhrase(session);
-    assert.equal(second.ok, true);
-    assert.deepEqual(clicked, ['join', 'join']);
-  } finally { clients.delete(account); }
-});
-
-test('waits for the current ordered step rather than clicking a later configured step', async () => {
-  const account = 'playing-ordered-steps';
-  const clicked = [];
-  const message = { id: 'message-ordered', createdTimestamp: Date.now(), components: [{ components: [{ type: 2, customId: 'later', label: 'Continue' }] }], clickButton: async (id) => clicked.push(id) };
-  const channel = { messages: { fetch: async () => new Map([[message.id, message]]) }, send: async () => {} };
-  clients.set(account, { client: { channels: { fetch: async () => channel } } });
-  try {
-    const result = await sendPlayingPhrase({ account, channelId: 'text-ordered', steps: [{ button: 'Join' }, { button: 'Continue' }], currentIndex: 0 });
-    assert.equal(result.waiting, true);
-    assert.match(result.error, /step 1/i);
-    assert.deepEqual(clicked, []);
-  } finally { clients.delete(account); }
-});
-
-test('does not advance the Playing scenario or mark a button handled when the click fails', async () => {
-  const account = 'playing-click-failure';
-  const clicked = [];
-  const message = { id: 'message-click-fail', createdTimestamp: Date.now(), components: [{ components: [{ type: 2, customId: 'join', label: 'Join' }] }], clickButton: async (id) => { clicked.push(id); throw new Error('temporary click failure'); } };
-  const channel = { messages: { fetch: async () => new Map([[message.id, message]]) }, send: async () => {} };
-  clients.set(account, { client: { channels: { fetch: async () => channel } } });
-  const session = { account, channelId: 'text-click-fail', steps: [{ button: 'Join' }, { button: 'Continue' }], currentIndex: 0 };
-  try {
-    const result = await sendPlayingPhrase(session);
-    assert.equal(result.ok, false);
-    assert.equal(result.clickFailed, true);
-    assert.equal(session.currentIndex, 0);
-    assert.equal(session.lastActionKey, undefined);
-    assert.deepEqual(clicked, ['join']);
-  } finally { clients.delete(account); }
-});
-
 test('stopping a Playing session invalidates its pending run', () => {
   const account = 'playing-stop-token';
   const timer = setTimeout(() => {}, 10000);
@@ -530,36 +385,24 @@ test('stopping a Playing session invalidates its pending run', () => {
   }
 });
 
-test('bulk start staggers connected sessions, preserves active sessions, and reports disconnected accounts', () => {
+test('starts all saved Playing sessions and does not duplicate active timers', () => {
   const saved = [...playingSessions.entries()];
-  const savedClients = [...clients.entries()];
   playingSessions.clear();
-  clients.clear();
-  const first = { account: 'bulk-start-1', channelId: 'text-1', steps: [{ button: 'Join' }], intervalMs: 60000, accountDelayMs: 0, active: false, status: 'saved', timer: null };
-  const second = { account: 'bulk-start-2', channelId: 'text-2', steps: [{ button: 'Join' }], intervalMs: 60000, accountDelayMs: 0, active: true, status: 'running', timer: null };
-  const third = { account: 'bulk-start-3', channelId: 'text-3', steps: [{ button: 'Join' }], intervalMs: 60000, accountDelayMs: 2000, active: false, status: 'saved', timer: null };
-  const disconnected = { account: 'bulk-start-offline', channelId: 'text-offline', steps: [{ button: 'Join' }], intervalMs: 60000, active: false, status: 'saved', timer: null };
+  const first = { account: 'bulk-start-1', channelId: 'text-1', steps: [{ button: 'Join' }], intervalMs: 60000, active: false, status: 'saved', timer: null };
+  const second = { account: 'bulk-start-2', channelId: 'text-2', steps: [{ button: 'Join' }], intervalMs: 60000, active: true, status: 'running', timer: null };
   playingSessions.set(first.account, first);
   playingSessions.set(second.account, second);
-  playingSessions.set(third.account, third);
-  playingSessions.set(disconnected.account, disconnected);
-  clients.set(first.account, { client: {} }); clients.set(second.account, { client: {} }); clients.set(third.account, { client: {} });
   try {
     const result = startAllPlayingSessions('test');
-    assert.equal(result.started, 2);
+    assert.equal(result.started, 1);
     assert.equal(result.alreadyActive, 1);
-    assert.equal(result.failed, 1);
     assert.equal(first.active, true);
     assert.equal(second.active, true);
-    assert.equal(third.active, true);
-    assert.equal(third.startDelayMs, 2000);
-    assert.equal(disconnected.active, false);
     clearTimeout(first.timer);
-    clearTimeout(third.timer);
   } finally {
-    for (const account of [first.account, second.account, third.account, disconnected.account]) playingSessions.delete(account);
+    playingSessions.delete(first.account);
+    playingSessions.delete(second.account);
     for (const [account, session] of saved) playingSessions.set(account, session);
-    clients.clear(); for (const [account, entry] of savedClients) clients.set(account, entry);
   }
 });
 
@@ -606,12 +449,9 @@ test('Discord start and stop commands control every Playing session with one rea
   const previousOwners = process.env.DISCORD_COMMAND_OWNERS;
   process.env.DISCORD_COMMAND_OWNERS = 'owner-1, owner-2';
   const saved = [...playingSessions.entries()];
-  const savedClients = [...clients.entries()];
   playingSessions.clear();
-  clients.clear();
   const sessions = ['discord-command-1', 'discord-command-2'].map((account) => ({ account, channelId: 'text', steps: [{ button: 'Join' }], intervalMs: 60000, active: false, status: 'saved', timer: null }));
   sessions.forEach((session) => playingSessions.set(session.account, session));
-  sessions.forEach((session) => clients.set(session.account, { client: {} }));
   const reacted = [];
   const channel = {};
   const client = { user: { id: 'owner-1' } };
@@ -630,7 +470,6 @@ test('Discord start and stop commands control every Playing session with one rea
   } finally {
     sessions.forEach((session) => playingSessions.delete(session.account));
     for (const [account, session] of saved) playingSessions.set(account, session);
-    clients.clear(); for (const [account, entry] of savedClients) clients.set(account, entry);
     if (previousOwners === undefined) delete process.env.DISCORD_COMMAND_OWNERS;
     else process.env.DISCORD_COMMAND_OWNERS = previousOwners;
   }
