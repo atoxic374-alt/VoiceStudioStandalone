@@ -128,28 +128,49 @@ function cleanAccountRecords(records) {
   return result;
 }
 function loadAccounts() {
-  const file = resolveDataFile('accounts.enc');
-  if (!fs.existsSync(file)) {
+  // Railway uploads can leave a newly-created, empty canonical accounts.enc
+  // beside the real export as accounts.enc.txt. Do not let that empty file
+  // hide a valid compatibility export.
+  const candidates = [
+    ACCOUNT_FILE,
+    path.join(DATA_DIR, 'accounts.enc.txt'),
+    path.join(DATA_DIR, 'accounts.enc.json.txt'),
+  ].filter((file, index, files) => fs.existsSync(file) && files.indexOf(file) === index);
+  if (!candidates.length) {
     console.warn(`[accounts] no saved account file found in ${DATA_DIR}; expected accounts.enc (also accepts accounts.enc.txt)`);
     return [];
   }
   let lastError;
-  for (const key of persistenceKeyCandidates()) {
-    try {
-      const payload = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '').trim());
-      const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(payload.iv, 'base64url'));
-      decipher.setAuthTag(Buffer.from(payload.tag, 'base64url'));
-      const plain = Buffer.concat([decipher.update(Buffer.from(payload.data, 'base64url')), decipher.final()]);
-      const plaintext = plain.toString('utf8');
-      const records = cleanAccountRecords(JSON.parse(plaintext));
-      if (file !== ACCOUNT_FILE) console.warn(`[accounts] reading uploaded compatibility filename ${path.basename(file)}; canonical filename is accounts.enc`);
-      if (file !== ACCOUNT_FILE || key !== persistenceKey()) saveAccounts(records);
-      const checksum = crypto.createHash('sha256').update(plaintext).digest('hex').slice(0, 16);
-      console.log(`[accounts] loaded ${records.length} saved account${records.length === 1 ? '' : 's'} from ${path.basename(file)}; plaintextBytes=${Buffer.byteLength(plaintext)}; checksum=${checksum}`);
-      return records;
-    } catch (error) { lastError = error; }
+  let emptyValidRecords = null;
+  for (const file of candidates) {
+    for (const key of persistenceKeyCandidates()) {
+      try {
+        const payload = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '').trim());
+        const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(payload.iv, 'base64url'));
+        decipher.setAuthTag(Buffer.from(payload.tag, 'base64url'));
+        const plain = Buffer.concat([decipher.update(Buffer.from(payload.data, 'base64url')), decipher.final()]);
+        const plaintext = plain.toString('utf8');
+        const records = cleanAccountRecords(JSON.parse(plaintext));
+        if (records.length === 0) {
+          emptyValidRecords ||= { file, key, plaintext };
+          continue;
+        }
+        if (file !== ACCOUNT_FILE) console.warn(`[accounts] reading uploaded compatibility filename ${path.basename(file)}; canonical filename is accounts.enc`);
+        if (file !== ACCOUNT_FILE || key !== persistenceKey()) saveAccounts(records);
+        const checksum = crypto.createHash('sha256').update(plaintext).digest('hex').slice(0, 16);
+        console.log(`[accounts] loaded ${records.length} saved account${records.length === 1 ? '' : 's'} from ${path.basename(file)}; plaintextBytes=${Buffer.byteLength(plaintext)}; checksum=${checksum}`);
+        return records;
+      } catch (error) { lastError = error; }
+    }
   }
-  console.warn(`[accounts] saved accounts could not be restored from ${path.basename(file)}: ${lastError?.message || 'unknown encryption or JSON error'}`);
+  if (emptyValidRecords) {
+    const { file, key, plaintext } = emptyValidRecords;
+    if (file !== ACCOUNT_FILE || key !== persistenceKey()) saveAccounts([]);
+    const checksum = crypto.createHash('sha256').update(plaintext).digest('hex').slice(0, 16);
+    console.log(`[accounts] loaded 0 saved accounts from ${path.basename(file)}; plaintextBytes=${Buffer.byteLength(plaintext)}; checksum=${checksum}`);
+    return [];
+  }
+  console.warn(`[accounts] saved accounts could not be restored from ${candidates.map((file) => path.basename(file)).join(', ')}: ${lastError?.message || 'unknown encryption or JSON error'}`);
   return [];
 }
 function persistConnectedAccounts() {
