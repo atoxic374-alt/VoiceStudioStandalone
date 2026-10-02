@@ -19,11 +19,30 @@ const AUTH_ENABLED = true;
 const app = express();
 const PORT = Number(process.env.PORT || 5050);
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data'));
+function isEmptyPersistedJson(file) {
+  try {
+    const value = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '').trim());
+    if (Array.isArray(value)) return value.length === 0;
+    if (!value || typeof value !== 'object') return true;
+    if ('rotations' in value || 'stateCycles' in value) return !(value.rotations?.length || value.stateCycles?.length);
+    return Object.keys(value).length === 0;
+  } catch {
+    return false;
+  }
+}
 function resolveDataFile(fileName) {
   const candidates = [fileName, `${fileName}.txt`, `${fileName}.json.txt`];
-  for (const candidate of candidates) {
-    const fullPath = path.join(DATA_DIR, candidate);
-    if (fs.existsSync(fullPath)) return fullPath;
+  const existing = candidates.map((candidate) => path.join(DATA_DIR, candidate)).filter((fullPath) => fs.existsSync(fullPath));
+  if (existing.length) {
+    const canonical = existing[0];
+    // A restart can create an empty canonical JSON file before an uploaded
+    // compatibility export is restored. Prefer the non-empty export in that
+    // case so saved voice sessions, tasks, and Playing sessions are retained.
+    if (fileName.endsWith('.json') && isEmptyPersistedJson(canonical)) {
+      const backup = existing.slice(1).find((fullPath) => !isEmptyPersistedJson(fullPath));
+      if (backup) return backup;
+    }
+    return canonical;
   }
   // Railway's file uploader and mobile browsers may rename a duplicate to
   // names such as accounts.enc(1).txt. Prefer the newest/largest compatible
