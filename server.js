@@ -933,37 +933,47 @@ function stopSyntheticStream(name, { leaveVoice = false, silent = false, invalid
   mediaStreamers.delete(name);
   mediaDesired.delete(name);
 }
-function scheduleMediaRestart(name, active, reason) {
-  if (!active || active.restarting || pendingMediaRestarts.has(name)) return;
-  active.restarting = true;
+function scheduleMediaRecovery(name, target, reason) {
+  if (!target || pendingMediaRestarts.has(name)) return;
   const attempts = Number(mediaRestartAttempts.get(name) || 0) + 1;
   mediaRestartAttempts.set(name, attempts);
-  if (attempts > 6) {
-    active.restarting = false;
-    logMediaEvent('error', 'media.restart_paused', { account: name, guildId: active.guildId, channelId: active.channelId, mediaKind: active.mediaKind, attempts, reason });
-    return;
-  }
-  const delayMs = Math.min(5 * 60 * 1000, 1000 * (2 ** (attempts - 1)));
-  logMediaEvent('warn', 'media.restart_scheduled', { account: name, guildId: active.guildId, channelId: active.channelId, mediaKind: active.mediaKind, reason, attempts, delayMs });
+  const delayMs = Math.min(5 * 60 * 1000, 1000 * (2 ** Math.min(attempts - 1, 8)));
+  logMediaEvent('warn', 'media.restart_scheduled', { account: name, guildId: target.guildId, channelId: target.channelId, mediaKind: target.mediaKind, reason, attempts, delayMs });
   const restartTimer = setTimeout(async () => {
     pendingMediaRestarts.delete(name);
-    const current = voiceSessions.get(sessionKey(name, active.guildId));
-    const expectedKind = current?.selfStream ? 'go-live' : current?.selfVideo ? 'camera' : null;
-    if (!current || current.channelId !== active.channelId || expectedKind !== active.mediaKind) return;
+    const current = voiceSessions.get(sessionKey(name, target.guildId));
+    const requested = target.desiredState || {};
+    const expectedKind = requested.selfStream === true || current?.selfStream === true
+      ? 'go-live'
+      : requested.selfVideo === true || current?.selfVideo === true ? 'camera' : null;
+    if (!current || String(current.channelId) !== String(target.channelId) || expectedKind !== target.mediaKind) return;
+    mediaDesired.set(name, { guildId: target.guildId, channelId: target.channelId, mediaKind: target.mediaKind });
     try {
-      const result = await startSyntheticStream(name, active.guildId, active.mediaKind, current);
+      const result = await startSyntheticStream(name, target.guildId, target.mediaKind, { ...current, ...requested });
       if (result.ok) {
-        const restored = voiceSessions.get(sessionKey(name, active.guildId));
-        if (restored) Object.assign(restored, { selfVideo: active.mediaKind === 'camera', selfStream: active.mediaKind === 'go-live', updatedAt: Date.now() });
+        const restored = voiceSessions.get(sessionKey(name, target.guildId));
+        if (restored) Object.assign(restored, { selfVideo: target.mediaKind === 'camera', selfStream: target.mediaKind === 'go-live', updatedAt: Date.now() });
+        mediaRestartAttempts.delete(name);
         persistSessions();
       }
     } catch (error) {
       // Timers do not have a caller to await them. Contain any unforeseen
       // failure so a retry never becomes a process-level crash.
-      logMediaEvent('error', 'media.restart_failed', { account: name, guildId: active.guildId, channelId: active.channelId, error: error?.message || String(error) });
+      logMediaEvent('error', 'media.restart_failed', { account: name, guildId: target.guildId, channelId: target.channelId, error: error?.message || String(error) });
     }
   }, delayMs);
   pendingMediaRestarts.set(name, restartTimer);
+}
+function scheduleMediaRestart(name, active, reason) {
+  if (!active || active.restarting || pendingMediaRestarts.has(name)) return;
+  active.restarting = true;
+  scheduleMediaRecovery(name, {
+    guildId: active.guildId,
+    channelId: active.channelId,
+    mediaKind: active.mediaKind,
+    desiredState: voiceSessions.get(sessionKey(name, active.guildId)) || {},
+  }, reason);
+  active.restarting = false;
 }
 function createBlackMediaSource() {
   const sourceProcess = spawn(FFMPEG_PATH || 'ffmpeg', [
@@ -1309,8 +1319,21 @@ async function processMediaStartQueue() {
       }
     } catch (error) {
       result = { ok: false, error: error?.message || String(error) };
-    } finally {
+      } finally {
       logMediaEvent(result?.ok ? 'info' : 'warn', 'media.queue_complete', { sequence: item.sequence, account: item.name, guildId: item.guildId, mediaKind: item.mediaKind, ok: result?.ok === true, cancelled: result?.cancelled === true, durationMs: Date.now() - startedAt, queueDepth: mediaStartQueue.length, error: result?.ok ? undefined : result?.error });
+      if (!result?.ok && !result?.cancelled) {
+        const current = voiceSessions.get(sessionKey(item.name, item.guildId));
+        const desiredState = { ...(current || {}), ...(item.desiredState || {}) };
+        const channelId = desiredState.channelId || current?.channelId;
+        if (channelId && (desiredState.selfStream === true || desiredState.selfVideo === true)) {
+          scheduleMediaRecovery(item.name, {
+            guildId: item.guildId,
+            channelId,
+            mediaKind: item.mediaKind,
+            desiredState,
+          }, result.error || 'media start failed');
+        }
+      }
       item.resolve(result || { ok: false, error: 'Media queue item completed without a result' });
       if (MEDIA_START_GAP_MS > 0 && mediaStartQueue.length) await new Promise((resolve) => setTimeout(resolve, MEDIA_START_GAP_MS));
     }
@@ -1340,6 +1363,9 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
   // Replacing a media transport must not send a voice leave for the account.
   // The primary voice connection owns room membership.
   if (existing) stopSyntheticStream(name, { invalidate: false });
+  // Keep the desired media state visible to the watchdog even if the first
+  // transport attempt fails before an active stream object is created.
+  mediaDesired.set(name, { guildId, channelId: session.channelId, mediaKind });
   const liveTarget = await confirmLiveMediaTarget(client, guildId, session.channelId);
   if (!liveTarget.ok) {
     logMediaEvent('warn', 'media.live_target_changed', { account: name, guildId, channelId: session.channelId, mediaKind, error: liveTarget.error, first: liveTarget.first, second: liveTarget.second });
@@ -1990,15 +2016,29 @@ async function confirmLiveMediaTarget(client, guildId, channelId, delayMs = 120)
       memberCount: rawTarget.channel?.members?.size ?? null,
     };
     const state = readGatewayVoiceState(client, guildId);
-    const matches = rawTarget.ok && state?.channelId != null && String(state.channelId) === String(channelId);
+    const connectionChannelId = voiceConnectionChannelId(client?.voice?.connection);
+    // The cached Guild voice state can briefly lag behind the authoritative
+    // VoiceConnection during reconnects and media handshakes. Accept the live
+    // connection when it is already on the requested channel.
+    const matches = rawTarget.ok && (
+      (state?.channelId != null && String(state.channelId) === String(channelId))
+      || String(connectionChannelId || '') === String(channelId)
+    );
     return { target, state, matches };
   };
-  const first = read();
-  if (!first.matches) return { ok: false, error: 'Live voice target changed or is no longer available', first };
-  await new Promise((resolve) => setTimeout(resolve, delayMs));
-  const second = read();
-  if (!second.matches) return { ok: false, error: 'Live voice target changed during confirmation', first, second };
-  return { ok: true, guildId: String(guildId), channelId: String(channelId), first, second };
+  let first = read();
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    if (first.matches) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      const second = read();
+      if (second.matches) return { ok: true, guildId: String(guildId), channelId: String(channelId), first, second };
+      first = second;
+    } else if (attempt < 2) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      first = read();
+    }
+  }
+  return { ok: false, error: first.matches ? 'Live voice target changed during confirmation' : 'Live voice target changed or is no longer available', first };
 }
 function upsertSession(name, guildId, channelId, opts = {}) {
   const previous = voiceSessions.get(sessionKey(name, guildId));
