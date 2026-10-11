@@ -277,6 +277,7 @@ const stateCycles = new Map();
 const voiceStateOperations = new Map();
 const syntheticStreams = new Map();
 const mediaStreamers = new Map();
+const streamerOwners = new WeakMap();
 const pendingMediaRestarts = new Map();
 const mediaRestartAttempts = new Map();
 const accountOperations = new Map();
@@ -298,10 +299,10 @@ const MEDIA_STREAM_TIMEOUT_MS = Math.max(12000, Number(process.env.MEDIA_STREAM_
 const ACCOUNT_RESTORE_CONCURRENCY = Math.max(1, Math.min(3, Number(process.env.ACCOUNT_RESTORE_CONCURRENCY || 2)));
 const ACCOUNT_CONNECT_CONCURRENCY = Math.max(1, Math.min(3, Number(process.env.ACCOUNT_CONNECT_CONCURRENCY || 2)));
 const DISCORD_PREFLIGHT_TIMEOUT_MS = Math.max(3000, Math.min(15000, Number(process.env.DISCORD_PREFLIGHT_TIMEOUT_MS || 8000)));
-// Media starts are serialized through an explicit FIFO queue. The next camera
-// or Go Live account starts only after the previous attempt has reached a
-// terminal result (ready, failed, or cancelled) and its resources are cleaned.
-// An optional gap can still be configured, but the default is zero.
+// Media starts are FIFO-serialized per account, but independent accounts may
+// establish their own transports concurrently. This prevents a slow handshake
+// for one account from blocking or mutating another account's media state.
+// An optional per-account gap can still be configured; the default is zero.
 const MEDIA_START_GAP_MS = Math.max(0, Number(process.env.MEDIA_START_GAP_MS || 0));
 const SYNTHETIC_VIDEO_FILE = path.join(DATA_DIR, 'synthetic-stream-black-v2.mp4');
 const DISCORD_REQUEST_GAP_MS = Math.max(0, Number(process.env.DISCORD_REQUEST_GAP_MS || 120));
@@ -319,8 +320,7 @@ const mediaRunGenerations = new Map();
 const primaryMediaFailures = new Map();
 const pendingRoomMoves = new Set();
 let watchdogRunning = false;
-const mediaStartQueue = [];
-let mediaStartRunning = false;
+const mediaStartQueues = new Map();
 let mediaStartSequence = 0;
 
 function ok(res, payload = {}) { return res.json({ success: true, ...payload }); }
@@ -1455,22 +1455,25 @@ function voiceConnectionChannelId(connection) {
 async function startSyntheticStream(name, guildId, mediaKind = 'go-live', desiredState = null) {
   const generation = Number(mediaRunGenerations.get(name) || 0);
   const sequence = ++mediaStartSequence;
-  const position = mediaStartQueue.length + (mediaStartRunning ? 1 : 0) + 1;
-  logMediaEvent('info', 'media.queue_enter', { sequence, account: name, guildId, mediaKind, position, queueDepth: mediaStartQueue.length + (mediaStartRunning ? 1 : 0) });
+  let queue = mediaStartQueues.get(name);
+  if (!queue) { queue = { items: [], running: false }; mediaStartQueues.set(name, queue); }
+  const position = queue.items.length + (queue.running ? 1 : 0) + 1;
+  logMediaEvent('info', 'media.queue_enter', { sequence, account: name, guildId, mediaKind, position, queueDepth: queue.items.length + (queue.running ? 1 : 0) });
   const result = await new Promise((resolve) => {
-    mediaStartQueue.push({ sequence, name, guildId, mediaKind, desiredState, generation, resolve });
-    processMediaStartQueue();
+    queue.items.push({ sequence, name, guildId, mediaKind, desiredState, generation, resolve });
+    processMediaStartQueue(name);
   });
   return result;
 }
-async function processMediaStartQueue() {
-  if (mediaStartRunning) return;
-  mediaStartRunning = true;
-  while (mediaStartQueue.length) {
-    const item = mediaStartQueue.shift();
+async function processMediaStartQueue(name) {
+  const queue = mediaStartQueues.get(name);
+  if (!queue || queue.running) return;
+  queue.running = true;
+  while (queue.items.length) {
+    const item = queue.items.shift();
     let result;
     const startedAt = Date.now();
-    logMediaEvent('info', 'media.queue_start', { sequence: item.sequence, account: item.name, guildId: item.guildId, mediaKind: item.mediaKind, queueDepth: mediaStartQueue.length });
+    logMediaEvent('info', 'media.queue_start', { sequence: item.sequence, account: item.name, guildId: item.guildId, mediaKind: item.mediaKind, queueDepth: queue.items.length });
     try {
       if (item.generation !== Number(mediaRunGenerations.get(item.name) || 0)) {
         result = { ok: false, cancelled: true, error: 'Media start cancelled by a newer account operation' };
@@ -1480,7 +1483,7 @@ async function processMediaStartQueue() {
     } catch (error) {
       result = { ok: false, error: error?.message || String(error) };
       } finally {
-      logMediaEvent(result?.ok ? 'info' : 'warn', 'media.queue_complete', { sequence: item.sequence, account: item.name, guildId: item.guildId, mediaKind: item.mediaKind, ok: result?.ok === true, cancelled: result?.cancelled === true, durationMs: Date.now() - startedAt, queueDepth: mediaStartQueue.length, error: result?.ok ? undefined : result?.error });
+      logMediaEvent(result?.ok ? 'info' : 'warn', 'media.queue_complete', { sequence: item.sequence, account: item.name, guildId: item.guildId, mediaKind: item.mediaKind, ok: result?.ok === true, cancelled: result?.cancelled === true, durationMs: Date.now() - startedAt, queueDepth: queue.items.length, error: result?.ok ? undefined : result?.error });
       if (!result?.ok && !result?.cancelled) {
         const current = voiceSessions.get(sessionKey(item.name, item.guildId));
         const desiredState = { ...(current || {}), ...(item.desiredState || {}) };
@@ -1495,18 +1498,30 @@ async function processMediaStartQueue() {
         }
       }
       item.resolve(result || { ok: false, error: 'Media queue item completed without a result' });
-      if (MEDIA_START_GAP_MS > 0 && mediaStartQueue.length) await new Promise((resolve) => setTimeout(resolve, MEDIA_START_GAP_MS));
+      if (MEDIA_START_GAP_MS > 0 && queue.items.length) await new Promise((resolve) => setTimeout(resolve, MEDIA_START_GAP_MS));
     }
   }
-  mediaStartRunning = false;
+  queue.running = false;
+  if (!queue.items.length && mediaStartQueues.get(name) === queue) mediaStartQueues.delete(name);
 }
 function mediaQueueSnapshot() {
+  const queues = [...mediaStartQueues.entries()];
+  const items = queues.flatMap(([account, queue]) => queue.items.map((item, index) => ({ sequence: item.sequence, account, guildId: item.guildId, mediaKind: item.mediaKind, position: index + 1 })));
+  const active = queues.filter(([, queue]) => queue.running).length;
   return {
-    running: mediaStartRunning,
-    active: mediaStartRunning ? 1 : 0,
-    pending: mediaStartQueue.length,
-    items: mediaStartQueue.map((item, index) => ({ sequence: item.sequence, account: item.name, guildId: item.guildId, mediaKind: item.mediaKind, position: index + 1 })),
+    running: active > 0,
+    active,
+    pending: items.length,
+    items,
   };
+}
+function registerAccountStreamer(name, streamer) {
+  if (!name || !streamer || (typeof streamer !== 'object' && typeof streamer !== 'function')) throw new TypeError('Account name and Streamer instance are required');
+  const owner = streamerOwners.get(streamer);
+  if (owner && owner !== name) throw new Error(`Streamer instance is already owned by account ${owner}`);
+  streamerOwners.set(streamer, name);
+  mediaStreamers.set(name, streamer);
+  return streamer;
 }
 async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live', desiredState = null, generation = Number(mediaRunGenerations.get(name) || 0)) {
   const pendingRestart = pendingMediaRestarts.get(name);
@@ -1600,7 +1615,7 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
       streamer = new Streamer(client);
       stage = 'streamer-created';
       logMediaEvent('info', 'media.streamer_created', { account: name, guildId, channelId: session.channelId, mediaKind, attempt });
-      mediaStreamers.set(name, streamer);
+      registerAccountStreamer(name, streamer);
       createdStreamer = true;
       installVoiceEventFilter(streamer, client.user?.id, guildId, session.channelId);
       // The library calls signalVideo(false) from joinVoice(). Its default
@@ -3269,4 +3284,4 @@ if (require.main === module) {
   process.once('SIGINT', () => { persistBeforeExit(); process.exit(0); });
 }
 
-module.exports = { app, clients, voiceSessions, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, recordSuccessfulCycleState, playingSessions, stopPlayingSession, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, hardenVoiceConnection, cleanupPrimaryStreamAttempt, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanAccountRecords, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, isRecoverableDiscordInteractionError };
+module.exports = { app, clients, voiceSessions, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, recordSuccessfulCycleState, playingSessions, stopPlayingSession, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, hardenVoiceConnection, cleanupPrimaryStreamAttempt, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, registerAccountStreamer, mediaStreamers, mediaQueueSnapshot, ensureSyntheticVideo, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanAccountRecords, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, isRecoverableDiscordInteractionError };
