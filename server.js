@@ -424,47 +424,61 @@ async function recoverVoiceAfterStateFailure(name, guildId, current) {
   }
   return restored;
 }
-async function executeStateForAccount(name, task, requestedState, expectedRunToken = null) {
-  const taskIsCurrent = () => task.active !== false && (expectedRunToken == null || task.runToken === expectedRunToken);
-  if (!taskIsCurrent()) return { name, ok: false, stale: true, error: 'State cycle was stopped or superseded' };
-  if (pendingRoomMoves.has(name)) return { name, ok: false, deferred: true, error: 'State cycle deferred while the account is moving rooms' };
-  const current = voiceSessions.get(sessionKey(name, task.guildId));
+async function executeQuickVoiceControlForAccount(name, guildId, requestedState, { isCurrent = () => true, operationType = 'state' } = {}) {
+  if (!isCurrent()) return { name, ok: false, stale: true, error: 'Voice operation was stopped or superseded' };
+  if (pendingRoomMoves.has(name)) return { name, ok: false, deferred: true, error: 'Voice state deferred while the account is moving rooms' };
   const client = getClient(name);
-  if (!current) return { name, ok: false, error: 'Account is not currently in a voice channel' };
   if (!client) return { name, ok: false, error: 'Account is not connected' };
-  const operation = beginAccountOperation(name, task.guildId, 'cycle');
+  const key = sessionKey(name, guildId);
+  const saved = voiceSessions.get(key);
+  const observed = readGatewayVoiceState(client, guildId);
+  const active = syntheticStreams.get(name);
+  const current = {
+    ...(observed || saved || {}),
+    selfStream: active?.mediaKind === 'go-live' || !!observed?.selfStream || (!observed && !!saved?.selfStream),
+    selfVideo: active?.mediaKind === 'camera' || !!observed?.selfVideo || (!observed && !!saved?.selfVideo),
+  };
+  if (!current.channelId) return { name, ok: false, error: 'Account is not currently in a voice channel' };
+  if (!saved && current.channelId) voiceSessions.set(key, { name, guildId, ...current });
+  const operation = beginAccountOperation(name, guildId, operationType);
   try {
-    const next = { ...current, ...mergeVoiceState({}, requestedState) };
+    const enablingMedia = requestedState.selfVideo === true || requestedState.selfStream === true;
+    const next = normalizeExclusiveVoiceState({
+      selfMute: requestedState.selfMute !== undefined ? requestedState.selfMute : !!current.selfMute,
+      selfDeaf: requestedState.selfDeaf !== undefined ? requestedState.selfDeaf : enablingMedia ? false : !!current.selfDeaf,
+      selfVideo: requestedState.selfVideo !== undefined ? requestedState.selfVideo : !!current.selfVideo,
+      selfStream: requestedState.selfStream !== undefined ? requestedState.selfStream : !!current.selfStream,
+    });
     if (next.selfDeaf && (next.selfVideo || next.selfStream)) return { name, ok: false, error: 'Invalid deafened media state' };
-    const stoppingMedia = current.selfStream || current.selfVideo || syntheticStreams.has(name);
-    if (stoppingMedia) {
-      stopSyntheticStream(name, { leaveVoice: false });
-      // STREAM_DELETE is asynchronous on Discord. Do not race its teardown
-      // with an OP4 reset; Discord can otherwise omit the reset update and the
-      // state cycle is left showing the old stream.
-      await new Promise((resolve) => setTimeout(resolve, MEDIA_SETTLE_DELAY_MS));
-    }
-    const cleared = await clearVoiceFlags(client, task.guildId, current.channelId, current);
+    if (current.selfStream || current.selfVideo || syntheticStreams.has(name)) stopSyntheticStream(name, { leaveVoice: false });
+    const cleared = await clearVoiceFlags(client, guildId, current.channelId, current);
     if (!cleared.ok) return { name, ok: false, error: `Unable to clear previous voice state: ${cleared.error}` };
-    if (!taskIsCurrent()) return { name, ok: false, stale: true, error: 'State cycle was stopped or superseded' };
+    if (!isCurrent()) return { name, ok: false, stale: true, error: 'Voice operation was stopped or superseded' };
     await waitForMediaSettle(next, current);
-    if (!taskIsCurrent()) return { name, ok: false, stale: true, error: 'State cycle was stopped or superseded' };
+    if (!isCurrent()) return { name, ok: false, stale: true, error: 'Voice operation was stopped or superseded' };
     let result;
     if (next.selfStream || next.selfVideo) {
-      result = await startSyntheticStream(name, task.guildId, next.selfStream ? 'go-live' : 'camera', next);
-      if (!result.ok) await recoverVoiceAfterStateFailure(name, task.guildId, next);
+      result = await startSyntheticStream(name, guildId, next.selfStream ? 'go-live' : 'camera', next);
+      if (!result.ok) await recoverVoiceAfterStateFailure(name, guildId, next);
     } else {
-      result = await sendVoiceOpConfirmed(client, task.guildId, current.channelId, next, 6000);
+      result = await sendVoiceOpConfirmed(client, guildId, current.channelId, next, 6000);
     }
     if (!operationIsCurrent(operation)) return { name, ok: false, stale: true, error: 'State operation was superseded by a newer request' };
     if (result.ok) {
-      Object.assign(current, next, { updatedAt: Date.now() });
+      const actual = readGatewayVoiceState(client, guildId);
+      Object.assign(current, actual || {}, next, { name, guildId, updatedAt: Date.now() });
+      voiceSessions.set(key, current);
       persistSessions();
     }
     return { name, ok: result.ok, permissionDenied: result.permissionDenied === true, error: result.ok ? null : result.error };
   } finally {
     endAccountOperation(operation);
   }
+}
+async function executeStateForAccount(name, task, requestedState, expectedRunToken = null) {
+  const taskIsCurrent = () => task.active !== false && (expectedRunToken == null || task.runToken === expectedRunToken);
+  const exactState = Object.fromEntries(['selfMute', 'selfDeaf', 'selfVideo', 'selfStream'].map((key) => [key, requestedState?.[key] === true]));
+  return executeQuickVoiceControlForAccount(name, task.guildId, exactState, { isCurrent: taskIsCurrent, operationType: 'cycle' });
 }
 function persistAutomationTasks() {
   const payload = { version: 1, rotations: [...rotations.values()].map(({ timer, running, ...task }) => task), stateCycles: [...stateCycles.values()].map(({ timer, running, ...task }) => task), savedAt: Date.now() };
@@ -2686,24 +2700,17 @@ app.post('/api/voice/state', async (req, res) => {
   const operationId = crypto.randomUUID();
   const operation = { id: operationId, pending: true, createdAt: Date.now(), result: null };
   voiceStateOperations.set(operationId, operation);
-  const task = { guildId, active: true, runToken: 0 };
   const requestedState = {
-    selfMute: selfMute === true,
-    selfDeaf: selfDeaf === true,
-    selfVideo: selfVideo === true,
-    selfStream: selfStream === true,
+    selfMute,
+    selfDeaf,
+    selfVideo,
+    selfStream,
   };
   setImmediate(async () => {
     try {
       const results = await mapWithConcurrency(accounts, 8, (name) => withResultRetry(() => withAccountLock(name, async () => {
         if (rotationAccounts.has(name)) return { name, ok: true, skipped: true, reason: 'Account is controlled by an active rotation' };
-        // Quick Control and state cycling now enter the exact same transition
-        // function, including cleanup, media retry, and safe recovery behavior.
-        const client = getClient(name);
-        const observed = readGatewayVoiceState(client, guildId);
-        const key = sessionKey(name, guildId);
-        if (!voiceSessions.has(key) && observed?.channelId) voiceSessions.set(key, { name, guildId, ...observed });
-        return executeStateForAccount(name, task, requestedState, task.runToken);
+        return executeQuickVoiceControlForAccount(name, guildId, requestedState, { operationType: 'state' });
       })));
       operation.result = { results, summary: summary(results) };
     } catch (error) {
