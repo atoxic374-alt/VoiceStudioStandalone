@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
-const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, cleanAccountRecords, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, retryMediaTransportImmediately, primaryMediaTransportIsActive, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanupPrimaryStreamAttempt, isRecoverableDiscordInteractionError } = require('../server');
+const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, cleanAccountRecords, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanupPrimaryStreamAttempt, isRecoverableDiscordInteractionError } = require('../server');
 
 test('classifies stale Discord component validation failures as recoverable', () => {
   assert.equal(isRecoverableDiscordInteractionError({ code: 50035, message: 'DiscordAPIError: Invalid Form Body' }), true);
@@ -67,7 +67,7 @@ test('waits for camera video packets on the primary voice connection', async () 
 
 test('recognizes an active camera transport before attempting to restart it', () => {
   const name = 'verify-active-camera-test';
-  const connection = { videoStatus: true, streamConnection: null };
+  const connection = { status: 0, videoStatus: true, streamConnection: null };
   const dispatcher = new EventEmitter();
   clients.set(name, { client: { voice: { connection } } });
   syntheticStreams.set(name, { connection, dispatcher, mediaKind: 'camera', guildId: 'guild-1', channelId: 'channel-1' });
@@ -85,7 +85,7 @@ test('recognizes an active camera transport before attempting to restart it', ()
 test('recognizes a connected Go Live transport before attempting to restart it', () => {
   const name = 'verify-active-stream-test';
   const streamConnection = { status: 0 };
-  const connection = { streamConnection };
+  const connection = { status: 0, streamConnection };
   const dispatcher = new EventEmitter();
   clients.set(name, { client: { voice: { connection } } });
   syntheticStreams.set(name, { connection, streamConnection, dispatcher, mediaKind: 'go-live', guildId: 'guild-1', channelId: 'channel-1' });
@@ -95,6 +95,44 @@ test('recognizes a connected Go Live transport before attempting to restart it',
     assert.equal(primaryMediaTransportIsActive(name, 'guild-1', 'channel-1', 'go-live'), false);
   } finally {
     syntheticStreams.delete(name);
+    clients.delete(name);
+  }
+});
+
+test('treats primary voice-camera transport as healthy in the watchdog', () => {
+  const name = 'watchdog-primary-camera-test';
+  const connection = { status: 0, videoStatus: true, streamConnection: null };
+  const client = { voice: { connection } };
+  const active = { connection, dispatcher: new EventEmitter(), mediaKind: 'camera', guildId: 'guild-1', channelId: 'channel-1' };
+  const session = { name, guildId: 'guild-1', channelId: 'channel-1', selfVideo: true, selfStream: false };
+  clients.set(name, { client });
+  try {
+    assert.deepEqual(mediaWatchdogReadiness(session, client, active), {
+      expectedKind: 'camera', primaryTransport: true, targetMatches: true, voiceReady: true, mediaReady: true, sourceReady: true,
+    });
+    connection.videoStatus = false;
+    assert.equal(mediaWatchdogReadiness(session, client, active).mediaReady, false);
+  } finally {
+    clients.delete(name);
+  }
+});
+
+test('treats primary Go Live transport as healthy in the watchdog', () => {
+  const name = 'watchdog-primary-live-test';
+  const streamConnection = { status: 0 };
+  const connection = { status: 0, streamConnection };
+  const client = { voice: { connection } };
+  const active = { connection, streamConnection, dispatcher: new EventEmitter(), mediaKind: 'go-live', guildId: 'guild-1', channelId: 'channel-1' };
+  const session = { name, guildId: 'guild-1', channelId: 'channel-1', selfVideo: false, selfStream: true };
+  clients.set(name, { client });
+  try {
+    const readiness = mediaWatchdogReadiness(session, client, active);
+    assert.equal(readiness.primaryTransport, true);
+    assert.equal(readiness.targetMatches, true);
+    assert.equal(readiness.voiceReady, true);
+    assert.equal(readiness.mediaReady, true);
+    assert.equal(readiness.sourceReady, true);
+  } finally {
     clients.delete(name);
   }
 });

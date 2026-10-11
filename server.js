@@ -1300,19 +1300,40 @@ async function retryMediaTransportImmediately(run, maxAttempts = 2, context = {}
   }
   return { ...last, attempts: maxAttempts };
 }
-function primaryMediaTransportIsActive(name, guildId, channelId, mediaKind) {
-  const client = getClient(name);
-  const active = syntheticStreams.get(name);
+function primaryMediaTransportIsActive(name, guildId, channelId, mediaKind, activeOverride = null, clientOverride = null) {
+  const client = clientOverride || getClient(name);
+  const active = activeOverride || syntheticStreams.get(name);
   const connection = client?.voice?.connection;
   const dispatcher = active?.dispatcher;
   if (!active || active.mediaKind !== mediaKind || String(active.guildId) !== String(guildId)
       || String(active.channelId) !== String(channelId) || active.completedAt || active.restarting
       || !dispatcher || dispatcher.destroyed || dispatcher.writableEnded || dispatcher.writableFinished
       || active.connection !== connection) return false;
+  if (connection?.status !== 0) return false;
   if (mediaKind === 'camera') return connection?.videoStatus === true;
   return !!active.streamConnection
     && connection?.streamConnection === active.streamConnection
     && active.streamConnection.status === 0;
+}
+function mediaWatchdogReadiness(session, client, active = syntheticStreams.get(session?.name)) {
+  const expectedKind = session?.selfStream ? 'go-live' : session?.selfVideo ? 'camera' : null;
+  const primaryTransport = !!active?.connection && active.connection === client?.voice?.connection;
+  const dedicatedTransport = active?.streamer?.voiceConnection;
+  const targetMatches = !!expectedKind && active?.mediaKind === expectedKind
+    && String(active.guildId) === String(session.guildId)
+    && String(active.channelId) === String(session.channelId);
+  const voiceReady = primaryTransport
+    ? active.connection.status === 0
+    : dedicatedTransport?.webRtcConn?.ready === true;
+  const mediaReady = primaryTransport
+    ? primaryMediaTransportIsActive(session.name, session.guildId, session.channelId, expectedKind, active, client)
+    : expectedKind === 'camera'
+      ? voiceReady
+      : dedicatedTransport?.streamConnection?.webRtcConn?.ready === true;
+  const sourceReady = primaryTransport
+    ? !!active.dispatcher && !active.dispatcher.destroyed && !active.dispatcher.writableEnded && !active.dispatcher.writableFinished
+    : !!active?.sourceProcess && active.sourceProcess.exitCode === null && !active.sourceProcess.killed;
+  return { expectedKind, primaryTransport, targetMatches, voiceReady, mediaReady, sourceReady };
 }
 async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live', isCurrent = () => true) {
   const client = getClient(name);
@@ -1655,7 +1676,7 @@ async function withAccountLock(name, operation) {
 }
 
 function taskResultSnapshot(result = {}) {
-  return { name: result.name, ok: result.ok === true, error: result.ok === true ? null : (result.error || 'فشل التنفيذ'), channelId: result.channelId || null, attemptedChannels: result.attemptedChannels || [], retries: Number(result.retries || 0), at: Date.now() };
+  return { name: result.name, ok: result.ok === true, verifiedActive: result.verifiedActive === true, error: result.ok === true ? null : (result.error || 'فشل التنفيذ'), channelId: result.channelId || null, attemptedChannels: result.attemptedChannels || [], retries: Number(result.retries || 0), at: Date.now() };
 }
 function recordTaskResult(task, result) {
   const snapshot = taskResultSnapshot(result);
@@ -1794,22 +1815,8 @@ async function watchdogMedia(session) {
   const expectedKind = session.selfStream ? 'go-live' : session.selfVideo ? 'camera' : null;
   const key = watchdogKey('media', session.name, session.guildId);
   const active = syntheticStreams.get(session.name);
-  const primaryTransport = active?.connection && active?.streamConnection;
-  const dedicatedTransport = active?.streamer?.voiceConnection;
-  const voiceReady = primaryTransport
-    ? active.connection.status === 0
-    : dedicatedTransport?.webRtcConn?.ready === true;
-  const mediaReady = primaryTransport
-    ? active.streamConnection.status === 0
-    : expectedKind === 'camera'
-      ? voiceReady
-      : dedicatedTransport?.streamConnection?.webRtcConn?.ready === true;
-  // Primary playVideo owns the FFmpeg process internally and uses the shared
-  // file, so there is no sourceProcess to inspect in that transport.
-  const sourceReady = primaryTransport
-    ? !!active?.dispatcher && active.dispatcher.destroyed !== true
-    : !!active?.sourceProcess && active.sourceProcess.exitCode === null && !active.sourceProcess.killed;
-  const mismatch = !!expectedKind && (!active || !voiceReady || !mediaReady || !sourceReady) && !pendingMediaRestarts.has(session.name);
+  const readiness = mediaWatchdogReadiness(session, client, active);
+  const mismatch = !!expectedKind && (!readiness.targetMatches || !readiness.voiceReady || !readiness.mediaReady || !readiness.sourceReady) && !pendingMediaRestarts.has(session.name);
   if (!watchdogIsMismatch(key, mismatch)) return;
   logMediaEvent('warn', 'watchdog.media_repair', { account: session.name, guildId: session.guildId, channelId: session.channelId, mediaKind: expectedKind });
   const result = await withAccountLock(session.name, () => startSyntheticStream(session.name, session.guildId, expectedKind, session));
@@ -3145,4 +3152,4 @@ if (require.main === module) {
   process.once('SIGINT', () => { persistBeforeExit(); process.exit(0); });
 }
 
-module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, hardenVoiceConnection, cleanupPrimaryStreamAttempt, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, retryMediaTransportImmediately, primaryMediaTransportIsActive, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanAccountRecords, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, isRecoverableDiscordInteractionError };
+module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, hardenVoiceConnection, cleanupPrimaryStreamAttempt, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanAccountRecords, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, isRecoverableDiscordInteractionError };
