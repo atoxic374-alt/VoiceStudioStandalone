@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
-const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, cleanAccountRecords, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, retryMediaTransportImmediately, waitForPrimaryVideoReady, clearVoiceFlags, cleanupPrimaryStreamAttempt, isRecoverableDiscordInteractionError } = require('../server');
+const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, cleanAccountRecords, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, retryMediaTransportImmediately, primaryMediaTransportIsActive, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanupPrimaryStreamAttempt, isRecoverableDiscordInteractionError } = require('../server');
 
 test('classifies stale Discord component validation failures as recoverable', () => {
   assert.equal(isRecoverableDiscordInteractionError({ code: 50035, message: 'DiscordAPIError: Invalid Form Body' }), true);
@@ -63,6 +63,40 @@ test('waits for camera video packets on the primary voice connection', async () 
   setTimeout(() => { connection.videoStatus = true; }, 20);
   await ready;
   assert.equal(connection.videoStatus, true);
+});
+
+test('recognizes an active camera transport before attempting to restart it', () => {
+  const name = 'verify-active-camera-test';
+  const connection = { videoStatus: true, streamConnection: null };
+  const dispatcher = new EventEmitter();
+  clients.set(name, { client: { voice: { connection } } });
+  syntheticStreams.set(name, { connection, dispatcher, mediaKind: 'camera', guildId: 'guild-1', channelId: 'channel-1' });
+  try {
+    assert.equal(primaryMediaTransportIsActive(name, 'guild-1', 'channel-1', 'camera'), true);
+    assert.equal(primaryMediaTransportIsActive(name, 'guild-1', 'channel-1', 'go-live'), false);
+    connection.videoStatus = false;
+    assert.equal(primaryMediaTransportIsActive(name, 'guild-1', 'channel-1', 'camera'), false);
+  } finally {
+    syntheticStreams.delete(name);
+    clients.delete(name);
+  }
+});
+
+test('recognizes a connected Go Live transport before attempting to restart it', () => {
+  const name = 'verify-active-stream-test';
+  const streamConnection = { status: 0 };
+  const connection = { streamConnection };
+  const dispatcher = new EventEmitter();
+  clients.set(name, { client: { voice: { connection } } });
+  syntheticStreams.set(name, { connection, streamConnection, dispatcher, mediaKind: 'go-live', guildId: 'guild-1', channelId: 'channel-1' });
+  try {
+    assert.equal(primaryMediaTransportIsActive(name, 'guild-1', 'channel-1', 'go-live'), true);
+    streamConnection.status = 1;
+    assert.equal(primaryMediaTransportIsActive(name, 'guild-1', 'channel-1', 'go-live'), false);
+  } finally {
+    syntheticStreams.delete(name);
+    clients.delete(name);
+  }
 });
 
 test('clears every previous voice flag before the next rotation state', async () => {

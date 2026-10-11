@@ -450,6 +450,23 @@ async function executeQuickVoiceControlForAccount(name, guildId, requestedState,
       selfStream: requestedState.selfStream !== undefined ? requestedState.selfStream : !!current.selfStream,
     });
     if (next.selfDeaf && (next.selfVideo || next.selfStream)) return { name, ok: false, error: 'Invalid deafened media state' };
+    const activeKind = next.selfStream ? 'go-live' : next.selfVideo ? 'camera' : null;
+    if (activeKind && active?.mediaKind === activeKind
+        && primaryMediaTransportIsActive(name, guildId, current.channelId, activeKind)) {
+      const gatewayMatches = observed?.channelId === current.channelId
+        && (activeKind === 'camera' ? observed.selfVideo === true && observed.selfStream !== true : observed.selfStream === true && observed.selfVideo !== true)
+        && observed.selfDeaf !== true;
+      const confirmed = gatewayMatches
+        ? { ok: true }
+        : await sendVoiceOpConfirmed(client, guildId, current.channelId, next, 1500);
+      logMediaEvent('info', 'media.active_reused', { account: name, guildId, channelId: current.channelId, mediaKind: activeKind, transportVerified: true, stateConfirmed: confirmed.ok });
+      // Keep a working transport even if Discord's gateway echo is late. A
+      // repeated click/request must never stop and recreate already-live media.
+      Object.assign(current, readGatewayVoiceState(client, guildId) || {}, next, { name, guildId, updatedAt: Date.now() });
+      voiceSessions.set(key, current);
+      persistSessions();
+      return { name, ok: true, verifiedActive: true, stateConfirmed: confirmed.ok, error: null };
+    }
     if (current.selfStream || current.selfVideo || syntheticStreams.has(name)) stopSyntheticStream(name, { leaveVoice: false });
     const cleared = await clearVoiceFlags(client, guildId, current.channelId, current);
     if (!cleared.ok) return { name, ok: false, error: `Unable to clear previous voice state: ${cleared.error}` };
@@ -470,7 +487,7 @@ async function executeQuickVoiceControlForAccount(name, guildId, requestedState,
       voiceSessions.set(key, current);
       persistSessions();
     }
-    return { name, ok: result.ok, permissionDenied: result.permissionDenied === true, error: result.ok ? null : result.error };
+    return { name, ok: result.ok, verifiedActive: result.verifiedActive === true, permissionDenied: result.permissionDenied === true, error: result.ok ? null : result.error };
   } finally {
     endAccountOperation(operation);
   }
@@ -1283,6 +1300,20 @@ async function retryMediaTransportImmediately(run, maxAttempts = 2, context = {}
   }
   return { ...last, attempts: maxAttempts };
 }
+function primaryMediaTransportIsActive(name, guildId, channelId, mediaKind) {
+  const client = getClient(name);
+  const active = syntheticStreams.get(name);
+  const connection = client?.voice?.connection;
+  const dispatcher = active?.dispatcher;
+  if (!active || active.mediaKind !== mediaKind || String(active.guildId) !== String(guildId)
+      || String(active.channelId) !== String(channelId) || active.completedAt || active.restarting
+      || !dispatcher || dispatcher.destroyed || dispatcher.writableEnded || dispatcher.writableFinished
+      || active.connection !== connection) return false;
+  if (mediaKind === 'camera') return connection?.videoStatus === true;
+  return !!active.streamConnection
+    && connection?.streamConnection === active.streamConnection
+    && active.streamConnection.status === 0;
+}
 async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live', isCurrent = () => true) {
   const client = getClient(name);
   const target = validateMediaTarget(client, guildId, session.channelId);
@@ -1335,6 +1366,14 @@ async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live',
       if (mediaKind === 'camera') await waitForPrimaryVideoReady(connection, dispatcher);
       return { ok: true };
     } catch (error) {
+      // Gateway confirmation may time out after Discord already accepted the
+      // media transport. Verify the live transport before tearing it down or
+      // issuing another create/start that could stop the working stream.
+      if (primaryMediaTransportIsActive(name, guildId, session.channelId, mediaKind)) {
+        primaryMediaFailures.delete(name);
+        logMediaEvent('warn', 'media.active_after_confirmation_timeout', { account: name, guildId, channelId: session.channelId, mediaKind, attempt, error: error?.message || String(error), transportVerified: true });
+        return { ok: true, verifiedActive: true, stateConfirmed: false };
+      }
       // Clean up before the immediate retry so the next attempt cannot reuse
       // a half-open StreamConnection or stale dispatcher.
       if (syntheticStreams.get(name) === active) stopSyntheticStream(name, { silent: true, invalidate: false });
@@ -2741,10 +2780,14 @@ app.post('/api/voice/state', async (req, res) => {
   };
   setImmediate(async () => {
     try {
-      const results = await mapWithConcurrency(accounts, 8, (name) => withResultRetry(() => withAccountLock(name, async () => {
-        if (rotationAccounts.has(name)) return { name, ok: true, skipped: true, reason: 'Account is controlled by an active rotation' };
-        return executeQuickVoiceControlForAccount(name, guildId, requestedState, { operationType: 'state' });
-      })));
+      const results = await mapWithConcurrency(accounts, 8, async (name) => {
+        const result = await withResultRetry(() => withAccountLock(name, async () => {
+          if (rotationAccounts.has(name)) return { name, ok: true, skipped: true, reason: 'Account is controlled by an active rotation' };
+          return executeQuickVoiceControlForAccount(name, guildId, requestedState, { operationType: 'state' });
+        }));
+        emitLive('operation.account.updated', { operation: 'state', operationId, result });
+        return result;
+      });
       operation.result = { results, summary: summary(results) };
     } catch (error) {
       const results = accounts.map((name) => ({ name, ok: false, error: error?.message || 'Voice state operation failed' }));
@@ -3102,4 +3145,4 @@ if (require.main === module) {
   process.once('SIGINT', () => { persistBeforeExit(); process.exit(0); });
 }
 
-module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, hardenVoiceConnection, cleanupPrimaryStreamAttempt, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, retryMediaTransportImmediately, waitForPrimaryVideoReady, clearVoiceFlags, cleanAccountRecords, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, isRecoverableDiscordInteractionError };
+module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, hardenVoiceConnection, cleanupPrimaryStreamAttempt, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, retryMediaTransportImmediately, primaryMediaTransportIsActive, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanAccountRecords, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, isRecoverableDiscordInteractionError };
