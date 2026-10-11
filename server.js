@@ -537,7 +537,7 @@ async function restoreStateCycleAccount(name, task, expectedRunToken = task?.run
   return withAccountLock(name, () => executeStateForAccount(name, task, desiredState, expectedRunToken));
 }
 function persistAutomationTasks() {
-  const payload = { version: 1, rotations: [...rotations.values()].map(({ timer, running, ...task }) => task), stateCycles: [...stateCycles.values()].map(({ timer, running, ...task }) => task), savedAt: Date.now() };
+  const payload = { version: 1, rotations: [...rotations.values()].map(({ timer, running, addingAccounts, ...task }) => task), stateCycles: [...stateCycles.values()].map(({ timer, running, addingAccounts, ...task }) => task), savedAt: Date.now() };
   const temp = `${AUTOMATION_TASKS_FILE}.tmp`;
   try { fs.writeFileSync(temp, JSON.stringify(payload, null, 2), { mode: 0o600 }); fs.renameSync(temp, AUTOMATION_TASKS_FILE); } catch (error) { try { fs.rmSync(temp, { force: true }); } catch {} console.warn('[automation] unable to persist tasks:', error.message); }
 }
@@ -1009,27 +1009,35 @@ function stopSyntheticStream(name, { leaveVoice = false, silent = false, invalid
 }
 function scheduleMediaRecovery(name, target, reason) {
   if (!target || pendingMediaRestarts.has(name)) return;
+  const scheduledGeneration = Number(mediaRunGenerations.get(name) || 0);
   const attempts = Number(mediaRestartAttempts.get(name) || 0) + 1;
   mediaRestartAttempts.set(name, attempts);
   const delayMs = Math.min(5 * 60 * 1000, 1000 * (2 ** Math.min(attempts - 1, 8)));
   logMediaEvent('warn', 'media.restart_scheduled', { account: name, guildId: target.guildId, channelId: target.channelId, mediaKind: target.mediaKind, reason, attempts, delayMs });
   const restartTimer = setTimeout(async () => {
     pendingMediaRestarts.delete(name);
-    const current = voiceSessions.get(sessionKey(name, target.guildId));
-    const requested = target.desiredState || {};
-    const expectedKind = requested.selfStream === true || current?.selfStream === true
-      ? 'go-live'
-      : requested.selfVideo === true || current?.selfVideo === true ? 'camera' : null;
-    if (!current || String(current.channelId) !== String(target.channelId) || expectedKind !== target.mediaKind) return;
-    mediaDesired.set(name, { guildId: target.guildId, channelId: target.channelId, mediaKind: target.mediaKind });
     try {
-      const result = await startSyntheticStream(name, target.guildId, target.mediaKind, { ...current, ...requested });
-      if (result.ok) {
-        const restored = voiceSessions.get(sessionKey(name, target.guildId));
-        if (restored) Object.assign(restored, { selfVideo: target.mediaKind === 'camera', selfStream: target.mediaKind === 'go-live', updatedAt: Date.now() });
-        mediaRestartAttempts.delete(name);
-        persistSessions();
-      }
+      await withAccountLock(name, async () => {
+        if (scheduledGeneration !== Number(mediaRunGenerations.get(name) || 0)) return;
+        const current = voiceSessions.get(sessionKey(name, target.guildId));
+        const client = getClient(name);
+        const observed = client ? readGatewayVoiceState(client, target.guildId) : null;
+        const liveCycle = [...stateCycles.values()].find((task) => task.active && task.guildId === target.guildId && task.accounts?.includes(name));
+        if (liveCycle?.running) return;
+        const expected = liveCycle ? stateCycleStateForAccount(liveCycle, name) : { ...(current || {}), ...(observed || {}) };
+        const expectedKind = expected?.selfStream === true ? 'go-live' : expected?.selfVideo === true ? 'camera' : null;
+        if (!current || String(current.channelId) !== String(target.channelId) || String(observed?.channelId || current.channelId) !== String(target.channelId) || expectedKind !== target.mediaKind) return;
+        if (primaryMediaTransportIsActive(name, target.guildId, target.channelId, target.mediaKind)) return;
+        const requested = { ...current, ...(observed || {}), ...(target.desiredState || {}), ...expected };
+        mediaDesired.set(name, { guildId: target.guildId, channelId: target.channelId, mediaKind: target.mediaKind });
+        const result = await startSyntheticStream(name, target.guildId, target.mediaKind, requested);
+        if (result.ok) {
+          const restored = voiceSessions.get(sessionKey(name, target.guildId));
+          if (restored) Object.assign(restored, { selfVideo: target.mediaKind === 'camera', selfStream: target.mediaKind === 'go-live', updatedAt: Date.now() });
+          mediaRestartAttempts.delete(name);
+          persistSessions();
+        }
+      });
     } catch (error) {
       // Timers do not have a caller to await them. Contain any unforeseen
       // failure so a retry never becomes a process-level crash.
@@ -1469,40 +1477,44 @@ async function processMediaStartQueue(name) {
   const queue = mediaStartQueues.get(name);
   if (!queue || queue.running) return;
   queue.running = true;
-  while (queue.items.length) {
-    const item = queue.items.shift();
-    let result;
-    const startedAt = Date.now();
-    logMediaEvent('info', 'media.queue_start', { sequence: item.sequence, account: item.name, guildId: item.guildId, mediaKind: item.mediaKind, queueDepth: queue.items.length });
-    try {
-      if (item.generation !== Number(mediaRunGenerations.get(item.name) || 0)) {
-        result = { ok: false, cancelled: true, error: 'Media start cancelled by a newer account operation' };
-      } else {
-        result = await startSyntheticStreamUnqueued(item.name, item.guildId, item.mediaKind, item.desiredState, item.generation);
-      }
-    } catch (error) {
-      result = { ok: false, error: error?.message || String(error) };
-      } finally {
-      logMediaEvent(result?.ok ? 'info' : 'warn', 'media.queue_complete', { sequence: item.sequence, account: item.name, guildId: item.guildId, mediaKind: item.mediaKind, ok: result?.ok === true, cancelled: result?.cancelled === true, durationMs: Date.now() - startedAt, queueDepth: queue.items.length, error: result?.ok ? undefined : result?.error });
-      if (!result?.ok && !result?.cancelled) {
-        const current = voiceSessions.get(sessionKey(item.name, item.guildId));
-        const desiredState = { ...(current || {}), ...(item.desiredState || {}) };
-        const channelId = desiredState.channelId || current?.channelId;
-        if (channelId && (desiredState.selfStream === true || desiredState.selfVideo === true)) {
-          scheduleMediaRecovery(item.name, {
-            guildId: item.guildId,
-            channelId,
-            mediaKind: item.mediaKind,
-            desiredState,
-          }, result.error || 'media start failed');
+  try {
+    while (queue.items.length) {
+      const item = queue.items.shift();
+      let result;
+      const startedAt = Date.now();
+      logMediaEvent('info', 'media.queue_start', { sequence: item.sequence, account: item.name, guildId: item.guildId, mediaKind: item.mediaKind, queueDepth: queue.items.length });
+      try {
+        if (item.generation !== Number(mediaRunGenerations.get(item.name) || 0)) {
+          result = { ok: false, cancelled: true, error: 'Media start cancelled by a newer account operation' };
+        } else {
+          result = await startSyntheticStreamUnqueued(item.name, item.guildId, item.mediaKind, item.desiredState, item.generation);
         }
+      } catch (error) {
+        result = { ok: false, error: error?.message || String(error) };
+      } finally {
+        logMediaEvent(result?.ok ? 'info' : 'warn', 'media.queue_complete', { sequence: item.sequence, account: item.name, guildId: item.guildId, mediaKind: item.mediaKind, ok: result?.ok === true, cancelled: result?.cancelled === true, durationMs: Date.now() - startedAt, queueDepth: queue.items.length, error: result?.ok ? undefined : result?.error });
+        if (!result?.ok && !result?.cancelled) {
+          const current = voiceSessions.get(sessionKey(item.name, item.guildId));
+          const desiredState = { ...(current || {}), ...(item.desiredState || {}) };
+          const channelId = desiredState.channelId || current?.channelId;
+          if (channelId && (desiredState.selfStream === true || desiredState.selfVideo === true)) {
+            scheduleMediaRecovery(item.name, {
+              guildId: item.guildId,
+              channelId,
+              mediaKind: item.mediaKind,
+              desiredState,
+            }, result.error || 'media start failed');
+          }
+        }
+        item.resolve(result || { ok: false, error: 'Media queue item completed without a result' });
+        if (MEDIA_START_GAP_MS > 0 && queue.items.length) await new Promise((resolve) => setTimeout(resolve, MEDIA_START_GAP_MS));
       }
-      item.resolve(result || { ok: false, error: 'Media queue item completed without a result' });
-      if (MEDIA_START_GAP_MS > 0 && queue.items.length) await new Promise((resolve) => setTimeout(resolve, MEDIA_START_GAP_MS));
     }
+  } finally {
+    queue.running = false;
+    if (queue.items.length) processMediaStartQueue(name);
+    else if (mediaStartQueues.get(name) === queue) mediaStartQueues.delete(name);
   }
-  queue.running = false;
-  if (!queue.items.length && mediaStartQueues.get(name) === queue) mediaStartQueues.delete(name);
 }
 function mediaQueueSnapshot() {
   const queues = [...mediaStartQueues.entries()];
@@ -3065,6 +3077,7 @@ app.post('/api/voice/task/add-accounts', async (req, res) => {
   const task = findAutomationTask(type, id);
   if (!task) return fail(res, new Error('Task not found'), 404);
   if (!task.active) return fail(res, new Error('Task is not active'), 409);
+  if (type === 'cycle' && (task.running || task.addingAccounts)) return fail(res, new Error('State cycle is changing states; try adding accounts again after the current transition finishes'), 409);
   const checks = accounts.map((name) => {
     if ((task.accounts || []).includes(name)) return { name, available: false, reason: 'الحساب موجود أصلًا في الجلسة' };
     if (taskHasAccountElsewhere(name, task.guildId, type, task.id)) return { name, available: false, reason: 'الحساب موجود في جلسة تدوير أخرى' };
@@ -3073,30 +3086,32 @@ app.post('/api/voice/task/add-accounts', async (req, res) => {
   const rejected = checks.filter((item) => !item.available);
   if (rejected.length) return fail(res, new Error(rejected.map((item) => `${item.name}: ${item.reason}`).join('؛ ')), 409, { rejected });
   const added = [];
-  for (const name of accounts) {
-    let result;
-    if (type === 'rotation') {
-      const current = voiceSessions.get(sessionKey(name, task.guildId));
-      const preferred = rotationPreferredChannel(name, task, task.accounts.length, null);
-      result = await moveRotationAccount(name, task, preferred, normalizeVoiceState(current || {}));
-    } else {
-      const stateIndex = nextStateIndex(task.states, task.stateHistory?.[name] || []);
-      const state = task.states?.[stateIndex] || {};
-      result = await withResultRetry(() => withAccountLock(name, async () => executeStateForAccount(name, task, state)));
+  if (type === 'cycle') task.addingAccounts = true;
+  try {
+    for (const name of accounts) {
+      let result;
+      let cycleStateIndex = -1;
+      if (type === 'rotation') {
+        const current = voiceSessions.get(sessionKey(name, task.guildId));
+        const preferred = rotationPreferredChannel(name, task, task.accounts.length, null);
+        result = await moveRotationAccount(name, task, preferred, normalizeVoiceState(current || {}));
+      } else {
+        cycleStateIndex = nextStateIndex(task.states, task.stateHistory?.[name] || []);
+        const state = task.states?.[cycleStateIndex] || {};
+        result = await withResultRetry(() => withAccountLock(name, async () => executeStateForAccount(name, task, state)));
+      }
+      if (!result.ok) return fail(res, new Error(`${name}: ${result.error || 'تعذر تشغيل الحساب'}`), 409, { added, failed: { name, ...result } });
+      task.accounts.push(name);
+      if (type === 'cycle') recordSuccessfulCycleState(task, name, cycleStateIndex, result.ok);
+      added.push(name);
+      recordTaskResult(task, result);
     }
-    if (!result.ok) return fail(res, new Error(`${name}: ${result.error || 'تعذر تشغيل الحساب'}`), 409, { added, failed: { name, ...result } });
-    task.accounts.push(name);
-    if (type === 'cycle') {
-      const stateIndex = nextStateIndex(task.states, task.stateHistory?.[name] || []);
-      task.accountStateIdx[name] = stateIndex;
-      task.stateHistory[name] = [...(task.stateHistory[name] || []), stateIndex];
-    }
-    added.push(name);
-    recordTaskResult(task, result);
+    persistAutomationTasks();
+    emitLive('task.accounts.added', { id: task.id, taskType: type, accounts: added });
+    return ok(res, { id: task.id, type, added, accounts: task.accounts, message: `تمت إضافة ${added.length} حساب`, summary: { total: added.length, ok: added.length, failed: 0, skipped: 0, retries: 0 } });
+  } finally {
+    if (type === 'cycle') task.addingAccounts = false;
   }
-  persistAutomationTasks();
-  emitLive('task.accounts.added', { id: task.id, taskType: type, accounts: added });
-  return ok(res, { id: task.id, type, added, accounts: task.accounts, message: `تمت إضافة ${added.length} حساب`, summary: { total: added.length, ok: added.length, failed: 0, skipped: 0, retries: 0 } });
 });
 app.post('/api/voice/state-cycle/start', async (req, res) => {
   const accounts = cleanAccounts(req.body?.accounts);
@@ -3111,11 +3126,12 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
   if (!validStates) return fail(res, new Error('State cycle contains an invalid voice state'), 400);
   const id = crypto.randomUUID();
   const task = { id, type: 'cycle', accounts, guildId, states, intervalMs: delay, currentIdx: 0, accountStateIdx: {}, stateHistory: {}, runToken: 0, startedAt: Date.now(), nextAt: Date.now() + delay };
-  task.running = false; task.active = true;
+  task.running = true; task.active = true;
   task.lastResults = [];
   const runStateCycle = async () => {
     if (task.nextAt > Date.now()) { if (task.active) task.timer = setTimeout(runStateCycle, task.nextAt - Date.now()); return; }
-    if (!task.active || task.running) return;
+    if (!task.active) return;
+    if (task.running || task.addingAccounts) { task.timer = setTimeout(runStateCycle, 1000); return; }
     task.running = true;
     const runToken = task.runToken;
     task.currentIdx = (task.currentIdx + 1) % task.states.length;
@@ -3227,11 +3243,11 @@ async function restoreAutomationTasks() {
     const currentStateIdx = Number.isInteger(Number(item.currentStateIdx)) && Number(item.currentStateIdx) >= 0 && Number(item.currentStateIdx) < item.states.length
       ? Number(item.currentStateIdx)
       : Number.isInteger(legacyIndex) && legacyIndex >= 0 && legacyIndex < item.states.length ? legacyIndex : 0;
-    const task = { ...item, type: 'cycle', accounts, currentStateIdx, accountStateIdx: { ...(item.accountStateIdx || {}) }, stateHistory: { ...(item.stateHistory || {}) }, runToken: Number(item.runToken || 0), running: false, active: true, intervalMs: Math.max(1000, Number(item.intervalMs || 300000)), nextAt: Number(item.nextAt || Date.now() + Number(item.intervalMs || 300000)) };
+    const task = { ...item, type: 'cycle', accounts, currentStateIdx, accountStateIdx: { ...(item.accountStateIdx || {}) }, stateHistory: { ...(item.stateHistory || {}) }, runToken: Number(item.runToken || 0), running: false, addingAccounts: false, active: true, intervalMs: Math.max(1000, Number(item.intervalMs || 300000)), nextAt: Number(item.nextAt || Date.now() + Number(item.intervalMs || 300000)) };
     const runStateCycle = async () => {
       if (!task.active) return;
       if (task.nextAt > Date.now()) { task.timer = setTimeout(runStateCycle, task.nextAt - Date.now()); return; }
-      if (task.running) { task.timer = setTimeout(runStateCycle, 1000); return; }
+      if (task.running || task.addingAccounts) { task.timer = setTimeout(runStateCycle, 1000); return; }
       task.running = true;
       task.nextAt = Date.now() + task.intervalMs;
       task.currentIdx = (task.currentIdx + 1) % task.states.length;
@@ -3239,9 +3255,9 @@ async function restoreAutomationTasks() {
         task.lastResults = await mapWithConcurrency(task.accounts, AUTOMATION_CONCURRENCY, (name) => withResultRetry(() => withAccountLock(name, async () => {
           const history = task.stateHistory[name] || [];
           const index = nextStateIndex(task.states, history);
-          task.stateHistory[name] = [...history, index];
-          task.accountStateIdx[name] = index;
-          return recordTaskResult(task, await executeStateForAccount(name, task, task.states[index]));
+          const result = await executeStateForAccount(name, task, task.states[index]);
+          recordSuccessfulCycleState(task, name, index, result.ok);
+          return recordTaskResult(task, result);
         })));
       } finally {
         task.running = false;
