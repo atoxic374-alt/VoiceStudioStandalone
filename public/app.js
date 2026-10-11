@@ -91,6 +91,29 @@ function requestAuthentication(message = 'أدخل كلمة مرور المسا�
   return authPromptPromise;
 }
 
+async function waitForVoiceStateOperation(operationId) {
+  const deadline = Date.now() + 10 * 60 * 1000;
+  let transientFailures = 0;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    try {
+      const response = await fetch(`/api/voice/state/operations/${encodeURIComponent(operationId)}`, {
+        credentials: 'include', cache: 'no-store', headers: { 'X-Voice-Studio': '1' },
+      });
+      if (response.status === 401) { await requestAuthentication(); continue; }
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || payload.success === false) throw new Error(payload.error || `Operation status failed (${response.status})`);
+      transientFailures = 0;
+      if (!payload.pending) return payload.result || { results: [], summary: { total: 0, ok: 0, failed: 1 }, error: 'Voice operation completed without a result' };
+      const subtitle = $('#operationSubtitle');
+      if (subtitle) subtitle.textContent = 'Waiting for Discord to confirm voice and media state…';
+    } catch (error) {
+      transientFailures += 1;
+      if (transientFailures >= 8) throw error;
+    }
+  }
+  throw new Error('Voice operation is still running; refresh the session list and check the final state.');
+}
 const api = async (url, options = {}) => {
   const response = await fetch(url, { ...options, credentials: 'include', cache: 'no-store', headers: { 'Content-Type': 'application/json', 'X-Voice-Studio': '1', ...(options.headers || {}) } });
   const payload = await response.json().catch(() => ({}));
@@ -99,6 +122,7 @@ const api = async (url, options = {}) => {
     return api(url, { ...options, _authRetry: true });
   }
   if (!response.ok || payload.success === false) throw new Error(payload.error || `Request failed (${response.status})`);
+  if (payload.pending && payload.operationId) return waitForVoiceStateOperation(payload.operationId);
   return payload;
 };
 const operationNames = { connect: 'Connect account', 'connect-bulk': 'Connect accounts', join: 'Join voice room', 'join-all': 'Join accounts', leave: 'Leave voice room', state: 'Update voice state', 'rotation/start': 'Start channel rotation', 'rotation/stop': 'Stop channel rotation', 'state-cycle/start': 'Start state cycle', 'state-cycle/stop': 'Stop state cycle' };

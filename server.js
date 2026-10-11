@@ -274,6 +274,7 @@ const connectingTokens = new Set();
 const voiceSessions = new Map();
 const rotations = new Map();
 const stateCycles = new Map();
+const voiceStateOperations = new Map();
 const syntheticStreams = new Map();
 const mediaStreamers = new Map();
 const pendingMediaRestarts = new Map();
@@ -2682,59 +2683,46 @@ app.post('/api/voice/state', async (req, res) => {
   for (const value of [selfMute, selfDeaf, selfVideo, selfStream]) if (value !== undefined && typeof value !== 'boolean') return fail(res, new Error('Voice state values must be boolean'), 400);
   if (selfDeaf === true && (selfVideo === true || selfStream === true)) return fail(res, new Error('Video or screen share cannot be enabled while deafened'), 400);
   const rotationAccounts = rotationControlledAccounts(guildId);
-  const results = await mapWithConcurrency(accounts, 8, (name) => withResultRetry(() => withAccountLock(name, async () => {
-    if (rotationAccounts.has(name)) return { name, ok: true, skipped: true, reason: 'Account is controlled by an active rotation' };
-    const operation = beginAccountOperation(name, guildId, 'state');
-    const operationStartedAt = Date.now();
-    const mediaKind = selfStream !== undefined ? 'stream' : selfVideo !== undefined ? 'camera' : 'voice-state';
-    const client = getClient(name);
-    const observed = readGatewayVoiceState(client, guildId);
-    const current = {
-      ...(observed || voiceSessions.get(sessionKey(name, guildId)) || {}),
-      selfStream: syntheticStreams.has(name) || !!observed?.selfStream,
-      selfVideo: syntheticStreams.get(name)?.mediaKind === 'camera' || !!observed?.selfVideo,
-    };
-    if (!client) { endAccountOperation(operation); return { name, ok: false, error: 'Account is not connected' }; }
-    if (!current?.channelId) { endAccountOperation(operation); return { name, ok: false, error: 'Account is not in a voice channel' }; }
-    const enablingMedia = selfVideo === true || selfStream === true;
-    const next = normalizeExclusiveVoiceState({
-      selfMute: selfMute !== undefined ? selfMute : !!current.selfMute,
-      selfDeaf: selfDeaf !== undefined ? selfDeaf : enablingMedia ? false : !!current.selfDeaf,
-      selfVideo: selfVideo !== undefined ? selfVideo : !!current.selfVideo,
-      selfStream: selfStream !== undefined ? selfStream : !!current.selfStream,
-    });
-    if (next.selfDeaf && (next.selfVideo || next.selfStream)) { endAccountOperation(operation); return { name, ok: false, error: 'Video or screen share cannot be enabled while deafened' }; }
-    // Use the same settle window as state rotation before touching media. The
-    // account lock above prevents concurrent operations for this account, and
-    // rotationControlledAccounts prevents Quick controls from racing a room
-    // rotation in the same guild.
-    if (current.selfStream || current.selfVideo || syntheticStreams.has(name)) stopSyntheticStream(name, { leaveVoice: false });
-    const cleared = await clearVoiceFlags(client, guildId, current.channelId, current);
-    if (!cleared.ok) { endAccountOperation(operation); return { name, ok: false, error: `Unable to clear previous voice state: ${cleared.error}` }; }
-    await waitForMediaSettle(next, current);
-    let result;
-    if (next.selfStream || next.selfVideo) {
-      // Stop the previous transport/state before starting the replacement
-      // media mode. This prevents a stale mute/deafen or old camera transport
-      // from surviving into Go Live.
-      result = await startSyntheticStream(name, guildId, next.selfStream ? 'go-live' : 'camera', next);
+  const operationId = crypto.randomUUID();
+  const operation = { id: operationId, pending: true, createdAt: Date.now(), result: null };
+  voiceStateOperations.set(operationId, operation);
+  const task = { guildId, active: true, runToken: 0 };
+  const requestedState = {
+    selfMute: selfMute === true,
+    selfDeaf: selfDeaf === true,
+    selfVideo: selfVideo === true,
+    selfStream: selfStream === true,
+  };
+  setImmediate(async () => {
+    try {
+      const results = await mapWithConcurrency(accounts, 8, (name) => withResultRetry(() => withAccountLock(name, async () => {
+        if (rotationAccounts.has(name)) return { name, ok: true, skipped: true, reason: 'Account is controlled by an active rotation' };
+        // Quick Control and state cycling now enter the exact same transition
+        // function, including cleanup, media retry, and safe recovery behavior.
+        const client = getClient(name);
+        const observed = readGatewayVoiceState(client, guildId);
+        const key = sessionKey(name, guildId);
+        if (!voiceSessions.has(key) && observed?.channelId) voiceSessions.set(key, { name, guildId, ...observed });
+        return executeStateForAccount(name, task, requestedState, task.runToken);
+      })));
+      operation.result = { results, summary: summary(results) };
+    } catch (error) {
+      const results = accounts.map((name) => ({ name, ok: false, error: error?.message || 'Voice state operation failed' }));
+      operation.result = { results, summary: summary(results) };
+    } finally {
+      operation.pending = false;
+      operation.completedAt = Date.now();
+      emitLive('operation.completed', { operation: 'state', operationId, ...operation.result });
+      const expiry = setTimeout(() => voiceStateOperations.delete(operationId), 10 * 60 * 1000);
+      expiry.unref?.();
     }
-    else {
-      result = await sendVoiceOpConfirmed(client, guildId, current.channelId, next, 6000);
-    }
-    if (!operationIsCurrent(operation)) { endAccountOperation(operation); return { name, ok: false, stale: true, error: 'Voice operation was superseded by a newer request' }; }
-    if (result.ok) {
-      const actual = readGatewayVoiceState(client, guildId);
-      Object.assign(current, actual || {}, next, { selfStream: !!next.selfStream, selfVideo: !!next.selfVideo, updatedAt: Date.now() });
-      persistSessions();
-    }
-    const output = { name, ok: result.ok, error: result.ok ? null : result.error };
-    logMediaEvent(result.ok ? 'info' : 'error', `${mediaKind}.${result.ok ? 'confirmed' : 'failed'}`, { account: name, guildId, channelId: current.channelId, durationMs: Date.now() - operationStartedAt, error: output.error || undefined });
-    endAccountOperation(operation);
-    return output;
-  })));
-  emitLive('operation.completed', { operation: 'state', results, summary: summary(results) });
-  return ok(res, { results, summary: summary(results) });
+  });
+  return res.status(202).json({ success: true, pending: true, operationId });
+});
+app.get('/api/voice/state/operations/:operationId', (req, res) => {
+  const operation = voiceStateOperations.get(String(req.params.operationId || ''));
+  if (!operation) return fail(res, new Error('Voice state operation not found or expired'), 404);
+  return ok(res, { operationId: operation.id, pending: operation.pending, result: operation.result });
 });
 app.post('/api/voice/join-all', async (req, res) => {
   const { guildId, channelId, selfMute = false, selfDeaf = false } = req.body || {};
