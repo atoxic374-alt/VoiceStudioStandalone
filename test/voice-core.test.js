@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
-const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, cleanAccountRecords, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, clearVoiceFlags, cleanupPrimaryStreamAttempt, isRecoverableDiscordInteractionError } = require('../server');
+const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, cleanAccountRecords, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, retryMediaTransportImmediately, clearVoiceFlags, cleanupPrimaryStreamAttempt, isRecoverableDiscordInteractionError } = require('../server');
 
 test('classifies stale Discord component validation failures as recoverable', () => {
   assert.equal(isRecoverableDiscordInteractionError({ code: 50035, message: 'DiscordAPIError: Invalid Form Body' }), true);
@@ -43,6 +43,17 @@ test('does not restore a previous deafen state after a failed camera or stream s
 test('retries transient live voice target confirmation failures', () => {
   assert.equal(retryableError({ error: 'Live voice target changed or is no longer available' }), true);
   assert.equal(retryableError({ error: 'Voice state mismatch for channel channel-1: gateway=none, connection=none' }), true);
+});
+
+test('creates a fresh media transport immediately after a failed attempt', async () => {
+  const calls = [];
+  const result = await retryMediaTransportImmediately(async (attempt) => {
+    calls.push(attempt);
+    return attempt === 1 ? { ok: false, error: 'first transport failed' } : { ok: true };
+  });
+  assert.deepEqual(calls, [1, 2]);
+  assert.equal(result.ok, true);
+  assert.equal(result.attempts, 2);
 });
 
 test('clears every previous voice flag before the next rotation state', async () => {
