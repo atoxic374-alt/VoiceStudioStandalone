@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
-const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, cleanAccountRecords, normalizeExclusiveVoiceState, clearVoiceFlags, cleanupPrimaryStreamAttempt, isRecoverableDiscordInteractionError } = require('../server');
+const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, cleanAccountRecords, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, clearVoiceFlags, cleanupPrimaryStreamAttempt, isRecoverableDiscordInteractionError } = require('../server');
 
 test('classifies stale Discord component validation failures as recoverable', () => {
   assert.equal(isRecoverableDiscordInteractionError({ code: 50035, message: 'DiscordAPIError: Invalid Form Body' }), true);
@@ -29,6 +29,20 @@ test('treats each rotation item as one exclusive voice mode', () => {
   assert.deepEqual(normalizeExclusiveVoiceState({ selfMute: true, selfStream: true }), { selfMute: false, selfDeaf: false, selfVideo: false, selfStream: true });
   assert.deepEqual(normalizeExclusiveVoiceState({ selfDeaf: true, selfVideo: true }), { selfMute: false, selfDeaf: false, selfVideo: true, selfStream: false });
   assert.deepEqual(normalizeExclusiveVoiceState({}), { selfMute: false, selfDeaf: false, selfVideo: false, selfStream: false });
+});
+
+test('does not restore a previous deafen state after a failed camera or stream start', () => {
+  assert.deepEqual(voiceRecoveryState({ selfMute: false, selfDeaf: true, selfVideo: false, selfStream: true }), {
+    selfMute: false, selfDeaf: false, selfVideo: false, selfStream: false,
+  });
+  assert.deepEqual(voiceRecoveryState({ selfMute: true, selfDeaf: false, selfVideo: true, selfStream: false }), {
+    selfMute: false, selfDeaf: false, selfVideo: false, selfStream: false,
+  });
+});
+
+test('retries transient live voice target confirmation failures', () => {
+  assert.equal(retryableError({ error: 'Live voice target changed or is no longer available' }), true);
+  assert.equal(retryableError({ error: 'Voice state mismatch for channel channel-1: gateway=none, connection=none' }), true);
 });
 
 test('clears every previous voice flag before the next rotation state', async () => {

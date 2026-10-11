@@ -376,6 +376,9 @@ function normalizeExclusiveVoiceState(state = {}) {
   if (requested.selfMute) return { selfMute: true, selfDeaf: false, selfVideo: false, selfStream: false };
   return { selfMute: false, selfDeaf: false, selfVideo: false, selfStream: false };
 }
+function voiceRecoveryState(desiredState = {}) {
+  return { ...normalizeExclusiveVoiceState(desiredState), selfVideo: false, selfStream: false };
+}
 function hasVoiceFlags(state = {}) {
   return !!(state.selfMute || state.selfDeaf || state.selfVideo || state.selfStream);
 }
@@ -408,14 +411,14 @@ async function recoverVoiceAfterStateFailure(name, guildId, current) {
   // session/token that the following OP4 needs and turns a recoverable media
   // failure into a guaranteed voice-state confirmation timeout.
   stopSyntheticStream(name, { leaveVoice: false });
+  const recoveryState = voiceRecoveryState(current);
   const restored = await sendVoiceOpConfirmed(client, guildId, current.channelId, {
-    selfMute: !!current.selfMute,
-    selfDeaf: !!current.selfDeaf,
-    selfVideo: false,
-    selfStream: false,
+    ...recoveryState,
   }, 4500);
   if (restored.ok) {
-    Object.assign(current, { selfVideo: false, selfStream: false, updatedAt: Date.now() });
+    Object.assign(current, recoveryState, { updatedAt: Date.now() });
+    const saved = voiceSessions.get(sessionKey(name, guildId));
+    if (saved) Object.assign(saved, recoveryState, { updatedAt: current.updatedAt });
     persistSessions();
   }
   return restored;
@@ -448,7 +451,7 @@ async function executeStateForAccount(name, task, requestedState, expectedRunTok
     let result;
     if (next.selfStream || next.selfVideo) {
       result = await startSyntheticStream(name, task.guildId, next.selfStream ? 'go-live' : 'camera', next);
-      if (!result.ok) await recoverVoiceAfterStateFailure(name, task.guildId, current);
+      if (!result.ok) await recoverVoiceAfterStateFailure(name, task.guildId, next);
     } else {
       result = await sendVoiceOpConfirmed(client, task.guildId, current.channelId, next, 6000);
     }
@@ -793,7 +796,7 @@ function summary(results) {
 }
 function retryableError(error) {
   const text = String(error?.error || error?.message || '').toLowerCase();
-  return /timeout|timed out|did not confirm|gateway not ready|no active gateway|web.?rtc|media transport|temporar|rate.?limit|connection|socket|network/.test(text);
+  return /timeout|timed out|did not confirm|gateway not ready|no active gateway|web.?rtc|media transport|temporar|rate.?limit|connection|socket|network|live voice target changed|voice state mismatch/.test(text);
 }
 function isInvalidCredentialError(error) {
   const status = Number(error?.status || error?.statusCode || 0);
@@ -2038,7 +2041,10 @@ async function confirmLiveMediaTarget(client, guildId, channelId, delayMs = 120)
       first = read();
     }
   }
-  return { ok: false, error: first.matches ? 'Live voice target changed during confirmation' : 'Live voice target changed or is no longer available', first };
+  const error = !first.target?.ok
+    ? `Live voice target is unavailable: ${first.target?.error || 'channel validation failed'}`
+    : `Voice state mismatch for channel ${channelId}: gateway=${first.state?.channelId || 'none'}, connection=${voiceConnectionChannelId(client?.voice?.connection) || 'none'}`;
+  return { ok: false, error, first };
 }
 function upsertSession(name, guildId, channelId, opts = {}) {
   const previous = voiceSessions.get(sessionKey(name, guildId));
@@ -3058,4 +3064,4 @@ if (require.main === module) {
   process.once('SIGINT', () => { persistBeforeExit(); process.exit(0); });
 }
 
-module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, hardenVoiceConnection, cleanupPrimaryStreamAttempt, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, normalizeExclusiveVoiceState, clearVoiceFlags, cleanAccountRecords, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, isRecoverableDiscordInteractionError };
+module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, hardenVoiceConnection, cleanupPrimaryStreamAttempt, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, clearVoiceFlags, cleanAccountRecords, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, isRecoverableDiscordInteractionError };
