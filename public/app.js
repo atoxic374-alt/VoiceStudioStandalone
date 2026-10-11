@@ -778,8 +778,9 @@ async function toggleCamera() {
   if (state.mediaBusy) return;
   const current = state.clients.find((client) => client.name === state.selectedAccount)?.voice;
   if (current?.selfVideo) {
+    const synced = await syncMediaVoiceState({ selfDeaf: false, selfVideo: false, selfStream: false }, 'Camera');
+    if (!synced.synced) throw synced.error || new Error('Discord did not confirm camera shutdown');
     stopCurrentStream({ updateDiscord: false });
-    await syncMediaVoiceState({ selfVideo: false, selfStream: false }, 'Camera');
     await refreshSessions();
     return;
   }
@@ -789,7 +790,7 @@ async function toggleCamera() {
     const canvas = document.createElement('canvas'); canvas.width = 1280; canvas.height = 720;
     const ctx = canvas.getContext('2d'); ctx.fillStyle = '#080b18'; ctx.fillRect(0, 0, canvas.width, canvas.height);
     const stream = canvas.captureStream(15);
-    const synced = await syncMediaVoiceState({ selfVideo: true, selfStream: false }, 'Camera');
+    const synced = await syncMediaVoiceState({ selfDeaf: false, selfVideo: true, selfStream: false }, 'Camera');
     if (!synced.synced) throw synced.error || new Error('Discord did not confirm camera state');
     showMediaStream(stream, 'camera');
     if ($('#mediaNotice')) $('#mediaNotice').textContent = 'Safe camera preview: a blank frame is used; no camera permission is requested.';
@@ -805,7 +806,7 @@ async function toggleScreen() {
   const enabled = !current?.selfStream;
   state.mediaBusy = true;
   try {
-    const result = await post('/api/voice/state', { accounts: selectedAccounts(), guildId: target.guildId, selfVideo: false, selfStream: enabled });
+    const result = await post('/api/voice/state', { accounts: selectedAccounts(), guildId: target.guildId, selfDeaf: false, selfVideo: false, selfStream: enabled });
     if (!result.summary?.ok) throw new Error(result.results?.find((item) => !item.ok)?.error || 'تعذر تشغيل البث الاصطناعي');
     const button = document.querySelector('.state-button[data-state="stream"]');
     button?.classList.toggle('is-active', enabled);
