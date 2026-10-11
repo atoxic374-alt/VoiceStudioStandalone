@@ -1098,7 +1098,7 @@ function withTimeout(promise, timeoutMs, message) {
   return Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), timeoutMs); })]).finally(() => clearTimeout(timer));
 }
 async function playPrimaryMediaAndWait(streamConnection, sourceStream, signaling, isCurrent = () => true) {
-  const dispatcher = streamConnection.playVideo(sourceStream, { fps: 15, presetH26x: 'superfast', bitrate: 300, inputFFmpegArgs: ['-re'], outputFFmpegArgs: ['-g', '30'] });
+  const dispatcher = streamConnection.playVideo(sourceStream, { fps: 15, presetH26x: 'superfast', bitrate: 300, inputFFmpegArgs: ['-stream_loop', '-1', '-re'], outputFFmpegArgs: ['-g', '30'] });
   if (!isCurrent()) {
     try { dispatcher?.destroy?.(); } catch {}
     throw new Error('Media start cancelled by a newer account operation');
@@ -1358,7 +1358,7 @@ async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live',
         // Camera video belongs to the existing VoiceConnection. A StreamConnection
         // is Discord's separate Go Live transport and will display this as Live.
         if (typeof connection.playVideo !== 'function') throw new Error('Primary voice connection does not support camera video');
-        dispatcher = connection.playVideo(source, { fps: 15, presetH26x: 'superfast', bitrate: 300, inputFFmpegArgs: ['-re'], outputFFmpegArgs: ['-g', '30'] });
+        dispatcher = connection.playVideo(source, { fps: 15, presetH26x: 'superfast', bitrate: 300, inputFFmpegArgs: ['-stream_loop', '-1', '-re'], outputFFmpegArgs: ['-g', '30'] });
       } else {
         // A retry creates a brand-new StreamConnection on the existing primary
         // voice session; it never opens a competing Gateway/voice handshake.
@@ -1769,6 +1769,11 @@ function watchdogMarkRepair(key) {
   previous.misses = 0;
   watchdogObservations.set(key, previous);
 }
+function isAccountManagedByActiveStateCycle(name, guildId) {
+  return [...stateCycles.values()].some((task) => task.active !== false
+    && String(task.guildId) === String(guildId)
+    && (task.accounts || []).includes(name));
+}
 function voiceStateMatchesExpected(actual, expected) {
   if (!actual?.channelId || !expected) return false;
   return ['selfMute', 'selfDeaf', 'selfVideo', 'selfStream']
@@ -1790,6 +1795,9 @@ async function watchdogRotation(task, account) {
 }
 async function watchdogStateCycle(task, account) {
   const client = getClient(account);
+  // A state cycle owns the exact media state until its configured nextAt.
+  // Do not let the periodic watchdog replay that same state mid-interval.
+  if (task.active && (task.accounts || []).includes(account)) return;
   if (!client || !task.active || task.running) return;
   if (accountOperations.has(operationKey(account, task.guildId))) return;
   const key = watchdogKey('cycle', task.id, account);
@@ -1807,6 +1815,9 @@ async function watchdogStateCycle(task, account) {
 async function watchdogMedia(session) {
   const client = getClient(session.name);
   if (!client || !session.channelId) return;
+  // State cycles own media for the whole interval. In particular, never let a
+  // second watchdog path restart a valid camera/Go Live transport mid-cycle.
+  if (isAccountManagedByActiveStateCycle(session.name, session.guildId)) return;
   // Do not revive stale selfVideo/selfStream flags restored from disk after a
   // process restart. Only repair media that was confirmed successfully during
   // this process; normal rotation/state tasks can explicitly start it again.
@@ -1829,7 +1840,8 @@ async function runVoiceWatchdog() {
   try {
     const repairs = [
       ...[...rotations.values()].flatMap((task) => (task.accounts || []).map((account) => () => watchdogRotation(task, account).catch((error) => logMediaEvent('error', 'watchdog.rotation_failed', { account, taskId: task.id, error: error.message })))),
-      ...[...stateCycles.values()].flatMap((task) => (task.accounts || []).map((account) => () => watchdogStateCycle(task, account).catch((error) => logMediaEvent('error', 'watchdog.state_failed', { account, taskId: task.id, error: error.message })))),
+      // State-cycle repairs are intentionally disabled; cycle transitions are
+      // serialized by their own timer and must not be replayed by the watchdog.
     ];
     await mapWithConcurrency(repairs, 4, (repair) => repair());
     const mediaSessions = [...voiceSessions.values()].filter((session) => session.selfStream || session.selfVideo);
@@ -2996,7 +3008,7 @@ app.post('/api/voice/task/add-accounts', async (req, res) => {
 app.post('/api/voice/state-cycle/start', async (req, res) => {
   const accounts = cleanAccounts(req.body?.accounts);
   const { guildId, states, intervalMs } = req.body || {};
-  const delay = Math.max(1000, Number(intervalMs || 60000));
+  const delay = Math.max(1000, Number(intervalMs || 300000));
   if (!accounts.length || !guildId || !Array.isArray(states) || states.length < 2) return fail(res, new Error('At least two states and one account are required'), 400);
   const conflicts = taskAccountConflicts(accounts, guildId, 'cycle');
   if (conflicts.length) return fail(res, new Error(`These accounts already have a state rotation: ${conflicts.join(', ')}`), 409);
@@ -3117,7 +3129,7 @@ async function restoreAutomationTasks() {
     if (!item.id || !item.guildId || !Array.isArray(item.states) || item.states.length < 2) continue;
     const accounts = cleanAccounts(item.accounts);
     if (taskAccountConflicts(accounts, item.guildId, 'cycle').length) continue;
-    const task = { ...item, type: 'cycle', accounts, accountStateIdx: { ...(item.accountStateIdx || {}) }, stateHistory: { ...(item.stateHistory || {}) }, running: false, active: true, intervalMs: Math.max(1000, Number(item.intervalMs || 60000)), nextAt: Number(item.nextAt || Date.now() + Number(item.intervalMs || 60000)) };
+    const task = { ...item, type: 'cycle', accounts, accountStateIdx: { ...(item.accountStateIdx || {}) }, stateHistory: { ...(item.stateHistory || {}) }, running: false, active: true, intervalMs: Math.max(1000, Number(item.intervalMs || 300000)), nextAt: Number(item.nextAt || Date.now() + Number(item.intervalMs || 300000)) };
     const runStateCycle = async () => {
       if (!task.active) return;
       if (task.nextAt > Date.now()) { task.timer = setTimeout(runStateCycle, task.nextAt - Date.now()); return; }
@@ -3152,4 +3164,4 @@ if (require.main === module) {
   process.once('SIGINT', () => { persistBeforeExit(); process.exit(0); });
 }
 
-module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, hardenVoiceConnection, cleanupPrimaryStreamAttempt, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanAccountRecords, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, isRecoverableDiscordInteractionError };
+module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, isAccountManagedByActiveStateCycle, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, hardenVoiceConnection, cleanupPrimaryStreamAttempt, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanAccountRecords, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, isRecoverableDiscordInteractionError };
