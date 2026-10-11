@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
-const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, stateCycleStateForAccount, isAccountManagedByActiveStateCycle, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, cleanAccountRecords, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanupPrimaryStreamAttempt, isRecoverableDiscordInteractionError } = require('../server');
+const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, stateCycleStateForAccount, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, cleanAccountRecords, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanupPrimaryStreamAttempt, isRecoverableDiscordInteractionError } = require('../server');
 
 test('classifies stale Discord component validation failures as recoverable', () => {
   assert.equal(isRecoverableDiscordInteractionError({ code: 50035, message: 'DiscordAPIError: Invalid Form Body' }), true);
@@ -137,7 +137,7 @@ test('treats primary Go Live transport as healthy in the watchdog', () => {
   }
 });
 
-test('state-cycle ownership suppresses watchdog media repairs until the cycle is stopped', () => {
+test('state-cycle ownership is discoverable for watchdog media monitoring', () => {
   const id = 'watchdog-cycle-ownership-test';
   stateCycles.set(id, { active: true, guildId: 'guild-1', accounts: ['cycle-account'] });
   try {
@@ -156,6 +156,14 @@ test('restores the last persisted state-cycle state instead of choosing a new on
   assert.equal(stateCycleStateForAccount({ states: [camera, live], accountStateIdx: { alpha: 1 }, stateHistory: { alpha: [0, 1] } }, 'alpha'), live);
   assert.equal(stateCycleStateForAccount({ states: [camera, live], accountStateIdx: {}, stateHistory: { alpha: [0, 1] } }, 'alpha'), live);
   assert.equal(stateCycleStateForAccount({ states: [camera, live], accountStateIdx: {}, stateHistory: {} }, 'alpha'), camera);
+});
+
+test('verifies camera and Go Live state against the actual account voice state', () => {
+  assert.equal(expectedMediaStateIsPresent({ channelId: 'channel-1', selfVideo: true, selfStream: false, selfDeaf: false }, 'channel-1', 'camera'), true);
+  assert.equal(expectedMediaStateIsPresent({ channelId: 'channel-1', selfVideo: false, selfStream: true, selfDeaf: false }, 'channel-1', 'go-live'), true);
+  assert.equal(expectedMediaStateIsPresent({ channelId: 'channel-1', selfVideo: false, selfStream: false, selfDeaf: false }, 'channel-1', 'camera'), false);
+  assert.equal(expectedMediaStateIsPresent({ channelId: 'channel-2', selfVideo: true, selfStream: false, selfDeaf: false }, 'channel-1', 'camera'), false);
+  assert.equal(expectedMediaStateIsPresent({ channelId: 'channel-1', selfVideo: true, selfStream: false, selfDeaf: true }, 'channel-1', 'camera'), false);
 });
 
 test('clears every previous voice flag before the next rotation state', async () => {
