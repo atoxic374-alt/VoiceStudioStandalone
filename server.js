@@ -397,10 +397,13 @@ function randomStateIndex(states, previous = -1) {
   const choices = Array.from({ length: count }, (_, index) => index).filter((index) => index !== previous);
   return choices[Math.floor(Math.random() * choices.length)];
 }
-function nextSynchronizedCycleIndex(states, currentIndex = -1) {
+function nextStateIndex(states, history = []) {
   const count = Array.isArray(states) ? states.length : 0;
   if (!count) return 0;
-  return (Number.isInteger(currentIndex) ? currentIndex + 1 : 0) % count;
+  const used = new Set((Array.isArray(history) ? history : []).filter((index) => Number.isInteger(index) && index >= 0 && index < count));
+  const available = Array.from({ length: count }, (_, index) => index).filter((index) => !used.has(index));
+  const choices = available.length ? available : Array.from({ length: count }, (_, index) => index).filter((index) => index !== history.at(-1));
+  return choices[Math.floor(Math.random() * choices.length)];
 }
 async function recoverVoiceAfterStateFailure(name, guildId, current) {
   const client = getClient(name);
@@ -497,13 +500,13 @@ async function executeStateForAccount(name, task, requestedState, expectedRunTok
 function stateCycleIndexForAccount(task, name) {
   const states = Array.isArray(task?.states) ? task.states : [];
   if (!states.length) return -1;
-  const sharedIndex = Number(task.currentStateIdx);
-  if (Number.isInteger(sharedIndex) && sharedIndex >= 0 && sharedIndex < states.length) return sharedIndex;
   const savedIndex = Number(task.accountStateIdx?.[name]);
   if (Number.isInteger(savedIndex) && savedIndex >= 0 && savedIndex < states.length) return savedIndex;
   const history = task.stateHistory?.[name];
   const lastIndex = Array.isArray(history) ? Number(history.at(-1)) : NaN;
-  return Number.isInteger(lastIndex) && lastIndex >= 0 && lastIndex < states.length ? lastIndex : 0;
+  if (Number.isInteger(lastIndex) && lastIndex >= 0 && lastIndex < states.length) return lastIndex;
+  const sharedIndex = Number(task.currentStateIdx);
+  return Number.isInteger(sharedIndex) && sharedIndex >= 0 && sharedIndex < states.length ? sharedIndex : 0;
 }
 function stateCycleStateForAccount(task, name) {
   const index = stateCycleIndexForAccount(task, name);
@@ -3054,15 +3057,14 @@ app.post('/api/voice/task/add-accounts', async (req, res) => {
       const preferred = rotationPreferredChannel(name, task, task.accounts.length, null);
       result = await moveRotationAccount(name, task, preferred, normalizeVoiceState(current || {}));
     } else {
-      const stateIndex = stateCycleIndexForAccount(task, name);
+      const stateIndex = nextStateIndex(task.states, task.stateHistory?.[name] || []);
       const state = task.states?.[stateIndex] || {};
       result = await withResultRetry(() => withAccountLock(name, async () => executeStateForAccount(name, task, state)));
     }
     if (!result.ok) return fail(res, new Error(`${name}: ${result.error || 'تعذر تشغيل الحساب'}`), 409, { added, failed: { name, ...result } });
     task.accounts.push(name);
     if (type === 'cycle') {
-      const stateIndex = stateCycleIndexForAccount(task, name);
-      task.currentStateIdx = stateIndex;
+      const stateIndex = nextStateIndex(task.states, task.stateHistory?.[name] || []);
       task.accountStateIdx[name] = stateIndex;
       task.stateHistory[name] = [...(task.stateHistory[name] || []), stateIndex];
     }
@@ -3085,7 +3087,7 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
     && !(item.selfDeaf === true && (item.selfVideo === true || item.selfStream === true)));
   if (!validStates) return fail(res, new Error('State cycle contains an invalid voice state'), 400);
   const id = crypto.randomUUID();
-  const task = { id, type: 'cycle', accounts, guildId, states, intervalMs: delay, currentIdx: 0, currentStateIdx: -1, accountStateIdx: {}, stateHistory: {}, runToken: 0, startedAt: Date.now(), nextAt: Date.now() + delay };
+  const task = { id, type: 'cycle', accounts, guildId, states, intervalMs: delay, currentIdx: 0, accountStateIdx: {}, stateHistory: {}, runToken: 0, startedAt: Date.now(), nextAt: Date.now() + delay };
   task.running = false; task.active = true;
   task.lastResults = [];
   const runStateCycle = async () => {
@@ -3093,13 +3095,12 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
     if (!task.active || task.running) return;
     task.running = true;
     const runToken = task.runToken;
-    const stateIndex = nextSynchronizedCycleIndex(task.states, task.currentStateIdx);
-    task.currentStateIdx = stateIndex;
-    task.currentIdx = stateIndex;
+    task.currentIdx = (task.currentIdx + 1) % task.states.length;
     try {
       task.lastResults = [];
       await mapWithConcurrency(task.accounts, AUTOMATION_CONCURRENCY, (name) => withResultRetry(() => withAccountLock(name, async () => {
         const history = task.stateHistory[name] || [];
+        const stateIndex = nextStateIndex(task.states, history);
         task.stateHistory[name] = [...history, stateIndex];
         task.accountStateIdx[name] = stateIndex;
         const result = await executeStateForAccount(name, task, task.states[stateIndex], runToken);
@@ -3119,10 +3120,8 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
   setImmediate(async () => {
     task.running = true;
     try {
-      const index = nextSynchronizedCycleIndex(task.states, task.currentStateIdx);
-      task.currentStateIdx = index;
-      task.currentIdx = index;
       task.lastResults = await mapWithConcurrency(task.accounts, AUTOMATION_CONCURRENCY, (name) => withResultRetry(() => withAccountLock(name, async () => {
+        const index = nextStateIndex(task.states, task.stateHistory[name] || []);
         task.stateHistory[name] = [index];
         task.accountStateIdx[name] = index;
         return recordTaskResult(task, await executeStateForAccount(name, task, task.states[index], task.runToken));
@@ -3263,4 +3262,4 @@ if (require.main === module) {
   process.once('SIGINT', () => { persistBeforeExit(); process.exit(0); });
 }
 
-module.exports = { app, clients, voiceSessions, rotations, stateCycles, stateCycleStateForAccount, nextSynchronizedCycleIndex, playingSessions, stopPlayingSession, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, hardenVoiceConnection, cleanupPrimaryStreamAttempt, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanAccountRecords, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, isRecoverableDiscordInteractionError };
+module.exports = { app, clients, voiceSessions, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, playingSessions, stopPlayingSession, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, hardenVoiceConnection, cleanupPrimaryStreamAttempt, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanAccountRecords, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, isRecoverableDiscordInteractionError };
