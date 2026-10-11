@@ -497,6 +497,31 @@ async function executeStateForAccount(name, task, requestedState, expectedRunTok
   const exactState = Object.fromEntries(['selfMute', 'selfDeaf', 'selfVideo', 'selfStream'].map((key) => [key, requestedState?.[key] === true]));
   return executeQuickVoiceControlForAccount(name, task.guildId, exactState, { isCurrent: taskIsCurrent, operationType: 'cycle' });
 }
+function stateCycleStateForAccount(task, name) {
+  const states = Array.isArray(task?.states) ? task.states : [];
+  if (!states.length) return null;
+  const savedIndex = Number(task.accountStateIdx?.[name]);
+  if (Number.isInteger(savedIndex) && savedIndex >= 0 && savedIndex < states.length) return states[savedIndex];
+  const history = task.stateHistory?.[name];
+  const lastIndex = Array.isArray(history) ? Number(history.at(-1)) : NaN;
+  return Number.isInteger(lastIndex) && lastIndex >= 0 && lastIndex < states.length ? states[lastIndex] : states[0];
+}
+async function restoreStateCycleAccount(name, task, expectedRunToken = task?.runToken) {
+  if (task?.active === false || (expectedRunToken != null && task.runToken !== expectedRunToken)) return { name, ok: false, stale: true, error: 'State cycle is no longer active' };
+  let session = voiceSessions.get(sessionKey(name, task.guildId));
+  if (!session?.channelId) return { name, ok: false, error: 'No saved voice room to resume this state cycle' };
+  const client = getClient(name);
+  const connection = client?.voice?.connection;
+  if (!connection || String(voiceConnectionChannelId(connection) || '') !== String(session.channelId)
+      || (connection.status != null && connection.status !== 0)) {
+    const joined = await moveAccount(name, task.guildId, session.channelId, normalizeVoiceState(session));
+    if (!joined.ok) return { name, ok: false, error: `Unable to restore saved voice room: ${joined.error || 'voice reconnect failed'}` };
+    session = voiceSessions.get(sessionKey(name, task.guildId)) || session;
+  }
+  const desiredState = stateCycleStateForAccount(task, name);
+  if (!desiredState) return { name, ok: false, error: 'State cycle has no saved state to resume' };
+  return withAccountLock(name, () => executeStateForAccount(name, task, desiredState, expectedRunToken));
+}
 function persistAutomationTasks() {
   const payload = { version: 1, rotations: [...rotations.values()].map(({ timer, running, ...task }) => task), stateCycles: [...stateCycles.values()].map(({ timer, running, ...task }) => task), savedAt: Date.now() };
   const temp = `${AUTOMATION_TASKS_FILE}.tmp`;
@@ -2233,7 +2258,8 @@ async function moveAccountLocked(name, guildId, channelId, opts = {}) {
     const current = { ...(saved || {}), ...(observed || {}) };
     for (const key of ['selfMute', 'selfDeaf', 'selfVideo', 'selfStream']) if (typeof observed?.[key] !== 'boolean' && typeof saved?.[key] === 'boolean') current[key] = saved[key];
     const hasCanonicalConnection = client.voice?.connection
-      && String(voiceConnectionChannelId(client.voice.connection)) === String(channelId);
+      && String(voiceConnectionChannelId(client.voice.connection)) === String(channelId)
+      && (client.voice.connection.status == null || client.voice.connection.status === 0);
     if (current?.channelId === channelId && hasCanonicalConnection) {
       endAccountOperation(operation);
       return { name, ok: true, alreadyIn: true, channelId };
@@ -3129,7 +3155,7 @@ async function restoreAutomationTasks() {
     if (!item.id || !item.guildId || !Array.isArray(item.states) || item.states.length < 2) continue;
     const accounts = cleanAccounts(item.accounts);
     if (taskAccountConflicts(accounts, item.guildId, 'cycle').length) continue;
-    const task = { ...item, type: 'cycle', accounts, accountStateIdx: { ...(item.accountStateIdx || {}) }, stateHistory: { ...(item.stateHistory || {}) }, running: false, active: true, intervalMs: Math.max(1000, Number(item.intervalMs || 300000)), nextAt: Number(item.nextAt || Date.now() + Number(item.intervalMs || 300000)) };
+    const task = { ...item, type: 'cycle', accounts, accountStateIdx: { ...(item.accountStateIdx || {}) }, stateHistory: { ...(item.stateHistory || {}) }, runToken: Number(item.runToken || 0), running: false, active: true, intervalMs: Math.max(1000, Number(item.intervalMs || 300000)), nextAt: Number(item.nextAt || Date.now() + Number(item.intervalMs || 300000)) };
     const runStateCycle = async () => {
       if (!task.active) return;
       if (task.nextAt > Date.now()) { task.timer = setTimeout(runStateCycle, task.nextAt - Date.now()); return; }
@@ -3153,7 +3179,29 @@ async function restoreAutomationTasks() {
       }
     };
     stateCycles.set(task.id, task);
-    task.timer = setTimeout(runStateCycle, Math.max(0, task.nextAt - Date.now()));
+    // The process restart drops the live media transport even though the task
+    // and its last selected state are persisted. Rejoin the saved room and
+    // reapply that same state now, then grant it a full configured interval;
+    // do not wait for an old/overdue nextAt and jump straight to another state.
+    task.running = true;
+    const restoreRunToken = task.runToken;
+    setImmediate(async () => {
+      try {
+        task.lastResults = await mapWithConcurrency(task.accounts, AUTOMATION_CONCURRENCY, async (name) => {
+          const result = await withResultRetry(() => restoreStateCycleAccount(name, task, restoreRunToken));
+          return recordTaskResult(task, result);
+        });
+        task.nextAt = Date.now() + task.intervalMs;
+        persistAutomationTasks();
+        emitLive('task.restored', { id: task.id, taskType: 'cycle', nextAt: task.nextAt, results: task.lastResults });
+      } catch (error) {
+        logMediaEvent('error', 'state_cycle.restore_failed', { taskId: task.id, error: error?.message || String(error) });
+        task.nextAt = Date.now() + task.intervalMs;
+      } finally {
+        task.running = false;
+        if (task.active) task.timer = setTimeout(runStateCycle, Math.max(1000, task.nextAt - Date.now()));
+      }
+    });
   }
 }
 app.get('/{*splat}', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
@@ -3164,4 +3212,4 @@ if (require.main === module) {
   process.once('SIGINT', () => { persistBeforeExit(); process.exit(0); });
 }
 
-module.exports = { app, clients, voiceSessions, rotations, stateCycles, playingSessions, stopPlayingSession, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, isAccountManagedByActiveStateCycle, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, hardenVoiceConnection, cleanupPrimaryStreamAttempt, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanAccountRecords, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, isRecoverableDiscordInteractionError };
+module.exports = { app, clients, voiceSessions, rotations, stateCycles, stateCycleStateForAccount, playingSessions, stopPlayingSession, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, isAccountManagedByActiveStateCycle, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, hardenVoiceConnection, cleanupPrimaryStreamAttempt, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, ensureSyntheticVideo, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanAccountRecords, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, isRecoverableDiscordInteractionError };
