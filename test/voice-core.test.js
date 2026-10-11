@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
-const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, cleanAccountRecords, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanupPrimaryStreamAttempt, isRecoverableDiscordInteractionError } = require('../server');
+const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, recordSuccessfulCycleState, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, cleanAccountRecords, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanupPrimaryStreamAttempt, isRecoverableDiscordInteractionError } = require('../server');
 
 test('classifies stale Discord component validation failures as recoverable', () => {
   assert.equal(isRecoverableDiscordInteractionError({ code: 50035, message: 'DiscordAPIError: Invalid Form Body' }), true);
@@ -174,6 +174,16 @@ test('keeps state-cycle choices random and independent per account without skipp
   } finally {
     Math.random = originalRandom;
   }
+});
+
+test('does not mark a failed state as completed in the cycle history', () => {
+  const task = { states: [{ selfVideo: true }, { selfStream: true }], stateHistory: { alpha: [1] }, accountStateIdx: { alpha: 1 } };
+  assert.equal(recordSuccessfulCycleState(task, 'alpha', 0, false), false);
+  assert.deepEqual(task.stateHistory.alpha, [1]);
+  assert.equal(task.accountStateIdx.alpha, 1);
+  assert.equal(recordSuccessfulCycleState(task, 'alpha', 0, true), true);
+  assert.deepEqual(task.stateHistory.alpha, [1, 0]);
+  assert.equal(task.accountStateIdx.alpha, 0);
 });
 
 test('verifies camera and Go Live state against the actual account voice state', () => {
