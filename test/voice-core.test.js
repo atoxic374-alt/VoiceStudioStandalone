@@ -497,6 +497,43 @@ test('continues Playing when the optional follow-up message cannot be sent', asy
   }
 });
 
+test('captures Invalid Form Body from the component REST request and skips the rejected button', async () => {
+  const account = 'playing-invalid-component';
+  const { EventEmitter } = require('node:events');
+  const eventClient = new EventEmitter();
+  eventClient.incrementMaxListeners = () => {};
+  eventClient.decrementMaxListeners = () => {};
+  eventClient.sessionId = 'session';
+  eventClient.api = { interactions: { post: async () => { const error = new Error('DiscordAPIError[50035]: Invalid Form Body'); error.code = 50035; throw error; } } };
+  const message = {
+    id: 'invalid-component-message',
+    createdTimestamp: Date.now(),
+    guildId: 'guild',
+    channelId: 'text-invalid',
+    applicationId: 'application',
+    author: { id: 'application' },
+    flags: { bitfield: 0 },
+    client: eventClient,
+    components: [{ components: [{ type: 2, customId: 'stale-button', label: 'Join' }] }],
+    resolveComponent: (customId) => customId === 'stale-button' ? { type: 'BUTTON', customId, disabled: false } : null,
+    clickButton: () => { throw new Error('fallback must not be used'); },
+  };
+  const channel = { messages: { fetch: async () => new Map([[message.id, message]]) } };
+  clients.set(account, { client: { channels: { fetch: async () => channel } } });
+  const session = { account, channelId: 'text-invalid', steps: [{ button: 'Join' }], currentIndex: 0 };
+  try {
+    const result = await sendPlayingPhrase(session);
+    assert.equal(result.ok, true);
+    assert.equal(result.skipped, true);
+    assert.equal(result.clickFailed, true);
+    assert.match(result.error, /Invalid Form Body/);
+    assert.equal(session.lastAction.clickFailed, true);
+    assert.equal(eventClient.listenerCount('messageCreate'), 1, 'waiter is consumed safely and expires without an unhandled rejection');
+  } finally {
+    clients.delete(account);
+  }
+});
+
 test('uses the current step and exact button label when several buttons are present', async () => {
   const account = 'playing-exact-button';
   const sent = [];

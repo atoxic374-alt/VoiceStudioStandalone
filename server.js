@@ -5,7 +5,7 @@ const crypto = require('crypto');
 const { execFileSync, spawn } = require('child_process');
 const FFMPEG_PATH = require('ffmpeg-static');
 const { EventEmitter } = require('events');
-const { Client } = require('discord.js-selfbot-v13');
+const { Client, Constants, SnowflakeUtil, Util } = require('discord.js-selfbot-v13');
 const helmet = require('helmet');
 
 const AUTH_COOKIE = 'voice_studio_auth';
@@ -570,6 +570,49 @@ function messageButtons(message) { return (message?.components || []).flatMap((r
 function normalizePlayingButton(value) { return String(value || '').normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').replace(/\s+/g, ' ').trim().toLocaleLowerCase(); }
 async function dispatchPlayingButton(message, customId, details, canContinue = () => true) {
   if (!canContinue()) return { ok: false, stopped: true, error: 'Playing session stopped before click' };
+  const client = message?.client;
+  if (client?.api?.interactions?.post && client.sessionId && message?.resolveComponent) {
+    const button = message.resolveComponent(customId);
+    if (!button || button.type !== 'BUTTON' || button.disabled) {
+      const error = !button ? 'BUTTON_NOT_FOUND' : 'BUTTON_CANNOT_CLICK';
+      logPlayingEvent('button.click.failed', { ...details, error });
+      return { ok: false, skip: true, error };
+    }
+    const nonce = SnowflakeUtil.generate();
+    const interaction = Util.createPromiseInteraction(client, nonce, 5000, true, message);
+    // Consume the waiter if Discord rejects the REST request before an app
+    // response arrives. This library's Message.clickButton() fires the REST
+    // request without returning it, which otherwise leaks Invalid Form Body
+    // as an unhandled rejection and floods the service logs.
+    interaction.catch(() => {});
+    const data = {
+      type: Constants.InteractionTypes.MESSAGE_COMPONENT,
+      nonce,
+      guild_id: message.guildId,
+      channel_id: message.channelId,
+      message_id: message.id,
+      application_id: message.applicationId ?? message.author?.id,
+      session_id: client.sessionId,
+      message_flags: message.flags?.bitfield ?? 0,
+      data: { component_type: Constants.MessageComponentTypes.BUTTON, custom_id: button.customId },
+    };
+    try {
+      await client.api.interactions.post({ data });
+    } catch (error) {
+      const errorText = error?.message || String(error);
+      const invalidComponent = isRecoverableDiscordInteractionError(error);
+      const rateLimited = error?.status === 429 || /429|rate.?limit|too many requests/i.test(errorText);
+      logPlayingEvent(rateLimited ? 'safety.rate-limited' : invalidComponent ? 'button.click.invalid_component' : 'button.click.failed', { ...details, code: error?.code ?? null, error: errorText });
+      return { ok: false, skip: true, invalidComponent, rateLimited, error: errorText };
+    }
+    const response = await Promise.race([
+      interaction.then(() => ({ responded: true })).catch((error) => ({ error })),
+      new Promise((resolve) => setTimeout(() => resolve({ timedOut: true }), 1500)),
+    ]);
+    if (response.timedOut) { logPlayingEvent('button.click.no-response', { ...details, error: 'No response from Application; interaction was dispatched' }); return { ok: true, noResponse: true }; }
+    if (response.error) { const error = response.error.message || String(response.error); const rateLimited = response.error.status === 429 || /429|rate.?limit|too many requests/i.test(error); logPlayingEvent(rateLimited ? 'safety.rate-limited' : 'button.click.failed', { ...details, error }); return { ok: false, skip: true, rateLimited, error }; }
+    return { ok: true, responded: true };
+  }
   let interaction;
   try { interaction = message.clickButton(customId); } catch (error) { const messageText = error.message || String(error); const rateLimited = error.status === 429 || /429|rate.?limit|too many requests/i.test(messageText); logPlayingEvent(rateLimited ? 'safety.rate-limited' : 'button.click.failed', { ...details, error: messageText }); return { ok: false, skip: true, rateLimited, error: messageText }; }
   const response = await Promise.race([
