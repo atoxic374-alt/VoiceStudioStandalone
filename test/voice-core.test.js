@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
-const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, recordSuccessfulCycleState, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, registerAccountStreamer, mediaStreamers, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, cleanAccountRecords, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanupPrimaryStreamAttempt, isRecoverableDiscordInteractionError } = require('../server');
+const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, recordSuccessfulCycleState, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, registerAccountStreamer, mediaStreamers, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, schedulePlaying, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, cleanAccountRecords, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanupPrimaryStreamAttempt, isRecoverableDiscordInteractionError } = require('../server');
 
 test('classifies stale Discord component validation failures as recoverable', () => {
   assert.equal(isRecoverableDiscordInteractionError({ code: 50035, message: 'DiscordAPIError: Invalid Form Body' }), true);
@@ -597,6 +597,57 @@ test('stopping a Playing session invalidates its pending run', () => {
     assert.equal(session.timer, null);
   } finally {
     playingSessions.delete(account);
+  }
+});
+
+test('stop prevents an in-flight Playing interaction from continuing or scheduling duplicate clicks', async () => {
+  const account = 'playing-stop-inflight';
+  const eventClient = new EventEmitter();
+  eventClient.incrementMaxListeners = () => {};
+  eventClient.decrementMaxListeners = () => {};
+  eventClient.sessionId = 'session';
+  let releasePost;
+  let signalPostStarted;
+  const postStarted = new Promise((resolve) => { signalPostStarted = resolve; });
+  let postCount = 0;
+  let sentPhrase = false;
+  eventClient.api = { interactions: { post: ({ data }) => {
+    postCount += 1;
+    signalPostStarted(data.nonce);
+    return new Promise((resolve) => { releasePost = () => { eventClient.emit('messageCreate', { nonce: data.nonce }); resolve(); }; });
+  } } };
+  const message = {
+    id: 'inflight-message', createdTimestamp: Date.now(), guildId: 'guild', channelId: 'text-inflight',
+    applicationId: 'application', author: { id: 'application' }, flags: { bitfield: 0 }, client: eventClient,
+    components: [{ components: [{ type: 2, customId: 'join', label: 'Join' }] }],
+    resolveComponent: (customId) => ({ type: 'BUTTON', customId, disabled: false }),
+  };
+  const channel = {
+    messages: { fetch: async () => new Map([[message.id, message]]) },
+    send: async () => { sentPhrase = true; },
+  };
+  const session = { account, channelId: 'text-inflight', steps: [{ button: 'Join', phrase: 'should-not-send' }], intervalMs: 10, active: true, status: 'running', timer: null, currentIndex: 0, runToken: 1 };
+  const saved = playingSessions.get(account);
+  playingSessions.set(account, session);
+  clients.set(account, { client: { channels: { fetch: async () => channel } } });
+  try {
+    schedulePlaying(session, 0);
+    schedulePlaying(session, 0);
+    const nonce = await postStarted;
+    assert.equal(postCount, 1, 'duplicate scheduling must not dispatch concurrent clicks');
+    assert.equal(stopPlayingSession(account, 'test-stop-inflight'), true);
+    releasePost();
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assert.equal(session.active, false);
+    assert.equal(session.timer, null);
+    assert.equal(postCount, 1, `only the already-submitted request ${nonce} may complete`);
+    assert.equal(sentPhrase, false, 'stopped session must not continue to the follow-up action');
+    assert.equal(session.currentIndex, 0);
+  } finally {
+    clearTimeout(session.timer);
+    playingSessions.delete(account);
+    if (saved) playingSessions.set(account, saved);
+    clients.delete(account);
   }
 });
 
