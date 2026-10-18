@@ -400,14 +400,20 @@ test('starts primary media before waiting for Discord stream signaling', async (
   assert.deepEqual(dispatcher, { id: 'dispatcher' });
 });
 
-test('cleans a half-open primary stream connection after a failed readiness attempt', () => {
+test('cleans a half-open primary stream connection without crashing on a delayed websocket error', async () => {
   let disconnected = 0;
-  const streamConnection = { disconnect: () => { disconnected += 1; } };
+  const streamConnection = new EventEmitter();
+  streamConnection.disconnect = () => {
+    disconnected += 1;
+    setImmediate(() => streamConnection.emit('error', new Error('WebSocket was closed before the connection was established')));
+  };
   const connection = { streamConnection };
   assert.equal(cleanupPrimaryStreamAttempt(connection, streamConnection), true);
   assert.equal(disconnected, 1);
   assert.equal(connection.streamConnection, null);
   assert.equal(cleanupPrimaryStreamAttempt(connection, null), false);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(streamConnection.listenerCount('error'), 1);
 });
 
 test('destroys a primary dispatcher when media start is cancelled during signaling', async () => {

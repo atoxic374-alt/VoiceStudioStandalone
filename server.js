@@ -278,6 +278,7 @@ const voiceStateOperations = new Map();
 const syntheticStreams = new Map();
 const mediaStreamers = new Map();
 const streamerOwners = new WeakMap();
+const voiceTransportErrorHandlers = new WeakSet();
 const pendingMediaRestarts = new Map();
 const mediaRestartAttempts = new Map();
 const accountOperations = new Map();
@@ -1018,6 +1019,10 @@ function stopSyntheticStream(name, { leaveVoice = false, silent = false, invalid
   const trackedStreamer = mediaStreamers.get(name);
   const streamers = [...new Set([active?.streamer, trackedStreamer].filter(Boolean))];
   if (active) {
+    attachVoiceTransportErrorHandler(active.streamConnection, { account: name, transport: 'stream', guildId: active.guildId, channelId: active.channelId });
+    attachVoiceTransportErrorHandler(active.connection, { account: name, transport: 'voice', guildId: active.guildId, channelId: active.channelId });
+    attachVoiceTransportErrorHandler(active.streamer?.voiceConnection, { account: name, transport: 'streamer-voice', guildId: active.guildId, channelId: active.channelId });
+    attachVoiceTransportErrorHandler(active.streamer?.voiceConnection?.streamConnection, { account: name, transport: 'stream', guildId: active.guildId, channelId: active.channelId });
     try { active.controller?.abort?.(); } catch {}
     try { active.sourceProcess?.kill?.('SIGTERM'); } catch {}
     // During a room move, do not send STREAM_DELETE/OP4 from the dedicated
@@ -1042,6 +1047,8 @@ function stopSyntheticStream(name, { leaveVoice = false, silent = false, invalid
   }
   syntheticStreams.delete(name);
   for (const streamer of streamers) {
+    attachVoiceTransportErrorHandler(streamer.voiceConnection, { account: name, transport: 'streamer-voice' });
+    attachVoiceTransportErrorHandler(streamer.voiceConnection?.streamConnection, { account: name, transport: 'stream' });
     try { streamer.stopStream?.(); } catch {}
     try { streamer.voiceConnection?.stop?.(); } catch {}
     try { streamer._gatewayEmitter?.removeAllListeners?.(); } catch {}
@@ -1145,6 +1152,7 @@ function cleanupPrimaryStreamAttempt(connection, streamConnection = connection?.
   // before its WebRTC promise settles. If that promise times out, leaving it
   // cached makes the next start reuse a half-open transport and can cause
   // repeated STREAM_SERVER_UPDATE/voice-socket failures.
+  attachVoiceTransportErrorHandler(streamConnection, { transport: 'primary-stream', channelId: voiceConnectionChannelId(streamConnection) });
   try { streamConnection.disconnect?.(); } catch {}
   if (connection?.streamConnection === streamConnection) {
     try { connection.streamConnection = null; } catch {}
@@ -1175,7 +1183,23 @@ function compactPrimaryVoiceClosingListeners(connection) {
 function hardenVoiceConnection(connection) {
   if (!connection || typeof connection !== 'object') return false;
   connection.setMaxListeners?.(0);
+  attachVoiceTransportErrorHandler(connection, { transport: 'voice', channelId: voiceConnectionChannelId(connection) });
   return compactPrimaryVoiceClosingListeners(connection);
+}
+function attachVoiceTransportErrorHandler(connection, details = {}) {
+  if (!connection || typeof connection.on !== 'function' || voiceTransportErrorHandlers.has(connection)) return false;
+  voiceTransportErrorHandlers.add(connection);
+  connection.on('error', (error) => {
+    const cause = error?.error || error?.cause || error;
+    const message = String(cause?.message || error?.message || cause || 'Unknown voice transport error');
+    const expectedCloseRace = /websocket was closed before the connection was established/i.test(message);
+    logMediaEvent(expectedCloseRace ? 'warn' : 'error', 'voice.transport_error_captured', {
+      ...details,
+      error: message.slice(0, 500),
+      expectedCloseRace,
+    });
+  });
+  return true;
 }
 function primaryMediaRetryError(name, guildId, channelId, mediaKind) {
   const previous = primaryMediaFailures.get(name);
@@ -1460,6 +1484,7 @@ async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live',
         // voice session; it never opens a competing Gateway/voice handshake.
         const connecting = connection.createStreamConnection();
         pendingStreamConnection = connection.streamConnection;
+        attachVoiceTransportErrorHandler(pendingStreamConnection, { account: name, transport: 'primary-stream', guildId, channelId: session.channelId });
         streamConnection = await withTimeout(connecting, MEDIA_STREAM_TIMEOUT_MS, `Discord media connection timed out after ${Math.round(MEDIA_STREAM_TIMEOUT_MS / 1000)} seconds`);
         pendingStreamConnection = streamConnection;
         dispatcher = await playPrimaryMediaAndWait(streamConnection, source, Promise.resolve(), isCurrent);
