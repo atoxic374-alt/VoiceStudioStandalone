@@ -1,7 +1,54 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
-const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, recordSuccessfulCycleState, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, registerAccountStreamer, mediaStreamers, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, schedulePlaying, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, cleanAccountRecords, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanupPrimaryStreamAttempt, isRecoverableDiscordInteractionError } = require('../server');
+const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, recordSuccessfulCycleState, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, registerAccountStreamer, mediaStreamers, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, schedulePlaying, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, cleanAccountRecords, buildAccountSnapshot, safeErrorSummary, guardVoiceWebSocketTeardown, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanupPrimaryStreamAttempt, isRecoverableDiscordInteractionError } = require('../server');
+
+test('captures delayed errors from a WebSocket after voice teardown without suppressing live errors', () => {
+  const streamConnection = new EventEmitter();
+  const voiceWebSocket = new EventEmitter();
+  const forwarded = [];
+  voiceWebSocket.dead = false;
+  voiceWebSocket.on('error', (error) => streamConnection.emit('error', error));
+  voiceWebSocket.ws = { onerror: (error) => voiceWebSocket.emit('error', error) };
+  streamConnection.sockets = { ws: voiceWebSocket };
+  streamConnection.on('error', (error) => forwarded.push(error));
+  assert.equal(guardVoiceWebSocketTeardown(streamConnection, { account: 'teardown-test', transport: 'stream' }), true);
+  const closeRace = new Error('WebSocket was closed before the connection was established');
+  voiceWebSocket.removeAllListeners('error');
+  voiceWebSocket.dead = true;
+  assert.doesNotThrow(() => voiceWebSocket.ws.onerror(closeRace));
+  assert.deepEqual(forwarded, []);
+  voiceWebSocket.dead = false;
+  voiceWebSocket.on('error', (error) => streamConnection.emit('error', error));
+  const liveFailure = new Error('Unexpected server response: 522');
+  voiceWebSocket.ws.onerror(liveFailure);
+  assert.deepEqual(forwarded, [liveFailure]);
+});
+
+test('account diagnostic snapshots never retain credentials', () => {
+  const snapshot = buildAccountSnapshot([
+    { name: 'Alpha', token: 'secret-account-token', savedAt: 123, status: 'connected' },
+    { name: 'Beta', token: 'another-secret', status: 'failed', error: 'Invalid token=another-secret', savedAt: 789, lastAttemptAt: 456 },
+  ]);
+  assert.deepEqual(snapshot, [
+    { name: 'Alpha', status: 'connected', savedAt: 123 },
+    { name: 'Beta', status: 'failed', savedAt: 789, lastAttemptAt: 456, error: 'Invalid token=[redacted]' },
+  ]);
+  assert.doesNotMatch(JSON.stringify(snapshot), /secret-account-token|another-secret/);
+});
+
+test('summarizes unhandled errors without serializing request headers or stacks', () => {
+  const summary = safeErrorSummary({
+    name: 'DiscordError', code: 'E_FAIL', status: 522,
+    message: 'request failed with token=secret-value',
+    request: { headers: { Authorization: 'Bearer sensitive-value' } },
+    stack: 'private stack trace',
+  });
+  assert.deepEqual(summary, {
+    name: 'DiscordError', message: 'request failed with token=[redacted]', code: 'E_FAIL', status: '522',
+  });
+  assert.doesNotMatch(JSON.stringify(summary), /sensitive-value|secret-value|stack/);
+});
 
 test('classifies stale Discord component validation failures as recoverable', () => {
   assert.equal(isRecoverableDiscordInteractionError({ code: 50035, message: 'DiscordAPIError: Invalid Form Body' }), true);

@@ -84,6 +84,18 @@ function logMediaEvent(level, event, details = {}) {
   try { fs.appendFileSync(MEDIA_LOG_FILE, `${JSON.stringify(record)}\n`, { mode: 0o600 }); } catch (error) { console.warn('[media-log] write failed:', error.message); }
   if (level === 'error') console.warn(`[media:${event}]`, details.error || details.stage || 'operation failed');
 }
+function safeErrorSummary(error) {
+  const source = error && typeof error === 'object' ? error : { message: String(error ?? 'Unknown error') };
+  const summary = {
+    name: String(source.name || 'Error').slice(0, 80),
+    message: redact(source.message || 'Unknown error').slice(0, 500),
+  };
+  for (const key of ['code', 'status', 'statusCode']) {
+    const value = source[key];
+    if (typeof value === 'string' || typeof value === 'number') summary[key] = String(value).slice(0, 80);
+  }
+  return summary;
+}
 function isRecoverableDiscordInteractionError(error) {
   const message = String(error?.message || error || '');
   return Number(error?.code) === 50035
@@ -93,10 +105,11 @@ function isRecoverableDiscordInteractionError(error) {
 // the message has changed. Do not let that rejection terminate Railway.
 process.on('unhandledRejection', (error) => {
   if (isRecoverableDiscordInteractionError(error)) {
-    console.warn('[discord] ignored stale or invalid component interaction:', String(error.message || error));
+    console.warn('[discord] ignored stale or invalid component interaction:', safeErrorSummary(error));
     return;
   }
-  console.error('[process] unhandled rejection:', error);
+  // Do not dump request objects, headers, cookies, or dependency stacks to Railway logs.
+  console.error('[process] unhandled rejection:', safeErrorSummary(error));
 });
 
 // Account tokens are persisted only as an authenticated AES-256-GCM payload.
@@ -120,11 +133,31 @@ function saveEncryptedRecords(file, records) {
   fs.renameSync(temp, file);
   try { fs.chmodSync(file, 0o600); } catch {}
 }
-function savePlainTokenSnapshot(file, records) {
+function saveAccountSnapshot(file, records) {
   const temp = `${file}.tmp`;
   fs.writeFileSync(temp, JSON.stringify(records, null, 2) + '\n', { mode: 0o600 });
   fs.renameSync(temp, file);
   try { fs.chmodSync(file, 0o600); } catch {}
+}
+function buildAccountSnapshot(records, defaultStatus = 'unknown') {
+  const result = [];
+  const seenNames = new Set();
+  for (const item of Array.isArray(records) ? records : []) {
+    const name = String(item?.name || '').trim().slice(0, 48);
+    const nameKey = name.toLocaleLowerCase();
+    if (!name || seenNames.has(nameKey)) continue;
+    seenNames.add(nameKey);
+    const snapshot = {
+      name,
+      status: String(item?.status || defaultStatus).slice(0, 24),
+      savedAt: Number(item?.savedAt) || Date.now(),
+    };
+    const lastAttemptAt = Number(item?.lastAttemptAt);
+    if (Number.isFinite(lastAttemptAt) && lastAttemptAt > 0) snapshot.lastAttemptAt = lastAttemptAt;
+    if (item?.error) snapshot.error = redact(item.error).slice(0, 300);
+    result.push(snapshot);
+  }
+  return result;
 }
 function saveAccounts(records) {
   saveEncryptedRecords(ACCOUNT_FILE, records);
@@ -203,37 +236,20 @@ function persistConnectedAccounts() {
   }
   catch (error) { console.warn('[accounts] unable to persist encrypted account file:', error.message); }
 }
-function cleanFailedAccountRecords(records) {
-  const result = [];
-  const seen = new Set();
-  for (const item of Array.isArray(records) ? records : []) {
-    const token = String(item?.token || '').trim();
-    const name = String(item?.name || '').trim().slice(0, 48);
-    if (!token || !name || seen.has(token.toLowerCase())) continue;
-    seen.add(token.toLowerCase());
-    result.push({
-      name,
-      token,
-      status: String(item?.status || 'failed').slice(0, 24),
-      error: redact(item?.error || 'Connection failed').slice(0, 300),
-      savedAt: Number(item?.savedAt) || Date.now(),
-      lastAttemptAt: Number(item?.lastAttemptAt) || Date.now(),
-    });
-  }
-  return result;
-}
 function persistAccountSnapshots() {
   try {
-    const active = cleanAccountRecords([...clients.entries()].map(([name, entry]) => ({
+    const active = buildAccountSnapshot([...clients.entries()].map(([name, entry]) => ({
       name,
-      token: entry.token,
+      status: 'connected',
       savedAt: entry.savedAt,
-    })));
-    const activeTokens = new Set(active.map((item) => item.token.toLowerCase()));
-    const failed = cleanFailedAccountRecords([...failedAccountRecords.values()]
-      .filter((item) => !activeTokens.has(String(item.token || '').toLowerCase())));
-    savePlainTokenSnapshot(ACTIVE_TOKENS_FILE, active);
-    savePlainTokenSnapshot(FAILED_TOKENS_FILE, failed);
+    })), 'connected');
+    const activeNames = new Set(active.map((item) => item.name.toLocaleLowerCase()));
+    const failed = buildAccountSnapshot([...failedAccountRecords.values()]
+      .filter((item) => !activeNames.has(String(item.name || '').toLocaleLowerCase())), 'failed');
+    // These legacy filenames are retained for compatibility, but snapshots now
+    // contain account metadata only. Credentials remain exclusively in accounts.enc.
+    saveAccountSnapshot(ACTIVE_TOKENS_FILE, active);
+    saveAccountSnapshot(FAILED_TOKENS_FILE, failed);
   } catch (error) {
     console.warn('[accounts] unable to persist active/failed token snapshots:', error.message);
   }
@@ -279,6 +295,8 @@ const syntheticStreams = new Map();
 const mediaStreamers = new Map();
 const streamerOwners = new WeakMap();
 const voiceTransportErrorHandlers = new WeakSet();
+const guardedVoiceWebSockets = new WeakSet();
+const voiceTransportErrorLogState = new Map();
 const pendingMediaRestarts = new Map();
 const mediaRestartAttempts = new Map();
 const accountOperations = new Map();
@@ -1023,6 +1041,10 @@ function stopSyntheticStream(name, { leaveVoice = false, silent = false, invalid
     attachVoiceTransportErrorHandler(active.connection, { account: name, transport: 'voice', guildId: active.guildId, channelId: active.channelId });
     attachVoiceTransportErrorHandler(active.streamer?.voiceConnection, { account: name, transport: 'streamer-voice', guildId: active.guildId, channelId: active.channelId });
     attachVoiceTransportErrorHandler(active.streamer?.voiceConnection?.streamConnection, { account: name, transport: 'stream', guildId: active.guildId, channelId: active.channelId });
+    guardVoiceWebSocketTeardown(active.streamConnection, { account: name, transport: 'stream', guildId: active.guildId, channelId: active.channelId });
+    guardVoiceWebSocketTeardown(active.connection, { account: name, transport: 'voice', guildId: active.guildId, channelId: active.channelId });
+    guardVoiceWebSocketTeardown(active.streamer?.voiceConnection, { account: name, transport: 'streamer-voice', guildId: active.guildId, channelId: active.channelId });
+    guardVoiceWebSocketTeardown(active.streamer?.voiceConnection?.streamConnection, { account: name, transport: 'stream', guildId: active.guildId, channelId: active.channelId });
     try { active.controller?.abort?.(); } catch {}
     try { active.sourceProcess?.kill?.('SIGTERM'); } catch {}
     // During a room move, do not send STREAM_DELETE/OP4 from the dedicated
@@ -1049,6 +1071,8 @@ function stopSyntheticStream(name, { leaveVoice = false, silent = false, invalid
   for (const streamer of streamers) {
     attachVoiceTransportErrorHandler(streamer.voiceConnection, { account: name, transport: 'streamer-voice' });
     attachVoiceTransportErrorHandler(streamer.voiceConnection?.streamConnection, { account: name, transport: 'stream' });
+    guardVoiceWebSocketTeardown(streamer.voiceConnection, { account: name, transport: 'streamer-voice' });
+    guardVoiceWebSocketTeardown(streamer.voiceConnection?.streamConnection, { account: name, transport: 'stream' });
     try { streamer.stopStream?.(); } catch {}
     try { streamer.voiceConnection?.stop?.(); } catch {}
     try { streamer._gatewayEmitter?.removeAllListeners?.(); } catch {}
@@ -1153,6 +1177,7 @@ function cleanupPrimaryStreamAttempt(connection, streamConnection = connection?.
   // cached makes the next start reuse a half-open transport and can cause
   // repeated STREAM_SERVER_UPDATE/voice-socket failures.
   attachVoiceTransportErrorHandler(streamConnection, { transport: 'primary-stream', channelId: voiceConnectionChannelId(streamConnection) });
+  guardVoiceWebSocketTeardown(streamConnection, { transport: 'primary-stream', channelId: voiceConnectionChannelId(streamConnection) });
   try { streamConnection.disconnect?.(); } catch {}
   if (connection?.streamConnection === streamConnection) {
     try { connection.streamConnection = null; } catch {}
@@ -1193,13 +1218,58 @@ function attachVoiceTransportErrorHandler(connection, details = {}) {
     const cause = error?.error || error?.cause || error;
     const message = String(cause?.message || error?.message || cause || 'Unknown voice transport error');
     const expectedCloseRace = /websocket was closed before the connection was established/i.test(message);
-    logMediaEvent(expectedCloseRace ? 'warn' : 'error', 'voice.transport_error_captured', {
+    logVoiceTransportError(expectedCloseRace ? 'warn' : 'error', 'voice.transport_error_captured', {
       ...details,
       error: message.slice(0, 500),
       expectedCloseRace,
     });
   });
   return true;
+}
+function logVoiceTransportError(level, event, details) {
+  const key = JSON.stringify([details.account || '', details.transport || '', details.error || '']);
+  const now = Date.now();
+  const previous = voiceTransportErrorLogState.get(key);
+  if (previous && now - previous.lastLoggedAt < 30_000) {
+    previous.suppressed += 1;
+    previous.lastSeenAt = now;
+    return false;
+  }
+  const suppressedCount = previous?.suppressed || 0;
+  voiceTransportErrorLogState.set(key, { lastLoggedAt: now, lastSeenAt: now, suppressed: 0 });
+  if (voiceTransportErrorLogState.size > 500) {
+    for (const [oldKey, state] of voiceTransportErrorLogState) {
+      if (now - state.lastSeenAt > 60_000 || voiceTransportErrorLogState.size > 750) voiceTransportErrorLogState.delete(oldKey);
+    }
+  }
+  logMediaEvent(level, event, { ...details, ...(suppressedCount ? { suppressedCount } : {}) });
+  return true;
+}
+function guardVoiceWebSocketTeardown(connection, details = {}) {
+  const voiceWebSocket = connection?.sockets?.ws;
+  const socket = voiceWebSocket?.ws;
+  const originalOnError = socket?.onerror;
+  if (!voiceWebSocket || !socket || typeof originalOnError !== 'function' || guardedVoiceWebSockets.has(socket)) return false;
+  try {
+    socket.onerror = function onClosingVoiceWebSocketError(error) {
+      if (!voiceWebSocket.dead) return originalOnError.call(this, error);
+      const cause = error?.error || error?.cause || error;
+      const message = String(cause?.message || error?.message || cause || 'Voice WebSocket failed while closing');
+      const expectedCloseRace = /websocket was closed before the connection was established/i.test(message);
+      // VoiceConnection.cleanup() removes the library's forwarding error
+      // listener before a CONNECTING socket finishes closing. Capture that
+      // late event here so EventEmitter cannot crash the whole process.
+      logVoiceTransportError('warn', 'voice.transport_teardown_error_captured', {
+        ...details,
+        error: message.slice(0, 500),
+        expectedCloseRace,
+      });
+    };
+    guardedVoiceWebSockets.add(socket);
+    return true;
+  } catch {
+    return false;
+  }
 }
 function primaryMediaRetryError(name, guildId, channelId, mediaKind) {
   const previous = primaryMediaFailures.get(name);
@@ -3374,4 +3444,4 @@ if (require.main === module) {
   process.once('SIGINT', () => { persistBeforeExit(); process.exit(0); });
 }
 
-module.exports = { app, clients, voiceSessions, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, recordSuccessfulCycleState, playingSessions, stopPlayingSession, schedulePlaying, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, hardenVoiceConnection, cleanupPrimaryStreamAttempt, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, registerAccountStreamer, mediaStreamers, mediaQueueSnapshot, ensureSyntheticVideo, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanAccountRecords, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, isRecoverableDiscordInteractionError };
+module.exports = { app, clients, voiceSessions, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, recordSuccessfulCycleState, playingSessions, stopPlayingSession, schedulePlaying, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, hardenVoiceConnection, cleanupPrimaryStreamAttempt, guardVoiceWebSocketTeardown, safeErrorSummary, buildAccountSnapshot, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, registerAccountStreamer, mediaStreamers, mediaQueueSnapshot, ensureSyntheticVideo, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanAccountRecords, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, isRecoverableDiscordInteractionError };
