@@ -124,16 +124,41 @@ async function waitForVoiceStateOperation(operationId) {
   try { return await Promise.race([eventResult, pollResult]); }
   finally { pendingVoiceStateOperations.delete(operationId); }
 }
+const apiGetRequests = new Map();
 const api = async (url, options = {}) => {
-  const response = await fetch(url, { ...options, credentials: 'include', cache: 'no-store', headers: { 'Content-Type': 'application/json', 'X-Voice-Studio': '1', ...(options.headers || {}) } });
-  const payload = await response.json().catch(() => ({}));
-  if (response.status === 401 && !options._authRetry) {
-    await requestAuthentication();
-    return api(url, { ...options, _authRetry: true });
-  }
-  if (!response.ok || payload.success === false) throw new Error(payload.error || `Request failed (${response.status})`);
-  if (payload.pending && payload.operationId) return waitForVoiceStateOperation(payload.operationId);
-  return payload;
+  const method = String(options.method || 'GET').toUpperCase();
+  const dedupeKey = method === 'GET' && !options.signal ? String(url) : null;
+  if (dedupeKey && apiGetRequests.has(dedupeKey)) return apiGetRequests.get(dedupeKey);
+  const request = (async () => {
+    let rateLimitRetries = 0;
+    let authRetried = false;
+    while (true) {
+      const fetchOptions = { ...options };
+      delete fetchOptions._authRetry;
+      delete fetchOptions._rateLimitRetry;
+      const response = await fetch(url, { ...fetchOptions, credentials: 'include', cache: 'no-store', headers: { 'Content-Type': 'application/json', 'X-Voice-Studio': '1', ...(options.headers || {}) } });
+      const payload = await response.json().catch(() => ({}));
+      if (response.status === 401 && !authRetried) {
+        authRetried = true;
+        await requestAuthentication();
+        continue;
+      }
+      if (response.status === 429 && method === 'GET' && rateLimitRetries < 2) {
+        rateLimitRetries += 1;
+        const retryAfter = Number(response.headers.get('Retry-After'));
+        const waitMs = Number.isFinite(retryAfter) && retryAfter > 0 ? Math.min(retryAfter, 60) * 1000 : rateLimitRetries * 1500;
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+        continue;
+      }
+      if (!response.ok || payload.success === false) throw new Error(payload.error || `Request failed (${response.status})`);
+      if (payload.pending && payload.operationId) return waitForVoiceStateOperation(payload.operationId);
+      return payload;
+    }
+  })();
+  if (!dedupeKey) return request;
+  apiGetRequests.set(dedupeKey, request);
+  request.then(() => apiGetRequests.delete(dedupeKey), () => apiGetRequests.delete(dedupeKey));
+  return request;
 };
 const operationNames = { connect: 'Connect account', 'connect-bulk': 'Connect accounts', join: 'Join voice room', 'join-all': 'Join accounts', leave: 'Leave voice room', state: 'Update voice state', 'rotation/start': 'Start channel rotation', 'rotation/stop': 'Stop channel rotation', 'state-cycle/start': 'Start state cycle', 'state-cycle/stop': 'Stop state cycle' };
 function operationStart(url, body = {}) { const modal = $('#operationModal'); if (!modal) return; const key = Object.keys(operationNames).find((item) => url.includes(item)); $('#operationTitle').textContent = operationNames[key] || 'Processing'; $('#operationSubtitle').textContent = 'Processing in fast batches…'; $('#operationResult').textContent = 'Success: 0 · Failed: 0 · Retries: 0'; $('#operationClose').hidden = true; $('.operation-loader')?.classList.remove('is-done', 'is-error'); const names = Array.isArray(body.accounts) ? body.accounts.map((item) => typeof item === 'string' ? item : item.name).filter(Boolean) : (body.name ? [body.name] : []); const profiles = names.map((name) => state.clients.find((client) => client.name === name) || { name, nickname: name }).filter(Boolean); modal.dataset.accountNames = JSON.stringify(names); $('#operationAccounts').innerHTML = profiles.length ? profiles.map((profile) => `<div class="operation-account" data-operation-name="${escapeHTML(profile.name)}"><span>${profile.avatar ? `<img src="${escapeHTML(profile.avatar)}" alt="" />` : escapeHTML((profile.nickname || profile.name || '?')[0])}</span><strong>${escapeHTML(profile.nickname || profile.displayName || profile.username || profile.name)}</strong><small>${escapeHTML(profile.name)} · Waiting…</small></div>`).join('') : '<div class="operation-empty">Working on the selected accounts…</div>'; modal.hidden = false; }
@@ -612,11 +637,9 @@ async function refreshSessions() {
       renderProfiles(state.clients);
       renderPlayingAccounts();
       updatePlayingSelection();
-      loadPlayingChannels();
       await syncSelectedAccountVoice();
       const data = await api('/api/voice/sessions');
       renderSessions(data.sessions || []);
-      await loadTasks();
     } catch (error) { console.warn('[voice] sessions refresh failed', error); }
     finally { state.refreshPromise = null; }
   })();
@@ -859,7 +882,7 @@ function initActivity() { $('#activityExpandButton')?.addEventListener('click', 
 function openLeaveAll() { const active = state.clients.filter((client) => client.voice); const list = $('#leaveAccountList'); list.innerHTML = active.length ? active.map((client) => `<label class="account-target"><input type="checkbox" value="${escapeHTML(client.name)}" data-leave-guild="${escapeHTML(client.voice.guildId)}" checked /><span class="target-avatar">${client.avatar ? `<img src="${escapeHTML(client.avatar)}" alt="" />` : escapeHTML((client.nickname || '?')[0])}</span><span class="target-copy"><strong>${escapeHTML(client.nickname || client.displayName || client.username || client.name)}</strong><small>${escapeHTML(client.name)} · ${escapeHTML(client.voice.guildName || client.voice.guildId)} · ${escapeHTML(client.voice.channelName || client.voice.channelId)}</small></span></label>`).join('') : '<div class="task-empty">No connected account is currently in voice</div>'; $('#leaveModal').hidden = false; }
 async function leaveAllSelected() { const selected = [...document.querySelectorAll('#leaveAccountList input:checked')].map((input) => ({ name: input.value, guildId: input.dataset.leaveGuild })); if (!selected.length) { toast('اختر حسابًا واحدًا على الأقل', 'error'); return; } const groups = new Map(); selected.forEach((item) => { if (!groups.has(item.guildId)) groups.set(item.guildId, []); groups.get(item.guildId).push(item.name); }); $('#leaveModal').hidden = true; try { for (const [guildId, accounts] of groups) await post('/api/voice/leave', { accounts, guildId });   addActivity('خروج جماعي', `${selected.length} حساب`, 'success'); toast(`تم إخراج ${selected.length} حساب`, 'success'); await refreshSessions(); } catch (error) { toast(error.message, 'error'); } }
 function scheduleLiveRefresh() { clearTimeout(state.liveRefreshTimer); state.liveRefreshTimer = setTimeout(() => refreshSessions().catch(() => {}), 180); }
-function connectLiveEvents() { if (!window.EventSource || state.liveEvents) return; const events = new EventSource('/api/events'); state.liveEvents = events; events.onmessage = (message) => { try { const event = JSON.parse(message.data); if (event.type === 'task.account.updated') { const task = state.tasks.find((item) => item.id === event.id); if (task && event.result) { task.accountStatus = { ...(task.accountStatus || {}), [event.result.name]: event.result }; task.lastResults = [...(task.lastResults || []).filter((item) => item.name !== event.result.name), event.result]; task.nextAt = event.nextAt || task.nextAt; task.currentIdx = event.currentIdx ?? task.currentIdx; renderTasks(state.tasks); if (!$('#taskDetailsModal')?.hidden && $('#taskDetailsTitle')?.textContent) openTaskDetails(task.id); } } if (event.type === 'task.completed') { const task = state.tasks.find((item) => item.id === event.id); if (task) { task.nextAt = event.nextAt || task.nextAt; task.currentIdx = event.currentIdx ?? task.currentIdx; renderTasks(state.tasks); } } if (event.type === 'operation.account.updated') operationAccountProgress(event); if (event.type === 'operation.completed' && event.operation === 'state' && event.operationId) pendingVoiceStateOperations.get(event.operationId)?.({ results: event.results || [], summary: event.summary || null }); if (event.type === 'operation.completed' && event.summary?.failed) toast(`${event.operation}: ${event.summary.failed} failed`, 'error'); if (event.type?.startsWith('playing.')) { loadPlayingSessions(); if (document.querySelector('[data-playing-pane="activity"]')?.classList.contains('is-active')) loadPlayingEvents(); } } catch (error) { console.warn('[live] event handling failed', error); } finally { scheduleLiveRefresh(); } }; events.onerror = () => { events.close(); state.liveEvents = null; setTimeout(connectLiveEvents, 5000); }; }
+function connectLiveEvents() { if (!window.EventSource || state.liveEvents) return; const events = new EventSource('/api/events'); state.liveEvents = events; events.onmessage = (message) => { let refreshAfterEvent = true; try { const event = JSON.parse(message.data); if (event.type === 'health.updated') refreshAfterEvent = false; if (event.type === 'task.account.updated') { const task = state.tasks.find((item) => item.id === event.id); if (task && event.result) { task.accountStatus = { ...(task.accountStatus || {}), [event.result.name]: event.result }; task.lastResults = [...(task.lastResults || []).filter((item) => item.name !== event.result.name), event.result]; task.nextAt = event.nextAt || task.nextAt; task.currentIdx = event.currentIdx ?? task.currentIdx; renderTasks(state.tasks); if (!$('#taskDetailsModal')?.hidden && $('#taskDetailsTitle')?.textContent) openTaskDetails(task.id); } } if (event.type === 'task.completed') { const task = state.tasks.find((item) => item.id === event.id); if (task) { task.nextAt = event.nextAt || task.nextAt; task.currentIdx = event.currentIdx ?? task.currentIdx; renderTasks(state.tasks); } } if (event.type === 'operation.account.updated') operationAccountProgress(event); if (event.type === 'operation.completed' && event.operation === 'state' && event.operationId) pendingVoiceStateOperations.get(event.operationId)?.({ results: event.results || [], summary: event.summary || null }); if (event.type === 'operation.completed' && event.summary?.failed) toast(`${event.operation}: ${event.summary.failed} failed`, 'error'); if (event.type?.startsWith('playing.')) { loadPlayingSessions(); if (document.querySelector('[data-playing-pane="activity"]')?.classList.contains('is-active')) loadPlayingEvents(); } } catch (error) { console.warn('[live] event handling failed', error); } finally { if (refreshAfterEvent) scheduleLiveRefresh(); } }; events.onerror = () => { events.close(); state.liveEvents = null; setTimeout(connectLiveEvents, 5000); }; }
 function initTheme() {
   const saved = localStorage.getItem('voice-theme');
   if (saved === 'light') document.body.classList.add('light-theme');
@@ -900,6 +923,6 @@ function init() {
   $('#connectButton').addEventListener('click', connect); $('#bulkConnectButton').addEventListener('click', bulkConnect); $('#disconnectButton').addEventListener('click', openDisconnect); $('#accountSelect').addEventListener('change', async (event) => { state.selectedAccount = event.target.value; await loadGuilds(); await loadAutomationCatalog(); }); $('#automationGuild').addEventListener('change', renderAutomationChannels); $('#automationChannel').addEventListener('change', renderTargetAccounts); $('#rotationRoomFilter').addEventListener('input', (event) => { state.rotationRoomFilter = event.target.value; state.rotationRoomPage = 0; renderRotationRooms(); }); $('#rotationPrevButton').addEventListener('click', () => { state.rotationRoomPage -= 1; renderRotationRooms(); }); $('#rotationNextButton').addEventListener('click', () => { state.rotationRoomPage += 1; renderRotationRooms(); }); $('#bulkJoinButton').addEventListener('click', bulkJoinSelected); $('#channelSelect').addEventListener('change', handleChannelChange); $('#joinButton').addEventListener('click', join); $('#joinAllButton').addEventListener('click', joinAll); $('#leaveButton').addEventListener('click', leave); $('#cameraButton')?.addEventListener('click', toggleCamera); $('#screenButton')?.addEventListener('click', toggleScreen); $('#startRotationButton').addEventListener('click', startRotation); $('#startCycleButton').addEventListener('click', startCycle); $('#stopMediaButton')?.addEventListener('click', () => stopCurrentStream()); $('#applyBulkStateButton')?.addEventListener('click', applyBulkState); $('#overviewFilter')?.addEventListener('input', (event) => { state.overviewFilter = event.target.value; refreshSessions(); }); $('#overviewSort')?.addEventListener('change', (event) => { state.overviewSort = event.target.value; refreshSessions(); }); document.querySelectorAll('.state-button').forEach((button) => button.addEventListener('click', () => applyState(button.dataset.state))); document.querySelectorAll('#statePicker input').forEach((input) => input.addEventListener('change', () => input.closest('.state-option')?.classList.toggle('is-selected', input.checked)));
   $('#operationClose').addEventListener('click', () => { $('#operationModal').hidden = true; $('.operation-loader')?.classList.remove('is-done', 'is-error'); }); $('#leaveAllButton')?.addEventListener('click', openLeaveAll); $('#confirmLeaveButton')?.addEventListener('click', leaveAllSelected); $('#cancelLeaveButton')?.addEventListener('click', () => { $('#leaveModal').hidden = true; }); $('#confirmDisconnectButton')?.addEventListener('click', disconnectSelected); $('#cancelDisconnectButton')?.addEventListener('click', () => { $('#disconnectModal').hidden = true; }); $('#disconnectModalClose')?.addEventListener('click', () => { $('#disconnectModal').hidden = true; }); window.addEventListener('beforeunload', () => stopCurrentStream({ updateDiscord: false }));
   document.addEventListener('change', (event) => { if (event.target.closest('#automationAccounts')) updateQuickStateButtons(); });
-  loadClients().then(() => renderPlayingAccounts()).catch(() => {}); refreshSessions(); loadTasks(); loadPlayingSessions(); connectLiveEvents(); state.taskCountdownTimer = setInterval(refreshTaskCountdowns, 1000); setInterval(refreshSessions, 15000); setInterval(loadTasks, 15000); setInterval(loadPlayingSessions, 15000);
+  loadClients().then(() => renderPlayingAccounts()).catch(() => {}); refreshSessions(); loadTasks(); loadPlayingSessions(); connectLiveEvents(); state.taskCountdownTimer = setInterval(refreshTaskCountdowns, 1000); setInterval(() => { if (document.visibilityState !== 'visible') return; refreshSessions(); loadTasks(); loadPlayingSessions(); }, 30000);
 }
 init();

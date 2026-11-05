@@ -2730,13 +2730,27 @@ function originGuard(req, res, next) {
   try { if (new URL(origin).host !== req.get('host')) return res.status(403).json({ success: false, error: 'Cross-origin request blocked' }); } catch { return res.status(403).json({ success: false, error: 'Invalid request origin' }); }
   return next();
 }
+function positiveLimit(value, fallback) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
 function rateLimit(req, res, next) {
-  const key = `${req.ip}:${req.method === 'GET' ? 'read' : 'write'}`;
+  const isRead = req.method === 'GET' || req.method === 'HEAD';
+  const key = `${req.ip}:${isRead ? 'read' : 'write'}`;
+  const limit = isRead
+    ? positiveLimit(process.env.API_READ_LIMIT_PER_MINUTE, 600)
+    : positiveLimit(process.env.API_WRITE_LIMIT_PER_MINUTE, 120);
   const now = Date.now(); const bucket = requestBuckets.get(key) || { start: now, count: 0 };
   if (now - bucket.start >= 60000) { bucket.start = now; bucket.count = 0; }
   bucket.count += 1; requestBuckets.set(key, bucket);
   if (requestBuckets.size > 10000) { for (const [bucketKey, value] of requestBuckets) if (now - value.start > 120000) requestBuckets.delete(bucketKey); }
-  if (bucket.count > (req.method === 'GET' ? 240 : 90)) return res.status(429).json({ success: false, error: 'Too many requests; try again shortly' });
+  const remaining = Math.max(0, limit - bucket.count);
+  res.setHeader('X-RateLimit-Limit', String(limit));
+  res.setHeader('X-RateLimit-Remaining', String(remaining));
+  if (bucket.count > limit) {
+    res.setHeader('Retry-After', String(Math.max(1, Math.ceil((bucket.start + 60000 - now) / 1000))));
+    return res.status(429).json({ success: false, error: 'Too many requests; try again shortly' });
+  }
   res.setHeader('Cache-Control', 'no-store');
   return next();
 }
