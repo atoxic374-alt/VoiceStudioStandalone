@@ -19,6 +19,10 @@ Open [http://localhost:5050](http://localhost:5050). Connected Discord tokens ar
 
 At every process start and account change, the server writes two local JSON diagnostic snapshots in `data/`: `active-tokens.json` and `failed-tokens.json` retain their legacy filenames but now contain account names, status, timestamps, and a sanitized error only. They never contain account tokens; credentials are stored only in the authenticated encrypted `accounts.enc` file. Existing plaintext token snapshots are overwritten with token-free metadata the next time the server starts. Set a stable, random `DATA_ENCRYPTION_KEY` in production and protect the Railway Volume because account metadata and the encrypted account file remain sensitive.
 
+## One-file migration
+
+On the source deployment, sign in as the owner and download `https://<source-host>/api/storage/portable-backup`. The authenticated endpoint creates one JSON backup containing only currently connected account records (still AES-256-GCM encrypted), plus their saved voice sessions and matching automation/Playing settings. On the destination, set the same `DATA_ENCRYPTION_KEY` as the source, upload that file to the mounted data directory as `voice-studio-portable-backup.json`, and restart the service. Startup validates the bundle checksum and verifies the account key before importing. Existing destination account/session/task files are moved into a hidden `.pre-portable-import-*` recovery folder, then the backup becomes the active data set so stale accounts are not merged into the migration. A marker prevents re-importing the same backup on every restart. The bundle deliberately excludes `.env`, passwords, diagnostic snapshots, and log files. A failed key check leaves the bundle and destination data unchanged.
+
 ## Test and check
 
 ```bash

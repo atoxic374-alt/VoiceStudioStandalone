@@ -74,6 +74,8 @@ const PLAYING_FILE = path.join(DATA_DIR, 'playing-sessions.json');
 const PLAYING_LOG_FILE = path.join(DATA_DIR, 'playing-events.log');
 const CLIENT_BIND_FILE = path.join(DATA_DIR, 'client-binding.json');
 const MEDIA_LOG_FILE = path.join(DATA_DIR, 'media-events.log');
+const PORTABLE_BACKUP_FILE = path.join(DATA_DIR, 'voice-studio-portable-backup.json');
+const PORTABLE_BACKUP_MARKER = path.join(DATA_DIR, '.voice-studio-portable-backup-applied');
 fs.mkdirSync(DATA_DIR, { recursive: true });
 const BUILD_FILES = ['server.js', 'package.json', 'public/app.js', 'public/index.html', 'public/styles.css', 'public/playing.css'];
 function getBuildVersion() {
@@ -127,6 +129,133 @@ function persistenceKeyCandidates() {
     'voice-studio-local-storage',
   ].filter(Boolean).map(String))].map(persistenceKey);
 }
+const PORTABLE_DATA_NAMES = ['accounts.enc', 'voice-sessions.json', 'automation-tasks.json', 'playing-sessions.json'];
+function canonicalPortableName(name) {
+  const safeName = path.basename(String(name || ''));
+  return PORTABLE_DATA_NAMES.find((fileName) => {
+    const ext = path.extname(fileName);
+    const stem = ext ? fileName.slice(0, -ext.length) : fileName;
+    const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`^${escapeRegExp(fileName)}(?:\\s*\\(\\d+\\))?(?:\\.txt|\\.json\\.txt)?$`, 'i').test(safeName)
+      || Boolean(ext && new RegExp(`^${escapeRegExp(stem)}\\s*\\(\\d+\\)${escapeRegExp(ext)}(?:\\.txt)?$`, 'i').test(safeName)) ? fileName : false;
+  });
+}
+function isPortableDataName(name) { return Boolean(canonicalPortableName(name)); }
+function encryptedRecordsText(records, key = persistenceKey()) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const encrypted = Buffer.concat([cipher.update(JSON.stringify(records), 'utf8'), cipher.final()]);
+  return JSON.stringify({ version: 1, iv: iv.toString('base64url'), tag: cipher.getAuthTag().toString('base64url'), data: encrypted.toString('base64url') });
+}
+function decryptAccountPayload(contents) {
+  try {
+    const payload = JSON.parse(contents.toString('utf8').replace(/^\uFEFF/, '').trim());
+    if (payload?.version !== 1 || !payload.iv || !payload.tag || !payload.data) return false;
+    for (const key of persistenceKeyCandidates()) {
+      try {
+        const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(payload.iv, 'base64url'));
+        decipher.setAuthTag(Buffer.from(payload.tag, 'base64url'));
+        const plain = Buffer.concat([decipher.update(Buffer.from(payload.data, 'base64url')), decipher.final()]);
+        if (Array.isArray(JSON.parse(plain.toString('utf8')))) return true;
+      } catch {}
+    }
+  } catch {}
+  return false;
+}
+function portableBackupPayload() {
+  const accounts = cleanAccountRecords([...clients.entries()].map(([name, entry]) => ({ name, token: entry.token, savedAt: entry.savedAt })));
+  if (!accounts.length) throw new Error('Connect the accounts you want to migrate before creating a portable backup');
+  const activeNames = new Set(accounts.map((account) => account.name.toLocaleLowerCase()));
+  const data = new Map();
+  data.set('accounts.enc', Buffer.from(encryptedRecordsText(accounts)));
+  const savedVoiceSessions = [...voiceSessions.values()].filter((session) => activeNames.has(String(session.name || '').toLocaleLowerCase()));
+  data.set('voice-sessions.json', Buffer.from(JSON.stringify(savedVoiceSessions, null, 2)));
+  const savedTasks = loadAutomationTasks();
+  const retainTaskAccounts = (items) => items.flatMap((task) => {
+    const accountsForTask = (Array.isArray(task.accounts) ? task.accounts : []).filter((name) => activeNames.has(String(name).toLocaleLowerCase()));
+    return accountsForTask.length ? [{ ...task, accounts: accountsForTask }] : [];
+  });
+  data.set('automation-tasks.json', Buffer.from(JSON.stringify({ version: 1, rotations: retainTaskAccounts(savedTasks.rotations), stateCycles: retainTaskAccounts(savedTasks.stateCycles), savedAt: Date.now() }, null, 2)));
+  const savedPlayingSessions = [...playingSessions.values()].filter((session) => activeNames.has(String(session.account || '').toLocaleLowerCase())).map(({ timer, running, ...session }) => session);
+  data.set('playing-sessions.json', Buffer.from(JSON.stringify(savedPlayingSessions, null, 2)));
+  const files = [...data.entries()].map(([name, contents]) => ({ name, data: contents.toString('base64'), sha256: crypto.createHash('sha256').update(contents).digest('hex') }));
+  return { format: 'voice-studio-portable-backup', version: 1, createdAt: new Date().toISOString(), files };
+}
+function nextImportedDataName(name, reserved = new Set()) {
+  if (!fs.existsSync(path.join(DATA_DIR, name)) && !reserved.has(name)) return name;
+  if (name.startsWith('accounts.enc')) {
+    for (let index = 1; index < 10000; index += 1) {
+      const candidate = `accounts.enc(${index}).txt`;
+      if (!fs.existsSync(path.join(DATA_DIR, candidate)) && !reserved.has(candidate)) return candidate;
+    }
+  } else {
+    const canonical = canonicalPortableName(name);
+    const ext = path.extname(canonical || name);
+    const stem = ext ? (canonical || name).slice(0, -ext.length) : (canonical || name);
+    for (let index = 1; index < 10000; index += 1) {
+      const candidate = `${stem} (${index})${ext}`;
+      if (!fs.existsSync(path.join(DATA_DIR, candidate)) && !reserved.has(candidate)) return candidate;
+    }
+  }
+  throw new Error('Unable to choose a unique imported data filename');
+}
+function consumePortableBackup() {
+  if (!fs.existsSync(PORTABLE_BACKUP_FILE)) return;
+  try {
+    const source = fs.readFileSync(PORTABLE_BACKUP_FILE);
+    const sourceHash = crypto.createHash('sha256').update(source).digest('hex');
+    try { if (fs.readFileSync(PORTABLE_BACKUP_MARKER, 'utf8').trim() === sourceHash) return; } catch {}
+    const backup = JSON.parse(source.toString('utf8').replace(/^\uFEFF/, '').trim());
+    if (backup?.format !== 'voice-studio-portable-backup' || backup.version !== 1 || !Array.isArray(backup.files) || !backup.files.length || backup.files.length > 100) {
+      throw new Error('Unsupported or invalid portable backup format');
+    }
+    const decoded = backup.files.map((item) => {
+      const name = String(item?.name || '');
+      if (name !== path.basename(name) || name.includes('\\') || !isPortableDataName(name) || typeof item.data !== 'string' || item.data.length > 1_400_000) throw new Error('Backup contains an invalid file entry');
+      const contents = Buffer.from(item.data, 'base64');
+      if (contents.toString('base64') !== item.data || crypto.createHash('sha256').update(contents).digest('hex') !== item.sha256) throw new Error(`Backup integrity check failed for ${name}`);
+      if (name.toLowerCase().startsWith('accounts.enc') && !decryptAccountPayload(contents)) throw new Error('The backup account file cannot be decrypted with this deployment DATA_ENCRYPTION_KEY/APP_PASSWORD');
+      if (!name.toLowerCase().startsWith('accounts.enc')) JSON.parse(contents.toString('utf8').replace(/^\uFEFF/, '').trim());
+      return { name, contents };
+    });
+    const previousFiles = PORTABLE_DATA_NAMES.flatMap((fileName) => listDataFiles(fileName));
+    const recoveryDir = previousFiles.length ? path.join(DATA_DIR, `.pre-portable-import-${Date.now()}`) : null;
+    const moved = [];
+    const imported = [];
+    try {
+      if (recoveryDir) {
+        fs.mkdirSync(recoveryDir, { mode: 0o700 });
+        for (const file of previousFiles) {
+          const savedPath = path.join(recoveryDir, file.name);
+          fs.renameSync(file.fullPath, savedPath);
+          moved.push({ original: file.fullPath, saved: savedPath });
+        }
+      }
+      const reserved = new Set();
+      const staged = decoded.map((item) => ({ ...item, target: nextImportedDataName(item.name, reserved) }));
+      for (const item of staged) reserved.add(item.target);
+      for (const item of staged) {
+        const target = path.join(DATA_DIR, item.target);
+        const temp = `${target}.portable-tmp`;
+        fs.writeFileSync(temp, item.contents, { mode: 0o600 });
+        fs.renameSync(temp, target);
+        imported.push(target);
+      }
+      fs.writeFileSync(`${PORTABLE_BACKUP_MARKER}.tmp`, sourceHash, { mode: 0o600 });
+      fs.renameSync(`${PORTABLE_BACKUP_MARKER}.tmp`, PORTABLE_BACKUP_MARKER);
+      console.log(`[storage] imported portable backup with ${staged.length} data files; ${moved.length} previous data files preserved in a recovery folder`);
+    } catch (error) {
+      for (const file of imported) fs.rmSync(file, { force: true });
+      for (const file of moved.reverse()) {
+        try { fs.renameSync(file.saved, file.original); } catch {}
+      }
+      throw error;
+    }
+  } catch (error) {
+    console.warn('[storage] portable backup was not imported:', error.message);
+  }
+}
+consumePortableBackup();
 function saveEncryptedRecords(file, records) {
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', persistenceKey(), iv);
@@ -2794,6 +2923,18 @@ app.get('/api/storage/status', (_req, res) => {
     return { name, path: file, exists: fs.existsSync(file), bytes };
   });
   return ok(res, { dataDir: DATA_DIR, accountFile, savedAccounts: savedAccountRecords.size, connectedAccounts: clients.size, files });
+});
+app.get('/api/storage/portable-backup', (_req, res) => {
+  try {
+    const backup = portableBackupPayload();
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="voice-studio-backup-${stamp}.json"`);
+    res.setHeader('Cache-Control', 'no-store');
+    return res.status(200).send(JSON.stringify(backup));
+  } catch (error) {
+    return res.status(400).json({ success: false, error: error.message });
+  }
 });
 const healthTimer = setInterval(() => {
   for (const [name, entry] of clients.entries()) {
