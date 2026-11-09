@@ -199,10 +199,29 @@ function nextImportedDataName(name, reserved = new Set()) {
   }
   throw new Error('Unable to choose a unique imported data filename');
 }
-function consumePortableBackup() {
-  if (!fs.existsSync(PORTABLE_BACKUP_FILE)) return;
+function findPortableBackupFile() {
+  if (fs.existsSync(PORTABLE_BACKUP_FILE)) return PORTABLE_BACKUP_FILE;
   try {
-    const source = fs.readFileSync(PORTABLE_BACKUP_FILE);
+    const candidates = fs.readdirSync(DATA_DIR).filter((name) => /^voice-studio-backup-.+\.json$/i.test(name)).flatMap((name) => {
+      const fullPath = path.join(DATA_DIR, name);
+      const stat = fs.statSync(fullPath);
+      return stat.isFile() ? [{ fullPath, mtimeMs: stat.mtimeMs }] : [];
+    }).sort((a, b) => b.mtimeMs - a.mtimeMs);
+    if (candidates.length > 1) console.log(`[storage] found ${candidates.length} timestamped portable backups; using the newest file`);
+    return candidates[0]?.fullPath || null;
+  } catch (error) {
+    console.warn('[storage] unable to scan for portable backup:', error.message);
+    return null;
+  }
+}
+function consumePortableBackup() {
+  const importFile = findPortableBackupFile();
+  if (!importFile) {
+    console.log(`[storage] no portable backup found in ${DATA_DIR}; expected voice-studio-portable-backup.json or voice-studio-backup-*.json`);
+    return;
+  }
+  try {
+    const source = fs.readFileSync(importFile);
     const sourceHash = crypto.createHash('sha256').update(source).digest('hex');
     try { if (fs.readFileSync(PORTABLE_BACKUP_MARKER, 'utf8').trim() === sourceHash) return; } catch {}
     const backup = JSON.parse(source.toString('utf8').replace(/^\uFEFF/, '').trim());
@@ -243,7 +262,7 @@ function consumePortableBackup() {
       }
       fs.writeFileSync(`${PORTABLE_BACKUP_MARKER}.tmp`, sourceHash, { mode: 0o600 });
       fs.renameSync(`${PORTABLE_BACKUP_MARKER}.tmp`, PORTABLE_BACKUP_MARKER);
-      console.log(`[storage] imported portable backup with ${staged.length} data files; ${moved.length} previous data files preserved in a recovery folder`);
+      console.log(`[storage] imported portable backup ${path.basename(importFile)} with ${staged.length} data files; ${moved.length} previous data files preserved in a recovery folder`);
     } catch (error) {
       for (const file of imported) fs.rmSync(file, { force: true });
       for (const file of moved.reverse()) {
@@ -252,7 +271,7 @@ function consumePortableBackup() {
       throw error;
     }
   } catch (error) {
-    console.warn('[storage] portable backup was not imported:', error.message);
+    console.warn(`[storage] portable backup ${path.basename(importFile)} was not imported:`, error.message);
   }
 }
 consumePortableBackup();
