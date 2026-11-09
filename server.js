@@ -2924,7 +2924,8 @@ app.get('/api/storage/status', (_req, res) => {
   });
   return ok(res, { dataDir: DATA_DIR, accountFile, savedAccounts: savedAccountRecords.size, connectedAccounts: clients.size, files });
 });
-app.get('/api/storage/portable-backup', (_req, res) => {
+app.get('/api/storage/portable-backup', (req, res) => {
+  if (req.authRole !== 'owner') return res.status(403).json({ success: false, error: 'Owner access required' });
   try {
     const backup = portableBackupPayload();
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');

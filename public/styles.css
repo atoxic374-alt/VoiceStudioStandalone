@@ -307,3 +307,6 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .profile-row-voice { min-width: 0; }
 .profile-row-voice .rotation-info-button { margin-inline-end: 5px; }
 @media (max-width: 690px) { .task-timer { min-width: 76px; } }
+.profiles-heading-copy { display: grid; gap: 2px; }
+#portableBackupDownload { display: inline-flex; align-items: center; text-decoration: none; color: var(--text); }
+#portableBackupDownload:hover { border-color: rgba(72,217,210,.38); color: var(--cyan); }
