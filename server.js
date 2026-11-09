@@ -30,35 +30,39 @@ function isEmptyPersistedJson(file) {
     return false;
   }
 }
+function listDataFiles(fileName) {
+  const ext = path.extname(fileName);
+  const stem = ext ? fileName.slice(0, -ext.length) : fileName;
+  const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const patterns = [
+    new RegExp(`^${escapeRegExp(fileName)}(?:\\s*\\(\\d+\\))?(?:\\.txt|\\.json\\.txt)?$`, 'i'),
+    ...(ext ? [new RegExp(`^${escapeRegExp(stem)}\\s*\\(\\d+\\)${escapeRegExp(ext)}(?:\\.txt)?$`, 'i')] : []),
+  ];
+  try {
+    return fs.readdirSync(DATA_DIR).flatMap((name) => {
+      if (!patterns.some((pattern) => pattern.test(name))) return [];
+      const fullPath = path.join(DATA_DIR, name);
+      const stat = fs.statSync(fullPath);
+      return stat.isFile() ? [{ fullPath, name, mtimeMs: stat.mtimeMs }] : [];
+    }).sort((a, b) => a.mtimeMs - b.mtimeMs || a.name.localeCompare(b.name));
+  } catch (error) {
+    console.warn(`[storage] unable to scan data directory for ${fileName}:`, error.message);
+    return [];
+  }
+}
 function resolveDataFile(fileName) {
-  const candidates = [fileName, `${fileName}.txt`, `${fileName}.json.txt`];
-  const existing = candidates.map((candidate) => path.join(DATA_DIR, candidate)).filter((fullPath) => fs.existsSync(fullPath));
+  const existing = listDataFiles(fileName);
   if (existing.length) {
-    const canonical = existing[0];
+    const canonical = existing.find((file) => file.name === fileName)?.fullPath || existing[0].fullPath;
     // A restart can create an empty canonical JSON file before an uploaded
     // compatibility export is restored. Prefer the non-empty export in that
     // case so saved voice sessions, tasks, and Playing sessions are retained.
     if (fileName.endsWith('.json') && isEmptyPersistedJson(canonical)) {
-      const backup = existing.slice(1).find((fullPath) => !isEmptyPersistedJson(fullPath));
+      const backup = existing.find((file) => file.fullPath !== canonical && !isEmptyPersistedJson(file.fullPath))?.fullPath;
       if (backup) return backup;
     }
     return canonical;
   }
-  // Railway's file uploader and mobile browsers may rename a duplicate to
-  // names such as accounts.enc(1).txt. Prefer the newest/largest compatible
-  // export when the canonical name is not present.
-  try {
-    const prefix = `${fileName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`;
-    const aliases = fs.readdirSync(DATA_DIR)
-      .filter((name) => new RegExp(`^${prefix}(?:\\(\\d+\\))?(?:\\.txt|\\.json\\.txt)$`).test(name))
-      .map((name) => {
-        const fullPath = path.join(DATA_DIR, name);
-        const stat = fs.statSync(fullPath);
-        return { fullPath, mtimeMs: stat.mtimeMs, size: stat.size };
-      })
-      .sort((a, b) => b.mtimeMs - a.mtimeMs || b.size - a.size);
-    if (aliases.length) return aliases[0].fullPath;
-  } catch (error) { console.warn(`[storage] unable to scan data directory for ${fileName}:`, error.message); }
   return path.join(DATA_DIR, fileName);
 }
 const ACCOUNT_FILE = path.join(DATA_DIR, 'accounts.enc');
@@ -180,21 +184,20 @@ function cleanAccountRecords(records) {
   return result;
 }
 function loadAccounts() {
-  // Railway uploads can leave a newly-created, empty canonical accounts.enc
-  // beside the real export as accounts.enc.txt. Do not let that empty file
-  // hide a valid compatibility export.
-  const candidates = [
-    ACCOUNT_FILE,
-    path.join(DATA_DIR, 'accounts.enc.txt'),
-    path.join(DATA_DIR, 'accounts.enc.json.txt'),
-  ].filter((file, index, files) => fs.existsSync(file) && files.indexOf(file) === index);
+  // Uploaders may append a numeric suffix to duplicate filenames. Read every
+  // compatible encrypted export and merge them rather than stopping at the
+  // first file (which may contain only a partial account list).
+  const candidates = listDataFiles('accounts.enc').map((file) => file.fullPath);
   if (!candidates.length) {
     console.warn(`[accounts] no saved account file found in ${DATA_DIR}; expected accounts.enc (also accepts accounts.enc.txt)`);
     return [];
   }
   let lastError;
-  let emptyValidRecords = null;
+  let validFiles = 0;
+  let recordsFromFiles = [];
+  let requiresMigration = false;
   for (const file of candidates) {
+    let fileLoaded = false;
     for (const key of persistenceKeyCandidates()) {
       try {
         const payload = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '').trim());
@@ -203,24 +206,20 @@ function loadAccounts() {
         const plain = Buffer.concat([decipher.update(Buffer.from(payload.data, 'base64url')), decipher.final()]);
         const plaintext = plain.toString('utf8');
         const records = cleanAccountRecords(JSON.parse(plaintext));
-        if (records.length === 0) {
-          emptyValidRecords ||= { file, key, plaintext };
-          continue;
-        }
-        if (file !== ACCOUNT_FILE) console.warn(`[accounts] reading uploaded compatibility filename ${path.basename(file)}; canonical filename is accounts.enc`);
-        if (file !== ACCOUNT_FILE || key !== persistenceKey()) saveAccounts(records);
-        const checksum = crypto.createHash('sha256').update(plaintext).digest('hex').slice(0, 16);
-        console.log(`[accounts] loaded ${records.length} saved account${records.length === 1 ? '' : 's'} from ${path.basename(file)}; plaintextBytes=${Buffer.byteLength(plaintext)}; checksum=${checksum}`);
-        return records;
+        recordsFromFiles.push(...records);
+        validFiles += 1;
+        fileLoaded = true;
+        if (file !== ACCOUNT_FILE || key !== persistenceKey()) requiresMigration = true;
+        break;
       } catch (error) { lastError = error; }
     }
+    if (!fileLoaded) console.warn(`[accounts] unable to read compatible file ${path.basename(file)}; it was left unchanged`);
   }
-  if (emptyValidRecords) {
-    const { file, key, plaintext } = emptyValidRecords;
-    if (file !== ACCOUNT_FILE || key !== persistenceKey()) saveAccounts([]);
-    const checksum = crypto.createHash('sha256').update(plaintext).digest('hex').slice(0, 16);
-    console.log(`[accounts] loaded 0 saved accounts from ${path.basename(file)}; plaintextBytes=${Buffer.byteLength(plaintext)}; checksum=${checksum}`);
-    return [];
+  if (validFiles) {
+    const records = cleanAccountRecords(recordsFromFiles);
+    if (requiresMigration || validFiles > 1) saveAccounts(records);
+    console.log(`[accounts] loaded ${records.length} saved account${records.length === 1 ? '' : 's'} from ${validFiles} compatible encrypted file${validFiles === 1 ? '' : 's'}`);
+    return records;
   }
   console.warn(`[accounts] saved accounts could not be restored from ${candidates.map((file) => path.basename(file)).join(', ')}: ${lastError?.message || 'unknown encryption or JSON error'}`);
   return [];
@@ -560,13 +559,39 @@ function persistAutomationTasks() {
   const temp = `${AUTOMATION_TASKS_FILE}.tmp`;
   try { fs.writeFileSync(temp, JSON.stringify(payload, null, 2), { mode: 0o600 }); fs.renameSync(temp, AUTOMATION_TASKS_FILE); } catch (error) { try { fs.rmSync(temp, { force: true }); } catch {} console.warn('[automation] unable to persist tasks:', error.message); }
 }
-function loadAutomationTasks() { try { const value = JSON.parse(fs.readFileSync(resolveDataFile('automation-tasks.json'), 'utf8').replace(/^\uFEFF/, '').trim()); return value && typeof value === 'object' ? value : { rotations: [], stateCycles: [] }; } catch (error) { if (fs.existsSync(resolveDataFile('automation-tasks.json'))) console.warn('[automation] saved tasks could not be restored:', error.message); return { rotations: [], stateCycles: [] }; } }
+function loadAutomationTasks() {
+  const merged = { rotations: [], stateCycles: [] };
+  const mergeById = (current, incoming) => {
+    const items = new Map(current.map((item, index) => [String(item?.id || `legacy-${index}`), item]));
+    for (const [index, item] of incoming.entries()) if (item && typeof item === 'object') items.set(String(item.id || `legacy-${index}`), item);
+    return [...items.values()];
+  };
+  for (const file of listDataFiles('automation-tasks.json')) {
+    try {
+      const value = JSON.parse(fs.readFileSync(file.fullPath, 'utf8').replace(/^\uFEFF/, '').trim());
+      if (!value || typeof value !== 'object') continue;
+      merged.rotations = mergeById(merged.rotations, Array.isArray(value.rotations) ? value.rotations : []);
+      merged.stateCycles = mergeById(merged.stateCycles, Array.isArray(value.stateCycles) ? value.stateCycles : []);
+    } catch (error) { console.warn(`[automation] saved tasks could not be restored from ${file.name}:`, error.message); }
+  }
+  return merged;
+}
 function persistPlayingSessions() {
   const safe = [...playingSessions.values()].map(({ timer, running, ...session }) => session);
   const temp = `${PLAYING_FILE}.tmp`;
   try { fs.writeFileSync(temp, JSON.stringify(safe, null, 2), { mode: 0o600 }); fs.renameSync(temp, PLAYING_FILE); } catch (error) { try { fs.rmSync(temp, { force: true }); } catch {} console.warn('[playing] unable to persist sessions:', error.message); }
 }
-function loadPlayingSessions() { try { const value = JSON.parse(fs.readFileSync(resolveDataFile('playing-sessions.json'), 'utf8').replace(/^\uFEFF/, '').trim()); return Array.isArray(value) ? value : []; } catch (error) { if (fs.existsSync(resolveDataFile('playing-sessions.json'))) console.warn('[playing] saved sessions could not be restored:', error.message); return []; } }
+function loadPlayingSessions() {
+  const sessions = new Map();
+  for (const file of listDataFiles('playing-sessions.json')) {
+    try {
+      const value = JSON.parse(fs.readFileSync(file.fullPath, 'utf8').replace(/^\uFEFF/, '').trim());
+      if (!Array.isArray(value)) continue;
+      for (const session of value) if (session?.account) sessions.set(playingKey(session.account), session);
+    } catch (error) { console.warn(`[playing] saved sessions could not be restored from ${file.name}:`, error.message); }
+  }
+  return [...sessions.values()];
+}
 function logPlayingEvent(event, details = {}) { const record = { time: new Date().toISOString(), event, ...details }; playingEvents.unshift(record); playingEvents.splice(500); try { fs.appendFileSync(PLAYING_LOG_FILE, `${JSON.stringify(record)}\n`, { mode: 0o600 }); } catch {} emitLive(`playing.${event}`, details); }
 function readPlayingEvents() { try { return fs.readFileSync(PLAYING_LOG_FILE, 'utf8').trim().split('\n').filter(Boolean).slice(-500).reverse().map((line) => JSON.parse(line)); } catch { return [...playingEvents]; } }
 function cleanPlayingSteps(steps) {
@@ -986,14 +1011,17 @@ async function clearVoiceFlags(client, guildId, channelId, current = {}) {
   return last || { ok: false, error: 'Unable to reset voice state' };
 }
 function readPersistedSessions() {
-  const file = resolveDataFile('voice-sessions.json');
-  try {
-    const value = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '').trim());
-    return Array.isArray(value) ? value : [];
-  } catch (error) {
-    if (fs.existsSync(file)) console.warn('[voice] saved sessions could not be restored:', error.message);
-    return [];
+  const sessions = new Map();
+  for (const file of listDataFiles('voice-sessions.json')) {
+    try {
+      const value = JSON.parse(fs.readFileSync(file.fullPath, 'utf8').replace(/^\uFEFF/, '').trim());
+      if (!Array.isArray(value)) continue;
+      for (const session of value) {
+        if (session?.name && session?.guildId && session?.channelId) sessions.set(sessionKey(session.name, session.guildId), session);
+      }
+    } catch (error) { console.warn(`[voice] saved sessions could not be restored from ${file.name}:`, error.message); }
   }
+  return [...sessions.values()];
 }
 function persistSessions() {
   const safe = [...voiceSessions.values()].map(({ name, guildId, channelId, selfMute, selfDeaf, selfVideo, selfStream }) => ({
