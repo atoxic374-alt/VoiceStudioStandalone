@@ -1447,6 +1447,34 @@ function guardVoiceWebSocketTeardown(connection, details = {}) {
     return false;
   }
 }
+function installVoiceWebSocketTeardownGuard() {
+  try {
+    const VoiceWebSocket = require('discord.js-selfbot-v13/src/client/voice/networking/VoiceWebSocket');
+    const prototype = VoiceWebSocket?.prototype;
+    if (!prototype || typeof prototype.onError !== 'function' || prototype.__voiceStudioTeardownGuard) return false;
+    const originalOnError = prototype.onError;
+    Object.defineProperty(prototype, '__voiceStudioTeardownGuard', { value: true });
+    prototype.onError = function onVoiceWebSocketError(error) {
+      const cause = error?.error || error?.cause || error;
+      const message = String(cause?.message || error?.message || cause || 'Unknown voice WebSocket error');
+      if (this.dead && /websocket was closed before the connection was established/i.test(message)) {
+        logVoiceTransportError('warn', 'voice.transport_teardown_error_captured', {
+          transport: 'voice-websocket',
+          channelId: voiceConnectionChannelId(this.connection),
+          error: message.slice(0, 500),
+          expectedCloseRace: true,
+        });
+        return;
+      }
+      return originalOnError.call(this, error);
+    };
+    return true;
+  } catch (error) {
+    console.warn('[voice] unable to install VoiceWebSocket teardown guard:', error.message);
+    return false;
+  }
+}
+installVoiceWebSocketTeardownGuard();
 function primaryMediaRetryError(name, guildId, channelId, mediaKind) {
   const previous = primaryMediaFailures.get(name);
   if (!previous || previous.guildId !== guildId || previous.channelId !== channelId || previous.mediaKind !== mediaKind || previous.retryAt <= Date.now()) return null;

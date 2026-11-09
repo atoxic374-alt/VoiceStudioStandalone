@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
 const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, recordSuccessfulCycleState, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, registerAccountStreamer, mediaStreamers, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, schedulePlaying, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, cleanAccountRecords, buildAccountSnapshot, safeErrorSummary, guardVoiceWebSocketTeardown, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanupPrimaryStreamAttempt, isRecoverableDiscordInteractionError } = require('../server');
+const VoiceWebSocket = require('discord.js-selfbot-v13/src/client/voice/networking/VoiceWebSocket');
 
 test('captures delayed errors from a WebSocket after voice teardown without suppressing live errors', () => {
   const streamConnection = new EventEmitter();
@@ -23,6 +24,20 @@ test('captures delayed errors from a WebSocket after voice teardown without supp
   const liveFailure = new Error('Unexpected server response: 522');
   voiceWebSocket.ws.onerror(liveFailure);
   assert.deepEqual(forwarded, [liveFailure]);
+});
+
+test('absorbs only the closed-before-connect VoiceWebSocket error after cleanup', () => {
+  const connection = new EventEmitter();
+  const voiceWebSocket = new VoiceWebSocket(connection);
+  const errors = [];
+  voiceWebSocket.on('error', (error) => errors.push(error));
+  voiceWebSocket.dead = true;
+  assert.doesNotThrow(() => voiceWebSocket.onError(new Error('WebSocket was closed before the connection was established')));
+  assert.deepEqual(errors, []);
+  voiceWebSocket.dead = false;
+  const liveFailure = new Error('Unexpected server response: 522');
+  voiceWebSocket.onError(liveFailure);
+  assert.deepEqual(errors, [liveFailure]);
 });
 
 test('account diagnostic snapshots never retain credentials', () => {
