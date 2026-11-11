@@ -5,7 +5,7 @@ const crypto = require('crypto');
 const { execFileSync, spawn } = require('child_process');
 const FFMPEG_PATH = require('ffmpeg-static');
 const { EventEmitter } = require('events');
-const { Client, Constants, SnowflakeUtil, Util } = require('discord.js-selfbot-v13');
+const { Client, Constants, SnowflakeUtil, Util, Options } = require('discord.js-selfbot-v13');
 const helmet = require('helmet');
 
 const AUTH_COOKIE = 'voice_studio_auth';
@@ -2785,7 +2785,15 @@ async function connectOne(token, name) {
   if (existing) throw new Error(`Duplicate token: already connected as ${existing[0]}`);
   if (connectingTokens.has(normalizedToken)) throw new Error('Duplicate token: connection already in progress');
   connectingTokens.add(normalizedToken);
-  const client = new Client({ checkUpdate: false, fetchAllMembers: false });
+  const client = new Client({
+    checkUpdate: false,
+    fetchAllMembers: false,
+    // Playing scans at most the newest 50 messages per channel. Bound this
+    // reconstructible cache to that same window and expire old cache entries;
+    // this never deletes Discord messages or persisted accounts/sessions.
+    makeCache: Options.cacheWithLimits({ ...Options.defaultMakeCacheSettings, MessageManager: 50 }),
+    sweepers: { ...Options.defaultSweeperSettings, messages: { interval: 300, lifetime: 1800 } },
+  });
   try {
     // Validate through REST first. Revoked tokens fail here without allocating
     // a Gateway/WebSocket session, which is much cheaper during bulk restore.
