@@ -15,7 +15,9 @@ const AUTH_TTL_MS = 12 * 60 * 60 * 1000;
 // binding must survive that expiry so the same client can log in again.
 const CLIENT_DEVICE_TTL_MS = 365 * 24 * 60 * 60 * 1000;
 // Fail closed: a production deployment without an owner password must not expose the API.
-const AUTH_ENABLED = true;
+// A deliberate development-only switch may skip the login prompt on a local preview.
+// Production always requires authentication, even if the bypass variable is accidentally set.
+const AUTH_ENABLED = process.env.NODE_ENV === 'production' || process.env.VOICE_STUDIO_DISABLE_AUTH !== 'true';
 const app = express();
 const PORT = Number(process.env.PORT || 5050);
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data'));
