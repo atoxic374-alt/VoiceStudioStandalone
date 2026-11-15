@@ -531,6 +531,24 @@ function cleanAccounts(accounts) {
   const values = Array.isArray(accounts) ? accounts : [accounts];
   return [...new Set(values.map((value) => String(value || '').trim()).filter(Boolean))].slice(0, 500);
 }
+function parseDiscordInviteCode(input) {
+  const raw = String(input || '').trim();
+  if (!raw) throw new Error('A Discord invite URL or code is required');
+  if (/^[A-Za-z0-9_-]{2,100}$/.test(raw)) return raw;
+  let url;
+  try { url = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`); }
+  catch { throw new Error('Invalid invite URL; use discord.gg/... or discord.com/invite/...'); }
+  const host = url.hostname.toLowerCase();
+  if (!['discord.gg', 'www.discord.gg', 'discord.com', 'www.discord.com', 'discordapp.com', 'www.discordapp.com'].includes(host)) {
+    throw new Error('Only Discord invite URLs are allowed');
+  }
+  const parts = url.pathname.split('/').filter(Boolean);
+  const code = host.endsWith('discord.gg') ? parts[0] : (parts[0]?.toLowerCase() === 'invite' ? parts[1] : '');
+  if (!/^[A-Za-z0-9_-]{2,100}$/.test(code || '')) {
+    throw new Error('Invalid invite URL; use discord.gg/... or discord.com/invite/...');
+  }
+  return code;
+}
 function normalizeVoiceState(state = {}) {
   return { selfMute: !!state.selfMute, selfDeaf: !!state.selfDeaf, selfVideo: !!state.selfVideo, selfStream: !!state.selfStream };
 }
@@ -3008,6 +3026,31 @@ app.get('/api/events', (req, res) => {
   req.on('close', () => { clearInterval(heartbeat); liveEvents.off('event', send); });
 });
 app.get('/api/accounts/health', (_req, res) => ok(res, { accounts: [...clients.entries()].map(([name, entry]) => accountHealth(name, entry)) }));
+app.post('/api/ts/join-server', async (req, res) => {
+  try {
+    const account = String(req.body?.account || req.body?.name || req.body?.email || '').trim();
+    if (!account) return fail(res, new Error('account is required'), 400);
+    const inviteCode = parseDiscordInviteCode(req.body?.inviteUrl || req.body?.inviteCode);
+    const client = getClient(account);
+    if (!client) return fail(res, new Error(`Discord account is not connected: ${account}`), 404);
+
+    // Preserve server onboarding and rule screening instead of bypassing them.
+    const joinedGuild = await client.acceptInvite(inviteCode, { bypassOnboarding: false, bypassVerify: false });
+    const guildId = String(joinedGuild?.id || '').trim();
+    if (!guildId) throw new Error('The invite did not resolve to a Discord server');
+    const cachedGuild = client.guilds?.cache?.get?.(guildId) || joinedGuild;
+    const verified = Boolean(client.guilds?.cache?.has?.(guildId));
+    return ok(res, {
+      joined: true,
+      verified,
+      inviteCode,
+      guild: { id: guildId, name: String(cachedGuild?.name || 'Discord server') },
+      message: verified ? 'Account joined the server and membership was confirmed' : 'Invite accepted, but membership could not be confirmed yet',
+    });
+  } catch (error) {
+    return fail(res, error, 400);
+  }
+});
 app.get('/api/discord/clients', (_req, res) => {
   normalizeConnectedAccountNames();
   const sessionByName = new Map([...voiceSessions.values()].map((session) => [session.name, session]));
