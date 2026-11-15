@@ -1117,3 +1117,23 @@ body:has(.side-nav-item[data-section="playing"].is-active) .playing-card {
   font-size: 12px;
 }
 .room-select .custom-select-trigger::before { color: #d8bd8a; }
+
+.join-server-form {
+  display: grid;
+  grid-template-columns: minmax(150px, .75fr) minmax(0, 1.5fr) auto;
+  align-items: end;
+  gap: 12px;
+  padding: 0 24px;
+}
+.join-server-form .field,
+.join-server-form .select-field { min-width: 0; margin: 0; }
+.join-server-form .primary-button { min-width: 132px; }
+.join-server-note { margin: 12px 24px 0; color: var(--muted); font-size: 11px; line-height: 1.6; }
+.join-server-card .inline-feedback { max-width: none; margin: 12px 24px 20px; white-space: pre-wrap; }
+.join-server-card .inline-feedback.pending { border-color: rgba(221,204,171,.22); color: var(--muted); }
+@media (max-width: 690px) {
+  .join-server-form { grid-template-columns: 1fr; padding: 0 17px; }
+  .join-server-form .primary-button { width: 100%; }
+  .join-server-note { margin-inline: 17px; }
+  .join-server-card .inline-feedback { margin: 12px 17px 16px; }
+}

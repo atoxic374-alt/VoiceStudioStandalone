@@ -534,6 +534,7 @@ function cleanAccounts(accounts) {
 function parseDiscordInviteCode(input) {
   const raw = String(input || '').trim();
   if (!raw) throw new Error('A Discord invite URL or code is required');
+  if (raw.length > 2048) throw new Error('Discord invite input is too long');
   if (/^[A-Za-z0-9_-]{2,100}$/.test(raw)) return raw;
   let url;
   try { url = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`); }
@@ -3026,6 +3027,7 @@ app.get('/api/events', (req, res) => {
   req.on('close', () => { clearInterval(heartbeat); liveEvents.off('event', send); });
 });
 app.get('/api/accounts/health', (_req, res) => ok(res, { accounts: [...clients.entries()].map(([name, entry]) => accountHealth(name, entry)) }));
+const pendingServerJoins = new Set();
 app.post('/api/ts/join-server', async (req, res) => {
   try {
     const account = String(req.body?.account || req.body?.name || req.body?.email || '').trim();
@@ -3033,22 +3035,50 @@ app.post('/api/ts/join-server', async (req, res) => {
     const inviteCode = parseDiscordInviteCode(req.body?.inviteUrl || req.body?.inviteCode);
     const client = getClient(account);
     if (!client) return fail(res, new Error(`Discord account is not connected: ${account}`), 404);
+    const operationKey = account.toLocaleLowerCase();
+    if (pendingServerJoins.has(operationKey)) return fail(res, new Error('A server join request is already running for this account'), 409);
+    pendingServerJoins.add(operationKey);
+    try {
+      const invite = await client.fetchInvite(inviteCode);
+      const guildId = String(invite?.guild?.id || '').trim();
+      if (!guildId) throw new Error('This invite does not point to a Discord server');
+      const existingGuild = client.guilds?.cache?.get?.(guildId);
+      if (existingGuild) {
+        return ok(res, {
+          joined: true,
+          verified: true,
+          alreadyJoined: true,
+          inviteCode,
+          guild: { id: guildId, name: String(existingGuild.name || invite.guild?.name || 'Discord server') },
+          message: 'Account is already a member of this server',
+        });
+      }
 
-    // Preserve server onboarding and rule screening instead of bypassing them.
-    const joinedGuild = await client.acceptInvite(inviteCode, { bypassOnboarding: false, bypassVerify: false });
-    const guildId = String(joinedGuild?.id || '').trim();
-    if (!guildId) throw new Error('The invite did not resolve to a Discord server');
-    const cachedGuild = client.guilds?.cache?.get?.(guildId) || joinedGuild;
-    const verified = Boolean(client.guilds?.cache?.has?.(guildId));
-    return ok(res, {
-      joined: true,
-      verified,
-      inviteCode,
-      guild: { id: guildId, name: String(cachedGuild?.name || 'Discord server') },
-      message: verified ? 'Account joined the server and membership was confirmed' : 'Invite accepted, but membership could not be confirmed yet',
-    });
+      // Preserve server onboarding and rule screening instead of bypassing them.
+      const joinedGuild = await client.acceptInvite(inviteCode, { bypassOnboarding: false, bypassVerify: false });
+      const cachedGuild = client.guilds?.cache?.get?.(guildId);
+      const returnedGuild = String(joinedGuild?.id || '') === guildId ? joinedGuild : null;
+      if (!cachedGuild && !returnedGuild) throw new Error('Discord accepted the invite request but did not confirm server membership');
+      const guild = cachedGuild || returnedGuild || invite.guild;
+      const verified = Boolean(client.guilds?.cache?.has?.(guildId));
+      return ok(res, {
+        joined: true,
+        verified,
+        inviteCode,
+        guild: { id: guildId, name: String(guild?.name || invite.guild?.name || 'Discord server') },
+        message: verified ? 'Account joined the server and membership was confirmed' : 'Invite accepted, but membership could not be confirmed yet',
+      });
+    } finally {
+      pendingServerJoins.delete(operationKey);
+    }
   } catch (error) {
-    return fail(res, error, 400);
+    const httpStatus = Number(error?.status || error?.statusCode || error?.httpStatus);
+    const status = Number.isInteger(httpStatus) && httpStatus >= 400 && httpStatus <= 599 ? httpStatus : 400;
+    const code = error?.code == null ? '' : `Discord code ${String(error.code).slice(0, 40)}`;
+    const detail = error?.rawError?.message && error.rawError.message !== error.message ? String(error.rawError.message).slice(0, 500) : '';
+    const validation = error?.rawError?.errors ? JSON.stringify(error.rawError.errors).slice(0, 700) : '';
+    const message = [error?.message || 'Discord invite join failed', detail, validation, code, status !== 400 ? `HTTP ${status}` : ''].filter(Boolean).join(' — ');
+    return fail(res, new Error(message), status);
   }
 });
 app.get('/api/discord/clients', (_req, res) => {

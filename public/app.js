@@ -220,8 +220,8 @@ function feedback(id, message, tone = '') {
 }
 function setBusy(key, busy) {
   if (busy) state.busy.add(key); else state.busy.delete(key);
-  const button = ({ connect: '#connectButton', join: '#joinButton', joinAll: '#joinAllButton', leave: '#leaveButton' }[key]);
-  if (button) $(button).disabled = busy;
+  const button = ({ connect: '#connectButton', join: '#joinButton', joinAll: '#joinAllButton', leave: '#leaveButton', 'join-server': '#joinServerButton' }[key]);
+  if (button) $(button).disabled = busy || (key === 'join-server' && !state.clients.length);
 }
 function playingSelectedAccounts() { return [...document.querySelectorAll('#playingAccounts input[type="checkbox"]:checked')].map((input) => input.value); }
 function updatePlayingSelection() { const count = playingSelectedAccounts().length; if ($('#playingSelectionCount')) $('#playingSelectionCount').textContent = String(count); renderPlayingChecklist(); savePlayingDraft(); }
@@ -262,6 +262,16 @@ async function loadClients(preferred = '') {
     : '<option value="">اتصل بحساب أولًا</option>';
   state.selectedAccount = state.clients.some((client) => client.name === current) ? current : (state.clients[0]?.name || '');
   select.value = state.selectedAccount;
+  const inviteAccountSelect = $('#joinServerAccount');
+  if (inviteAccountSelect) {
+    const preferredInviteAccount = inviteAccountSelect.value || state.selectedAccount;
+    inviteAccountSelect.innerHTML = state.clients.length
+      ? state.clients.map((client) => `<option value="${escapeHTML(client.name)}">${escapeHTML(client.nickname || client.displayName || client.username || client.name)}</option>`).join('')
+      : '<option value="">Connect an account first</option>';
+    inviteAccountSelect.value = state.clients.some((client) => client.name === preferredInviteAccount) ? preferredInviteAccount : state.selectedAccount;
+    inviteAccountSelect.disabled = !state.clients.length || state.busy.has('join-server');
+    $('#joinServerButton').disabled = !state.clients.length || state.busy.has('join-server');
+  }
   $('#accountBadge').textContent = state.clients.length ? `${state.clients.length} connected` : 'No accounts'; $('#navAccountCount').textContent = String(state.clients.length);
   $('#connectionLabel').textContent = state.clients.length ? `${state.clients.length} حساب متصل` : 'جاهز للاتصال';
   renderProfiles(state.clients);
@@ -270,6 +280,51 @@ async function loadClients(preferred = '') {
   loadPlayingChannels();
   await loadGuilds();
   await loadAutomationCatalog();
+}
+async function joinDiscordServer(event) {
+  event.preventDefault();
+  if (state.busy.has('join-server')) return;
+  const account = String($('#joinServerAccount')?.value || '').trim();
+  const inviteUrl = String($('#joinServerInvite')?.value || '').trim();
+  if (!account || !state.clients.some((client) => client.name === account)) {
+    feedback('#joinServerFeedback', 'Connect and select one account first.', 'error');
+    return;
+  }
+  if (!inviteUrl) {
+    feedback('#joinServerFeedback', 'Enter a Discord invite link or code.', 'error');
+    return;
+  }
+  setBusy('join-server', true);
+  $('#joinServerAccount').disabled = true;
+  $('#joinServerInvite').disabled = true;
+  $('#joinServerButton')?.setAttribute('aria-busy', 'true');
+  feedback('#joinServerFeedback', `Processing ${account}…`);
+  try {
+    const result = await api('/api/ts/join-server', {
+      method: 'POST',
+      body: JSON.stringify({ account, inviteUrl }),
+    });
+    const guildName = result.guild?.name || 'the Discord server';
+    const status = result.alreadyJoined
+      ? `${account} is already a member of ${guildName}.`
+      : result.verified === true
+      ? `Success — ${account} joined ${guildName} and membership was confirmed.`
+      : `Request accepted — membership in ${guildName} is not confirmed yet. ${result.message || ''}`.trim();
+    feedback('#joinServerFeedback', status, result.verified === true ? 'success' : 'pending');
+    addActivity('Join Discord server', `${account} · ${guildName}${result.alreadyJoined ? ' · already a member' : result.verified ? ' · confirmed' : ' · unconfirmed'}`, result.verified ? 'success' : '', account);
+    toast(result.alreadyJoined ? 'Account is already a member' : result.verified ? 'Server join confirmed' : 'Join accepted; membership pending', result.verified ? 'success' : '');
+    $('#joinServerInvite').value = '';
+  } catch (error) {
+    const reason = String(error?.message || 'Unknown error').slice(0, 1200);
+    feedback('#joinServerFeedback', `Failed for ${account}: ${reason}`, 'error');
+    addActivity('Server join failed', `${account} · ${reason}`, 'error', account);
+    toast('Server join failed — see the detailed reason below', 'error');
+  } finally {
+    setBusy('join-server', false);
+    $('#joinServerAccount').disabled = !state.clients.length;
+    $('#joinServerInvite').disabled = false;
+    $('#joinServerButton')?.removeAttribute('aria-busy');
+  }
 }
 async function loadAutomationCatalog() {
   const guildSelect = $('#automationGuild');
@@ -926,3 +981,4 @@ function init() {
   loadClients().then(() => renderPlayingAccounts()).catch(() => {}); refreshSessions(); loadTasks(); loadPlayingSessions(); connectLiveEvents(); state.taskCountdownTimer = setInterval(refreshTaskCountdowns, 1000); setInterval(() => { if (document.visibilityState !== 'visible') return; refreshSessions(); loadTasks(); loadPlayingSessions(); }, 30000);
 }
 init();
+$('#joinServerForm')?.addEventListener('submit', joinDiscordServer);
