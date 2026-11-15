@@ -192,7 +192,7 @@ button:focus-visible, input:focus-visible, select:focus-visible {
     padding: 13px 17px 11px;
     border-bottom-color: var(--line);
     background: rgba(19, 20, 17, .96);
-    backdrop-filter: blur(20px);
+    backdrop-filter: none;
   }
   .brand-lockup { padding: 0 2px; gap: 10px; }
   .brand-mark { width: 34px; height: 34px; border-radius: 11px; }
@@ -201,7 +201,12 @@ button:focus-visible, input:focus-visible, select:focus-visible {
   .side-nav {
     position: fixed;
     z-index: 80;
-    inset: auto 0 0;
+    top: auto !important;
+    right: 0 !important;
+    bottom: 0 !important;
+    left: 0 !important;
+    width: 100vw;
+    box-sizing: border-box;
     display: grid;
     grid-template-columns: repeat(6, minmax(0, 1fr));
     gap: 2px;
@@ -509,4 +514,14 @@ input[type="checkbox"], input[type="radio"] { accent-color: #a89460; }
   .side-nav-item.is-active .nav-glyph, .playing-pane.is-active, .card:not([hidden]),
   .side-nav-item.is-active .nav-count, .toast { animation: none !important; }
   *, *::before, *::after { scroll-behavior: auto !important; }
+}
+
+
+/* Responsive correction confirmed in a real 390px viewport. */
+[hidden] { display: none !important; }
+@media (max-width: 690px) {
+  .dashboard-grid { grid-template-columns: minmax(0, 1fr) !important; }
+  .column-main, .column-side { width: 100%; min-width: 0; }
+  .column-main > .card, .column-side > .card, .activity-card { min-width: 0; width: 100%; }
+  .column-side { grid-template-columns: minmax(0, 1fr); }
 }
