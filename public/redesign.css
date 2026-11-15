@@ -295,3 +295,218 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 @media (prefers-reduced-motion: reduce) {
   .side-nav-item, .primary-button, .ghost-button, .action-button, .card { animation: none; transition-duration: .01ms; }
 }
+
+
+/* Second pass — cohesive component language, clearer actions, and purposeful motion. */
+:root {
+  --accent-brass: #b9a36c;
+  --accent-olive: #8da18e;
+  --surface-raised: #24251f;
+  --motion-fast: 150ms;
+  --motion-medium: 240ms;
+  --motion-slow: 420ms;
+  --shadow-raised: 0 15px 38px rgba(0, 0, 0, .28);
+}
+.light-theme {
+  --surface-raised: #f9f8f2;
+  --shadow-raised: 0 15px 34px rgba(46, 46, 34, .12);
+}
+
+/* Clear workspace hierarchy: quiet frame, confidently bordered work surfaces. */
+.sidebar { box-shadow: inset -1px 0 rgba(216, 206, 177, .025), 12px 0 40px rgba(0, 0, 0, .08); }
+.brand-lockup { letter-spacing: .1em; }
+.side-nav-item { position: relative; overflow: hidden; transition: color var(--motion-fast) ease, background var(--motion-medium) var(--ease), border-color var(--motion-medium) ease, transform var(--motion-fast) ease; }
+.side-nav-item.is-active::after { position: absolute; inset: 9px auto 9px 0; width: 2px; border-radius: 2px; background: var(--accent-brass); content: ''; box-shadow: 0 0 12px rgba(185, 163, 108, .42); }
+.breadcrumb strong { font-size: 12px; }
+.topbar { position: sticky; top: 0; z-index: 30; background: linear-gradient(180deg, color-mix(in srgb, var(--bg) 92%, transparent), color-mix(in srgb, var(--bg) 72%, transparent)); backdrop-filter: blur(14px); }
+.hero-block { align-items: center; padding: 4px 0 8px; }
+.hero-block h1 { font-weight: 720; }
+.hero-signal { opacity: .62; }
+.card {
+  isolation: isolate;
+  transition: border-color var(--motion-medium) ease, box-shadow var(--motion-medium) ease, transform var(--motion-medium) var(--ease), background var(--motion-medium) ease;
+}
+.card::after { position: absolute; z-index: -1; inset: 0; border-radius: inherit; background: linear-gradient(135deg, rgba(255,255,255,.025), transparent 45%); opacity: .7; pointer-events: none; content: ''; }
+.card-heading { align-items: center; }
+.card-heading h2 { font-weight: 690; letter-spacing: -.025em; }
+.card-kicker, .eyebrow { letter-spacing: .14em; }
+.card-kicker { color: color-mix(in srgb, var(--accent-brass) 80%, var(--muted)); }
+.card .soft-badge { min-height: 27px; border-radius: 9px; background-color: rgba(236, 229, 207, .035); }
+
+/* One consistent button grammar; call-to-action, utility, and destructive actions stay distinct. */
+button, .room-page-button { -webkit-tap-highlight-color: transparent; }
+button:not(:disabled) { touch-action: manipulation; }
+.primary-button, .ghost-button, .action-button, .refresh-button, .room-page-button,
+.task-details-button, .task-add-button, .task-stop, .profile-leave, .modal-close-button,
+.playing-remove, .playing-customize, .playing-tab, .side-nav-item, .state-button, .media-control {
+  transition: color var(--motion-fast) ease, background-color var(--motion-fast) ease, border-color var(--motion-fast) ease, box-shadow var(--motion-fast) ease, transform var(--motion-fast) var(--ease), filter var(--motion-fast) ease;
+}
+.primary-button, .action-button { min-height: 43px; border-radius: 12px; font-size: 11px; font-weight: 740; letter-spacing: .01em; }
+.primary-button { background: linear-gradient(145deg, #a58f5b, #7e7049); box-shadow: 0 7px 18px rgba(125, 107, 62, .19), inset 0 1px rgba(255,255,255,.12); }
+.primary-button:hover:not(:disabled) { transform: translateY(-2px); filter: brightness(1.08); box-shadow: 0 11px 24px rgba(125, 107, 62, .27), inset 0 1px rgba(255,255,255,.15); }
+.ghost-button { min-height: 40px; border-color: var(--line); background: rgba(237, 230, 207, .025); color: var(--muted); }
+.ghost-button:hover:not(:disabled) { border-color: var(--line-strong); background: rgba(237, 230, 207, .075); color: var(--text); transform: translateY(-1px); }
+.action-button { min-width: 0; padding-inline: 13px; }
+.action-join:hover:not(:disabled) { border-color: rgba(145,167,151,.48); background: rgba(117,145,121,.2); color: #d3dfd0; }
+.action-secondary:hover:not(:disabled) { border-color: rgba(189,167,111,.42); background: rgba(189,167,111,.15); color: #eadbb6; }
+.action-danger:hover:not(:disabled) { border-color: rgba(215,137,125,.48); background: rgba(215,137,125,.15); color: #edb2a8; }
+button:active:not(:disabled), .room-page-button:active { transform: translateY(1px) scale(.975); }
+button:disabled { cursor: not-allowed; filter: saturate(.55); opacity: .52; }
+.primary-button:disabled, .action-button:disabled { transform: none; box-shadow: none; }
+.icon-button, .language-button { min-height: 38px; border-radius: 11px; }
+.modal-close-button { transition: transform var(--motion-fast) var(--ease), background-color var(--motion-fast) ease; }
+.modal-close-button:hover { transform: rotate(5deg) scale(1.04); }
+
+/* Intentional action order: the main voice action leads, secondary actions follow, leave actions group last. */
+.voice-actions { grid-template-columns: minmax(150px, 1.25fr) repeat(3, minmax(94px, .85fr)); align-items: stretch; }
+.voice-actions .action-join { box-shadow: inset 0 1px rgba(255,255,255,.06); }
+.setup-actions { align-items: center; }
+.setup-actions .primary-button { min-width: 132px; }
+.setup-actions .ghost-button { min-width: 116px; }
+.automation-actions { grid-template-columns: repeat(2, minmax(0,1fr)); }
+.automation-actions .action-button { min-height: 45px; }
+.quick-card .state-button { border-radius: 13px; }
+.quick-card .state-button:hover:not(:disabled) { transform: translateY(-2px); box-shadow: 0 9px 22px rgba(0,0,0,.16); }
+.state-button.is-active { border-color: rgba(189,167,111,.48); background: rgba(189,167,111,.105); }
+.activity-actions .activity-clear { border-color: rgba(215,137,125,.24); }
+
+/* Controls and collections read like a well-spaced operations console. */
+.field input, .select-field select, .site-select, .custom-select-trigger,
+.automation-guild, .playing-step input, .playing-account-phrases,
+.bulk-import textarea, .overview-tools input, .overview-tools select,
+.playing-event-filters input, .playing-event-filters select {
+  min-height: 42px;
+  border-radius: 11px;
+  transition: border-color var(--motion-fast) ease, background-color var(--motion-fast) ease, box-shadow var(--motion-fast) ease;
+}
+.field input:focus, .select-field select:focus, .site-select:focus, .automation-guild:focus,
+.playing-step input:focus, .playing-account-phrases:focus, .bulk-import textarea:focus {
+  border-color: rgba(145,167,151,.66);
+  box-shadow: 0 0 0 3px rgba(145,167,151,.09);
+}
+input[type="checkbox"], input[type="radio"] { accent-color: #a89460; }
+::selection { color: #f7f5ed; background: rgba(145, 167, 151, .38); }
+
+/* Repeated information: consistent card rows, restrained status color, legible empty states. */
+.session-row, .profile-row, .playing-session, .playing-control-item,
+.task-row, .task-detail-account, .playing-event, .operation-account {
+  transition: border-color var(--motion-fast) ease, background-color var(--motion-fast) ease, transform var(--motion-fast) var(--ease);
+}
+.session-row:hover, .profile-row:hover, .playing-session:hover, .playing-control-item:hover,
+.task-detail-account:hover, .operation-account:hover { border-color: var(--line-strong); transform: translateY(-1px); }
+.profile-row-main strong, .session-info strong, .playing-account strong { font-weight: 680; }
+.empty-state, .task-empty { border-radius: 13px; }
+.empty-state { min-height: 136px; background: rgba(238,232,211,.015); }
+.health-pill, .playing-summary span, .playing-check { border-radius: 8px; }
+.health-pill.healthy, .playing-check.is-ok { color: #bdd0bc; }
+.playing-check.is-missing { color: #e2a79b; }
+
+/* Playbook: numbered steps, clear tab state and an anchored run panel. */
+.playing-card { border-color: var(--line); background: linear-gradient(145deg, rgba(31,31,27,.98), rgba(24,25,21,.97)); }
+.playing-hero { align-items: center; border-bottom-color: var(--line); }
+.playing-hero-copy h2 { font-weight: 720; }
+.playing-live { border-color: rgba(145,167,151,.23); background: rgba(145,167,151,.07); }
+.playing-live strong { color: #bed0bc; }
+.playing-tabs { background: rgba(0,0,0,.07); }
+.playing-tab { border-radius: 10px 10px 0 0; }
+.playing-tab:hover:not(.is-active) { background: rgba(238,232,211,.04); }
+.playing-tab.is-active { background: rgba(145,167,151,.085); }
+.playing-tab.is-active::after { background: var(--accent-brass); }
+.playing-tab.is-active b, .playing-tab.is-active span { color: #bdd0bc; }
+.playing-step-label, .playing-section-kicker { color: #c1ae7e; }
+.playing-pane-icon { border-color: rgba(189,167,111,.25); background: rgba(189,167,111,.09); color: var(--violet-bright); }
+.playing-run-panel { border-color: rgba(145,167,151,.21); background: rgba(117,145,121,.055); }
+.playing-run-panel .playing-actions { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 7px; }
+.playing-run-panel .playing-actions .action-button { grid-column: 1 / -1; }
+.playing-run-panel #playingPreviewButton, .playing-run-panel #playingSave { grid-column: auto; }
+.playing-sticky-controls { border-color: rgba(189,167,111,.26); background: rgba(28,29,25,.95); }
+.playing-preview { border-color: rgba(145,167,151,.26); background: rgba(145,167,151,.035); }
+.playing-preview-row b, .playing-event-kind, .playing-account-log > header strong { color: #b9ccb8; }
+.playing-control-item:has(input:checked), .playing-account:has(input:checked) { border-color: rgba(145,167,151,.46); background: rgba(117,145,121,.09); }
+.playing-control-state { transition: background-color var(--motion-fast) ease, box-shadow var(--motion-fast) ease; }
+.playing-session.is-active .playing-last { color: #bdd0bc; }
+
+/* Dialogs, alerts and status feedback share the same material and hierarchy. */
+.operation-modal, .task-details-modal { background: rgba(9,10,8,.78); backdrop-filter: blur(13px); }
+.operation-dialog, .task-details-dialog {
+  border-color: var(--line-strong);
+  border-radius: 20px;
+  background: linear-gradient(145deg, #24251f, #171814);
+  box-shadow: 0 28px 86px rgba(0,0,0,.48);
+}
+.auth-dialog { border-color: rgba(189,167,111,.26); border-radius: 21px; }
+.modal-close-button { background: rgba(215,137,125,.09); }
+.inline-feedback, .auth-feedback { min-height: 22px; }
+.toast { border-radius: 12px; animation: toast-enter 260ms var(--ease) both; }
+.toast.success { border-color: rgba(145,167,151,.42); }
+.toast.error { border-color: rgba(215,137,125,.46); }
+
+/* Distinct but calm motion: entrance, focus, selection and audio activity. */
+@keyframes panel-enter {
+  from { opacity: 0; transform: translateY(12px) scale(.994); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+@keyframes control-pop {
+  0% { opacity: 0; transform: translateY(5px) scale(.985); }
+  70% { opacity: 1; transform: translateY(-1px) scale(1.004); }
+  100% { opacity: 1; transform: none; }
+}
+@keyframes active-glow {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(145,167,151,0); }
+  50% { box-shadow: 0 0 0 4px rgba(145,167,151,.075); }
+}
+@keyframes toast-enter {
+  from { opacity: 0; transform: translateY(9px) scale(.985); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+.side-nav-item.is-active .nav-glyph { animation: control-pop 280ms var(--ease) both; }
+.playing-pane.is-active { animation: panel-enter var(--motion-slow) var(--ease) both; }
+.card:not([hidden]) { animation: panel-enter 360ms var(--ease) both; }
+.card[hidden] { display: none !important; }
+.side-nav-item.is-active .nav-count { animation: active-glow 2.6s ease-in-out infinite; }
+.primary-button:focus-visible, .action-join:focus-visible { box-shadow: 0 0 0 4px rgba(185,163,108,.16); }
+
+/* Respect the light theme without changing the selected palette or control behavior. */
+.light-theme .sidebar { background: rgba(244,243,236,.96); }
+.light-theme .topbar { background: linear-gradient(180deg, rgba(239,238,232,.94), rgba(239,238,232,.72)); }
+.light-theme .card, .light-theme .playing-card { background: linear-gradient(145deg, rgba(255,255,251,.98), rgba(247,246,239,.98)); }
+.light-theme .field input, .light-theme .select-field select, .light-theme .site-select,
+.light-theme .custom-select-trigger, .light-theme .automation-guild, .light-theme .multi-select,
+.light-theme .playing-step input, .light-theme .playing-account-phrases,
+.light-theme .overview-tools input, .light-theme .overview-tools select,
+.light-theme .playing-event-filters input, .light-theme .playing-event-filters select {
+  background-color: rgba(226, 225, 213, .42);
+}
+.light-theme .operation-dialog, .light-theme .task-details-dialog, .light-theme .auth-dialog {
+  background: linear-gradient(145deg, #fffefa, #f0efe7);
+}
+.light-theme .side-nav-item.is-active { background: linear-gradient(100deg, rgba(143,123,78,.13), rgba(143,123,78,.04)); }
+
+@media (max-width: 760px) {
+  .voice-actions { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .voice-actions .action-join { grid-column: 1 / -1; }
+  .voice-actions .action-secondary { grid-column: 1 / -1; }
+  .setup-actions { gap: 8px; }
+  .setup-actions .primary-button, .setup-actions .ghost-button { min-width: 0; width: 100%; }
+  .playing-run-panel .playing-actions { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .playing-run-panel .playing-actions .action-button { min-height: 42px; }
+  .playing-pane-head { align-items: center; }
+  .playing-section-head { align-items: flex-start; }
+}
+@media (max-width: 420px) {
+  .voice-actions { gap: 7px; }
+  .voice-actions .action-button { padding-inline: 8px; font-size: 9px; }
+  .playing-run-panel .playing-actions { grid-template-columns: 1fr; }
+  .playing-run-panel .playing-actions .action-button { grid-column: 1; }
+  .playing-tab small { display: none; }
+  .playing-tab { min-width: 82px; grid-template-columns: 19px 1fr; }
+  .topbar { height: 56px; }
+}
+@media (hover: hover) and (pointer: fine) {
+  .card:hover { border-color: var(--line-strong); box-shadow: var(--shadow-raised); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .side-nav-item.is-active .nav-glyph, .playing-pane.is-active, .card:not([hidden]),
+  .side-nav-item.is-active .nav-count, .toast { animation: none !important; }
+  *, *::before, *::after { scroll-behavior: auto !important; }
+}
