@@ -149,7 +149,7 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--green); }
 .quick-card { background: #f9fbf9; }
 .quick-card .state-grid { grid-template-columns: repeat(2,minmax(0,1fr)); padding: 0 18px; }
 .state-button, .media-control { border-color: var(--line); border-radius: 10px; background: #fff; }
-.state-button:hover:not(:disabled), .media-control:hover:not(:disabled) { border-color: #acd0b6; background: #f7fbf8; box-shadow: none; transform: none; }
+.state-button:hover:not(:disabled), .media-control:hover:not(:disabled) { border-color: #abd0b5; background: #f7fbf8; box-shadow: none; transform: none; }
 .state-button.is-active, .media-control.is-active, .channel-check:has(input:checked), .state-option.is-selected {
   border-color: #9fc8aa; background: #eff7f1; color: #17683e;
 }
@@ -431,3 +431,31 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--green); }
 .light-theme .field input, .light-theme .select-field select, .light-theme .site-select,
 .light-theme .custom-select-trigger, .light-theme .automation-guild, .light-theme .multi-select,
 .light-theme .playing-step input, .light-theme .playing-account-phrases { background-color: #fbfcfb; }
+
+
+/* Compact, balanced server/room selectors. */
+.custom-select.server-select > .custom-select-trigger,
+.custom-select.room-select > .custom-select-trigger {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  width: 100%; min-width: 0; min-height: 42px; height: 42px;
+  padding: 0 13px; font-size: 12px; line-height: 1.15;
+}
+.custom-select.server-select > .custom-select-trigger > span,
+.custom-select.room-select > .custom-select-trigger > span {
+  flex: 1 1 auto; min-width: 0; overflow: hidden;
+  text-align: center; text-overflow: ellipsis; white-space: nowrap;
+}
+.custom-select.server-select > .custom-select-trigger > i,
+.custom-select.room-select > .custom-select-trigger > i { flex: 0 0 auto; font-style: normal; }
+@media (max-width: 700px) {
+  .custom-select.server-select > .custom-select-trigger,
+  .custom-select.room-select > .custom-select-trigger { min-height: 42px; height: 42px; padding-inline: 12px; font-size: 12px; }
+}
+
+.top-mic {
+  border-color: rgba(33,134,83,.25) !important;
+  background: linear-gradient(145deg, rgba(33,134,83,.10), rgba(33,134,83,.035)) !important;
+  color: var(--green) !important;
+  box-shadow: 0 0 12px rgba(33,134,83,.07) !important;
+}
+.top-mic-pulse { border-color: rgba(33,134,83,.38) !important; }
