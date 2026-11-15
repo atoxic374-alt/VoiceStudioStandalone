@@ -497,6 +497,15 @@ function fail(res, error, status = 200, payload = {}) {
   const message = redact(error?.message || String(error || 'Unknown error'));
   return res.status(status).json({ success: false, error: message, ...payload });
 }
+function discordErrorDetails(error, fallback = 'Discord request failed') {
+  const code = error?.code == null ? '' : `Discord code ${String(error.code).slice(0, 40)}`;
+  const status = Number(error?.status || error?.statusCode || error?.httpStatus);
+  const statusText = Number.isInteger(status) && status >= 400 && status <= 599 ? `HTTP ${status}` : '';
+  const detail = error?.rawError?.message && error.rawError.message !== error.message ? String(error.rawError.message).slice(0, 500) : '';
+  let validation = '';
+  try { if (error?.rawError?.errors) validation = JSON.stringify(error.rawError.errors).slice(0, 700); } catch {}
+  return redact([error?.message || fallback, detail, validation, code, statusText].filter(Boolean).join(' — ')).slice(0, 1200);
+}
 function parseCookies(req) { const result = {}; for (const part of String(req.headers.cookie || '').split(';')) { const separator = part.indexOf('='); if (separator < 1) continue; const key = part.slice(0, separator).trim(); const raw = part.slice(separator + 1).trim(); try { result[key] = decodeURIComponent(raw); } catch {} } return result; }
 function authSignature(value, secret = process.env.APP_PASSWORD || 'disabled') { return crypto.createHmac('sha256', secret).update(value).digest('base64url'); }
 function hashSecret(value) { return crypto.createHash('sha256').update(String(value)).digest('hex'); }
@@ -3084,12 +3093,73 @@ app.post('/api/ts/join-server', async (req, res) => {
   } catch (error) {
     const httpStatus = Number(error?.status || error?.statusCode || error?.httpStatus);
     const status = Number.isInteger(httpStatus) && httpStatus >= 400 && httpStatus <= 599 ? httpStatus : 400;
-    const code = error?.code == null ? '' : `Discord code ${String(error.code).slice(0, 40)}`;
-    const detail = error?.rawError?.message && error.rawError.message !== error.message ? String(error.rawError.message).slice(0, 500) : '';
-    const validation = error?.rawError?.errors ? JSON.stringify(error.rawError.errors).slice(0, 700) : '';
-    const message = [error?.message || 'Discord invite join failed', detail, validation, code, status !== 400 ? `HTTP ${status}` : ''].filter(Boolean).join(' — ');
-    return fail(res, new Error(message), status);
+    return fail(res, new Error(discordErrorDetails(error, 'Discord invite join failed')), status);
   }
+});
+app.post('/api/ts/check-membership', async (req, res) => {
+  const inviteCode = (() => {
+    try { return parseDiscordInviteCode(req.body?.inviteUrl || req.body?.inviteCode); }
+    catch (error) { return error; }
+  })();
+  if (inviteCode instanceof Error) return fail(res, inviteCode, 400);
+  const accountNames = cleanAccounts(req.body?.accounts);
+  if (!accountNames.length) return fail(res, new Error('Select at least one connected account'), 400);
+  const inviteResolver = accountNames.map((name) => getClient(name)).find(Boolean);
+  if (!inviteResolver) return fail(res, new Error('None of the selected accounts is connected'), 404);
+
+  let invite;
+  try { invite = await inviteResolver.fetchInvite(inviteCode); }
+  catch (error) {
+    const httpStatus = Number(error?.status || error?.statusCode || error?.httpStatus);
+    const status = Number.isInteger(httpStatus) && httpStatus >= 400 && httpStatus <= 599 ? httpStatus : 400;
+    return fail(res, new Error(discordErrorDetails(error, 'Unable to resolve Discord invite')), status);
+  }
+  const guildId = String(invite?.guild?.id || '').trim();
+  if (!guildId) return fail(res, new Error('This invite does not point to a Discord server'), 400);
+
+  const results = [];
+  for (const name of accountNames) {
+    const client = getClient(name);
+    if (!client) {
+      results.push({ name, ok: false, error: 'Account is not connected' });
+      continue;
+    }
+    if (pendingServerJoins.has(name.toLocaleLowerCase())) {
+      results.push({ name, ok: false, error: 'A server join is currently running for this account' });
+      continue;
+    }
+    try {
+      let guild = client.guilds?.cache?.get?.(guildId) || null;
+      if (!guild) {
+        const guilds = await client.guilds.fetch();
+        guild = guilds?.get?.(guildId) || client.guilds?.cache?.get?.(guildId) || null;
+      }
+      const member = Boolean(guild);
+      results.push({
+        name,
+        ok: true,
+        member,
+        skipped: member,
+        status: member ? 'already_member' : 'not_member',
+        guild: { id: guildId, name: String(guild?.name || invite.guild?.name || 'Discord server') },
+        message: member ? 'Already a member — skipped' : 'Not a member — no join was attempted',
+      });
+    } catch (error) {
+      results.push({ name, ok: false, error: discordErrorDetails(error, 'Membership check failed') });
+    }
+  }
+  const summary = {
+    total: results.length,
+    members: results.filter((item) => item.ok && item.member).length,
+    notMembers: results.filter((item) => item.ok && !item.member).length,
+    failed: results.filter((item) => !item.ok).length,
+  };
+  return ok(res, {
+    inviteCode,
+    guild: { id: guildId, name: String(invite.guild?.name || 'Discord server') },
+    results,
+    summary,
+  });
 });
 app.get('/api/discord/clients', (_req, res) => {
   normalizeConnectedAccountNames();

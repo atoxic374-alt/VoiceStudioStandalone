@@ -76,8 +76,15 @@
                 <label class="field"><span>Invite link or code</span><input id="joinServerInvite" type="text" maxlength="2048" placeholder="https://discord.gg/..." autocomplete="off" required /></label>
                 <button id="joinServerButton" class="primary-button" type="submit" disabled>Join server</button>
               </form>
-              <p class="join-server-note">One selected account per request. Discord onboarding, verification and CAPTCHA challenges are not bypassed.</p>
+              <p class="join-server-note">Join affects one selected account. The multi-account check below is read-only; Discord verification and CAPTCHA are never bypassed.</p>
               <div id="joinServerFeedback" class="inline-feedback" role="status" aria-live="polite"></div>
+              <section class="membership-check-panel" aria-labelledby="membershipCheckTitle">
+                <div class="membership-check-head"><div><strong id="membershipCheckTitle">Check membership</strong><small>Read-only check — no accounts will be joined</small></div><div class="membership-check-actions"><button id="selectAllMembershipAccounts" class="ghost-button" type="button" disabled>Select all</button><button id="clearMembershipAccounts" class="ghost-button" type="button" disabled>Clear</button></div></div>
+                <div id="membershipAccountList" class="account-targets membership-account-list"><div class="task-empty">Connect accounts to check membership</div></div>
+                <button id="checkMembershipButton" class="action-button action-secondary membership-check-button" type="button" disabled>Check selected accounts</button>
+                <div id="membershipCheckSummary" class="inline-feedback" role="status" aria-live="polite"></div>
+                <div id="membershipCheckResults" class="membership-check-results" aria-live="polite"></div>
+              </section>
             </article>
 
             <article class="card channel-card" data-panel="voice">

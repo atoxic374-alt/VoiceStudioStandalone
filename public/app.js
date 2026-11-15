@@ -18,6 +18,7 @@ const state = {
   lastOperation: null, authenticated: false, mediaBusy: false, tasks: [],
   refreshPromise: null, liveEvents: null, liveRefreshTimer: null, taskCountdownTimer: null,
   playingSessions: [], playingSessionsPromise: null,
+  membershipCheckBusy: false,
 };
 
 let authPromptPromise = null;
@@ -252,6 +253,60 @@ async function previewPlaying() { const steps = playingSteps(); try { const data
 async function saveAndRunPlaying() { if (!renderPlayingChecklist()) { toast('أكمل قائمة التحقق أولًا', 'error'); return; } if (await savePlaying()) await startPlaying(); }
 function initPlaying() { addPlayingStep(); restorePlayingDraft(); renderPlayingAccounts(); loadPlayingChannels(); const refreshChecklist = () => { renderPlayingChecklist(); savePlayingDraft(); }; $('#playingSummaryToggle')?.addEventListener('click', () => { const summary = $('#playingSummary'); const button = $('#playingSummaryToggle'); const expanded = button.getAttribute('aria-expanded') === 'true'; summary.hidden = expanded; button.setAttribute('aria-expanded', String(!expanded)); button.querySelector('span').textContent = expanded ? 'Show overview' : 'Hide overview'; }); $('#playingGuildSelect')?.addEventListener('change', () => { $('#playingChannelId').value = ''; $('#playingChannelName').value = ''; $('#playingChannelSearch').value = ''; state.playingChannelAccounts = []; loadPlayingChannels(); refreshChecklist(); }); $('#playingChannelSearch')?.addEventListener('input', (event) => loadPlayingChannels(event.target.value)); $('#playingChannelSelect')?.addEventListener('change', (event) => { $('#playingChannelId').value = event.target.value; $('#playingChannelName').value = event.target.selectedOptions[0]?.dataset.channelName || ''; state.playingChannelAccounts = state.playingChannels?.find((channel) => channel.id === event.target.value)?.accounts || []; renderPlayingAccounts(); refreshChecklist(); }); document.querySelectorAll('#playingScenarioName, #playingInterval, #playingAccountDelay').forEach((input) => input.addEventListener('input', refreshChecklist)); $('#playingEventSearch')?.addEventListener('input', renderPlayingEvents); $('#playingEventAccount')?.addEventListener('change', renderPlayingEvents); $('#playingEventFilter')?.addEventListener('change', renderPlayingEvents); document.querySelectorAll('[data-playing-tab]').forEach((button) => button.addEventListener('click', () => { const tab = button.dataset.playingTab; document.querySelectorAll('[data-playing-tab]').forEach((item) => { const active = item === button; item.classList.toggle('is-active', active); item.setAttribute('aria-selected', String(active)); }); document.querySelectorAll('[data-playing-pane]').forEach((pane) => { const active = pane.dataset.playingPane === tab; pane.classList.toggle('is-active', active); pane.toggleAttribute('hidden', !active); }); if (tab === 'activity') loadPlayingEvents(); })); $('#playingAddStep')?.addEventListener('click', () => addPlayingStep()); $('#playingSelectAll')?.addEventListener('click', () => { const boxes = [...document.querySelectorAll('#playingAccounts input:not(:disabled)')]; const all = boxes.length && boxes.every((box) => box.checked); boxes.forEach((box) => { box.checked = !all; }); updatePlayingSelection(); }); $('#playingSave')?.addEventListener('click', savePlaying); $('#playingSaveRun')?.addEventListener('click', saveAndRunPlaying); $('#playingCancelEdit')?.addEventListener('click', cancelPlayingEdit); $('#playingPreviewButton')?.addEventListener('click', previewPlaying); $('#playingPreviewToggle')?.addEventListener('click', () => { const preview = $('#playingPreview'); const button = $('#playingPreviewToggle'); const expanded = button.getAttribute('aria-expanded') === 'true'; preview.hidden = expanded; button.setAttribute('aria-expanded', String(!expanded)); button.textContent = expanded ? 'Show preview' : 'Hide preview'; }); $('#playingStart')?.addEventListener('click', startPlaying); $('#playingStop')?.addEventListener('click', stopPlayingSessions); $('#playingRestart')?.addEventListener('click', restartPlayingSessions); $('#playingEmergency')?.addEventListener('click', async () => { const active = (state.playingSessions || []).filter((session) => session.active).length; await api('/api/playing/emergency-stop', { method: 'POST', body: '{}' }); toast(`تم إيقاف ${active} جلسة فورًا`, 'success'); await loadPlayingSessions(); }); $('#playingRefreshEvents')?.addEventListener('click', loadPlayingEvents); document.querySelectorAll('[data-playing-pane]').forEach((pane, index) => { if (index > 0) pane.hidden = true; }); loadPlayingSessions(); renderPlayingChecklist(); }
 
+function selectedMembershipAccounts() {
+  return [...document.querySelectorAll('#membershipAccountList input[type="checkbox"]:checked')].map((input) => input.value);
+}
+function renderMembershipAccounts() {
+  const root = $('#membershipAccountList');
+  if (!root) return;
+  const selected = new Set(selectedMembershipAccounts());
+  root.innerHTML = state.clients.length
+    ? state.clients.map((client) => `<label class="membership-account-item"><input type="checkbox" value="${escapeHTML(client.name)}" ${selected.has(client.name) ? 'checked' : ''} ${state.membershipCheckBusy ? 'disabled' : ''} /><span class="membership-account-copy"><strong>${escapeHTML(client.nickname || client.displayName || client.username || client.name)}</strong><small>${escapeHTML(client.name)}</small></span></label>`).join('')
+    : '<div class="task-empty">Connect accounts to check membership</div>';
+  root.querySelectorAll('input[type="checkbox"]').forEach((input) => input.addEventListener('change', updateMembershipControls));
+  updateMembershipControls();
+}
+function updateMembershipControls() {
+  const count = selectedMembershipAccounts().length;
+  const connected = state.clients.length > 0;
+  $('#checkMembershipButton').disabled = !connected || !count || state.membershipCheckBusy;
+  $('#selectAllMembershipAccounts').disabled = !connected || state.membershipCheckBusy;
+  $('#clearMembershipAccounts').disabled = !count || state.membershipCheckBusy;
+  if ($('#checkMembershipButton')) $('#checkMembershipButton').textContent = state.membershipCheckBusy ? 'Checking membership…' : `Check selected accounts${count ? ` (${count})` : ''}`;
+}
+function renderMembershipResults(results, guild) {
+  const root = $('#membershipCheckResults');
+  if (!root) return;
+  root.innerHTML = results.length ? `<div class="membership-result-heading">${escapeHTML(guild?.name || 'Discord server')} · ${results.length} account${results.length === 1 ? '' : 's'}</div>` + results.map((result) => {
+    const tone = !result.ok ? 'is-error' : result.member ? 'is-member' : 'is-not-member';
+    const label = !result.ok ? 'Check failed' : result.member ? 'Already a member · skipped' : 'Not a member · no join attempted';
+    const detail = result.ok ? (result.message || '') : (result.error || 'Membership check failed');
+    return `<div class="membership-result ${tone}"><span class="membership-result-mark" aria-hidden="true">${!result.ok ? '!' : result.member ? '✓' : '–'}</span><span><strong>${escapeHTML(accountNickname(result.name))}</strong><small>${escapeHTML(result.name)} · ${escapeHTML(label)}</small>${detail ? `<small class="membership-result-detail">${escapeHTML(detail)}</small>` : ''}</span></div>`;
+  }).join('') : '';
+}
+async function checkServerMembership() {
+  const accounts = selectedMembershipAccounts();
+  const inviteUrl = String($('#joinServerInvite')?.value || '').trim();
+  if (!inviteUrl) { feedback('#membershipCheckSummary', 'Enter a Discord invite link or code above first.', 'error'); $('#joinServerInvite')?.focus(); return; }
+  if (!accounts.length) { feedback('#membershipCheckSummary', 'Select at least one connected account.', 'error'); return; }
+  if (state.membershipCheckBusy) return;
+  state.membershipCheckBusy = true;
+  renderMembershipAccounts();
+  feedback('#membershipCheckSummary', `Checking ${accounts.length} selected account${accounts.length === 1 ? '' : 's'}…`);
+  $('#membershipCheckResults').innerHTML = '';
+  try {
+    const result = await api('/api/ts/check-membership', { method: 'POST', body: JSON.stringify({ accounts, inviteUrl }) });
+    renderMembershipResults(result.results || [], result.guild);
+    const summary = result.summary || {};
+    const text = `${summary.members || 0} already members · ${summary.notMembers || 0} not members · ${summary.failed || 0} checks failed`;
+    feedback('#membershipCheckSummary', text, summary.failed ? 'pending' : 'success');
+  } catch (error) {
+    feedback('#membershipCheckSummary', error.message || 'Membership check failed.', 'error');
+  } finally {
+    state.membershipCheckBusy = false;
+    renderMembershipAccounts();
+  }
+}
 async function loadClients(preferred = '') {
   const data = await api('/api/discord/clients');
   state.clients = data.clients || [];
@@ -272,6 +327,7 @@ async function loadClients(preferred = '') {
     inviteAccountSelect.disabled = !state.clients.length || state.busy.has('join-server');
     $('#joinServerButton').disabled = !state.clients.length || state.busy.has('join-server');
   }
+  renderMembershipAccounts();
   $('#accountBadge').textContent = state.clients.length ? `${state.clients.length} connected` : 'No accounts'; $('#navAccountCount').textContent = String(state.clients.length);
   $('#connectionLabel').textContent = state.clients.length ? `${state.clients.length} حساب متصل` : 'جاهز للاتصال';
   renderProfiles(state.clients);
@@ -982,3 +1038,6 @@ function init() {
 }
 init();
 $('#joinServerForm')?.addEventListener('submit', joinDiscordServer);
+$('#checkMembershipButton')?.addEventListener('click', checkServerMembership);
+$('#selectAllMembershipAccounts')?.addEventListener('click', () => { document.querySelectorAll('#membershipAccountList input[type="checkbox"]').forEach((input) => { input.checked = true; }); updateMembershipControls(); });
+$('#clearMembershipAccounts')?.addEventListener('click', () => { document.querySelectorAll('#membershipAccountList input[type="checkbox"]').forEach((input) => { input.checked = false; }); updateMembershipControls(); });

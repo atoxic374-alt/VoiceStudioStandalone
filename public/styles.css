@@ -1137,3 +1137,38 @@ body:has(.side-nav-item[data-section="playing"].is-active) .playing-card {
   .join-server-note { margin-inline: 17px; }
   .join-server-card .inline-feedback { margin: 12px 17px 16px; }
 }
+
+
+/* Read-only multi-account Discord membership checks */
+.membership-check-panel { position: relative; margin: 9px 25px 24px; padding: 14px; border: 1px solid var(--line); border-radius: 15px; background: rgba(255,255,255,.025); }
+.membership-check-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 11px; }
+.membership-check-head strong, .membership-check-head small { display: block; }
+.membership-check-head strong { font-size: 11px; }
+.membership-check-head small { margin-top: 3px; color: var(--muted); font-size: 9px; }
+.membership-check-actions { display: flex; gap: 6px; }
+.membership-check-actions .ghost-button { min-height: 30px; padding: 0 9px; font-size: 9px; }
+.membership-account-list { display: grid; gap: 6px; max-height: 220px; overflow-y: auto; }
+.membership-account-item { display: flex; align-items: center; gap: 9px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px; background: rgba(255,255,255,.02); cursor: pointer; }
+.membership-account-item:has(input:checked) { border-color: rgba(197,168,117,.58); background: rgba(197,168,117,.08); }
+.membership-account-item input { accent-color: var(--cyan); }
+.membership-account-copy { min-width: 0; }
+.membership-account-copy strong, .membership-account-copy small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.membership-account-copy strong { font-size: 10px; }
+.membership-account-copy small { color: var(--muted); font-size: 8px; }
+.membership-check-button { width: 100%; margin-top: 10px; }
+.membership-check-button:disabled, .membership-check-actions button:disabled { cursor: not-allowed; opacity: .48; }
+.membership-check-results { display: grid; gap: 6px; margin-top: 8px; }
+.membership-result-heading { padding: 5px 1px; color: var(--muted); font-size: 9px; font-weight: 700; }
+.membership-result { display: flex; align-items: flex-start; gap: 9px; padding: 9px; border: 1px solid var(--line); border-radius: 10px; background: rgba(255,255,255,.02); }
+.membership-result-mark { display: grid; width: 20px; height: 20px; flex: 0 0 20px; place-items: center; border-radius: 7px; background: rgba(140,149,181,.12); color: var(--muted); font-size: 11px; font-weight: 800; }
+.membership-result > span:last-child { min-width: 0; }
+.membership-result strong, .membership-result small { display: block; overflow-wrap: anywhere; }
+.membership-result strong { font-size: 10px; }
+.membership-result small { margin-top: 2px; color: var(--muted); font-size: 8px; }
+.membership-result .membership-result-detail { color: var(--red); }
+.membership-result.is-member { border-color: rgba(197,168,117,.28); }
+.membership-result.is-member .membership-result-mark { background: rgba(197,168,117,.13); color: var(--green); }
+.membership-result.is-not-member .membership-result-mark { background: rgba(140,149,181,.12); color: var(--muted); }
+.membership-result.is-error { border-color: rgba(255,113,139,.35); background: rgba(255,113,139,.04); }
+.membership-result.is-error .membership-result-mark { background: rgba(255,113,139,.13); color: var(--red); }
+@media (max-width: 690px) { .membership-check-panel { margin-left: 18px; margin-right: 18px; padding: 11px; }.membership-check-head { align-items: flex-start; flex-direction: column; }.membership-check-actions { width: 100%; }.membership-check-actions .ghost-button { flex: 1; } }
