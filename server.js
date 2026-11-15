@@ -1137,6 +1137,11 @@ function isInvalidCredentialError(error) {
   const text = String(error?.error || error?.message || '').toLowerCase();
   return status === 401 || code === 40001 || code === 4004 || /invalid token|improper token|token is invalid|incorrect login details/.test(text);
 }
+function isCaptchaChallengeError(error) {
+  const code = String(error?.code || '').toUpperCase();
+  const text = String(error?.error || error?.message || '').toLowerCase();
+  return code.includes('CAPTCHA_SOLVER_NOT_IMPLEMENTED') || /captcha|human verification required/.test(text);
+}
 async function withResultRetry(worker, maxRetries = 2) {
   let last = null;
   for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
@@ -2359,7 +2364,7 @@ async function connectOneWithRetry(token, name) {
       // A temporary gateway/network/rate-limit failure is not evidence that
       // Discord rotated or revoked the token. Do not label or destroy the
       // account for that case; the caller can retry it later.
-      if (isInvalidCredentialError(error)) break;
+      if (isInvalidCredentialError(error) || isCaptchaChallengeError(error)) break;
       if (attempt === 0) await new Promise((resolve) => setTimeout(resolve, 500));
     }
   }
@@ -2367,6 +2372,11 @@ async function connectOneWithRetry(token, name) {
   if (isInvalidCredentialError(lastError)) {
     markTokenChanged(finalName, String(token || '').trim(), lastError);
     throw new Error('Invalid Discord token: Discord rejected the token or it was revoked');
+  }
+  if (isCaptchaChallengeError(lastError)) {
+    const verificationError = new Error('Discord requires CAPTCHA or additional verification for this account. VoiceStudio cannot solve or bypass this check. Complete any verification in the official Discord app or website, then retry manually if Discord allows it.');
+    recordFailedAccount(finalName, String(token || '').trim(), verificationError, 'verification-required');
+    throw verificationError;
   }
   recordFailedAccount(finalName, String(token || '').trim(), lastError, 'connection-failed');
   throw new Error(`Temporary Discord connection failure after retry: ${lastError?.message || 'Gateway unavailable'}`);
@@ -3758,4 +3768,4 @@ if (require.main === module) {
   process.once('SIGINT', () => { persistBeforeExit(); process.exit(0); });
 }
 
-module.exports = { app, clients, voiceSessions, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, recordSuccessfulCycleState, playingSessions, stopPlayingSession, schedulePlaying, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, hardenVoiceConnection, cleanupPrimaryStreamAttempt, guardVoiceWebSocketTeardown, safeErrorSummary, buildAccountSnapshot, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, registerAccountStreamer, mediaStreamers, mediaQueueSnapshot, ensureSyntheticVideo, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanAccountRecords, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, isRecoverableDiscordInteractionError };
+module.exports = { app, clients, voiceSessions, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, recordSuccessfulCycleState, playingSessions, stopPlayingSession, schedulePlaying, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, hardenVoiceConnection, cleanupPrimaryStreamAttempt, guardVoiceWebSocketTeardown, safeErrorSummary, buildAccountSnapshot, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, registerAccountStreamer, mediaStreamers, mediaQueueSnapshot, ensureSyntheticVideo, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, isCaptchaChallengeError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanAccountRecords, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, isRecoverableDiscordInteractionError };

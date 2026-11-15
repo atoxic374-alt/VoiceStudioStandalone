@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
-const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, recordSuccessfulCycleState, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, registerAccountStreamer, mediaStreamers, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, schedulePlaying, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, cleanAccountRecords, buildAccountSnapshot, safeErrorSummary, guardVoiceWebSocketTeardown, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanupPrimaryStreamAttempt, isRecoverableDiscordInteractionError } = require('../server');
+const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, recordSuccessfulCycleState, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, registerAccountStreamer, mediaStreamers, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, schedulePlaying, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, cleanAccountRecords, buildAccountSnapshot, safeErrorSummary, guardVoiceWebSocketTeardown, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, isCaptchaChallengeError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanupPrimaryStreamAttempt, isRecoverableDiscordInteractionError } = require('../server');
 const VoiceWebSocket = require('discord.js-selfbot-v13/src/client/voice/networking/VoiceWebSocket');
 
 test('captures delayed errors from a WebSocket after voice teardown without suppressing live errors', () => {
@@ -102,6 +102,11 @@ test('does not restore a previous deafen state after a failed camera or stream s
   });
 });
 
+test('recognizes CAPTCHA challenges as manual-verification failures', () => {
+  assert.equal(isCaptchaChallengeError({ message: 'CAPTCHA_SOLVER_NOT_IMPLEMENTED — Discord code 500' }), true);
+  assert.equal(isCaptchaChallengeError({ code: 'CAPTCHA_SOLVER_NOT_IMPLEMENTED' }), true);
+  assert.equal(isCaptchaChallengeError({ message: 'Gateway temporarily unavailable' }), false);
+});
 test('retries transient live voice target confirmation failures', () => {
   assert.equal(retryableError({ error: 'Live voice target changed or is no longer available' }), true);
   assert.equal(retryableError({ error: 'Voice state mismatch for channel channel-1: gateway=none, connection=none' }), true);
