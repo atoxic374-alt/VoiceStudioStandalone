@@ -528,3 +528,136 @@ a { color:#e0c99f; }
 @media (prefers-reduced-motion:reduce) {
   *,*::before,*::after { scroll-behavior:auto !important; animation-duration:.01ms !important; animation-iteration-count:1 !important; transition-duration:.01ms !important; }
 }
+
+
+/* ── Layout pass inspired by the supplied Voice Control reference ── */
+/* Keep navigation in a persistent side rail; arrange the Voice workspace
+   as a focused destination panel with full-width quick controls below. */
+@media (min-width:1001px) {
+  body:has(.side-nav-item[data-section="voice"].is-active) .dashboard-grid {
+    display:grid;
+    grid-template-columns:minmax(320px,1fr) minmax(420px,1.08fr);
+    align-items:start;
+    gap:18px;
+  }
+  body:has(.side-nav-item[data-section="voice"].is-active) .column-main,
+  body:has(.side-nav-item[data-section="voice"].is-active) .column-side {
+    display:contents;
+  }
+  body:has(.side-nav-item[data-section="voice"].is-active) .channel-card {
+    grid-column:1;
+    grid-row:1;
+    width:100%;
+    max-width:760px;
+    justify-self:start;
+  }
+  body:has(.side-nav-item[data-section="voice"].is-active) .quick-card {
+    grid-column:1 / -1;
+    grid-row:2;
+    width:100%;
+  }
+  body:has(.side-nav-item[data-section="voice"].is-active) .quick-card .state-grid {
+    grid-template-columns:repeat(5,minmax(0,1fr));
+    padding:0 25px 25px;
+  }
+  body:has(.side-nav-item[data-section="voice"].is-active) .hero-block {
+    justify-content:flex-end;
+    text-align:right;
+  }
+  body:has(.side-nav-item[data-section="voice"].is-active) .hero-block > div:first-child {
+    margin-inline-start:auto;
+  }
+}
+@media (min-width:761px) and (max-width:1000px) {
+  .app-shell { flex-direction:row; }
+  .sidebar {
+    position:sticky; top:0; width:78px; height:100vh; min-height:100vh;
+    flex:0 0 78px; padding:22px 9px 16px;
+    border-left:1px solid var(--line); border-bottom:0;
+  }
+  .brand-lockup { justify-content:center; padding:0; }
+  .brand-lockup > div:last-child,.side-status,.sidebar-footer > div:not(.ens-mark) { display:none; }
+  .side-nav { display:grid; gap:9px; margin-top:38px; }
+  .side-nav-item { justify-content:center; min-height:46px; padding:8px 4px; gap:0; }
+  .side-nav-item > span:not(.nav-glyph):not(.nav-count) {
+    position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden;
+    clip:rect(0,0,0,0); white-space:nowrap; border:0;
+  }
+  .nav-count { position:absolute; transform:translate(-13px,-13px); min-width:15px; padding:0 3px; font-size:8px; }
+  .sidebar-footer { justify-content:center; padding:14px 0 2px; }
+  .main-panel { min-width:0; padding-inline:22px; }
+}
+@media (max-width:760px) {
+  .app-shell { display:flex; flex-direction:row; align-items:stretch; min-height:100vh; }
+  .sidebar {
+    position:sticky; top:0; z-index:30; align-self:flex-start;
+    width:62px; height:100vh; min-height:100vh; flex:0 0 62px;
+    padding:16px 6px 12px; border:0; border-left:1px solid var(--line);
+    border-bottom:0; background:rgba(15,13,11,.97); backdrop-filter:blur(20px);
+  }
+  .brand-lockup { justify-content:center; gap:0; padding:0; }
+  .brand-lockup > div:last-child,.side-status,.sidebar-footer > div:not(.ens-mark) { display:none; }
+  .brand-mark { width:34px; height:34px; }
+  .side-nav {
+    display:grid; gap:8px; margin-top:28px; padding:0;
+    overflow:visible;
+  }
+  .side-nav-item {
+    position:relative; display:flex; justify-content:center; align-items:center;
+    width:100%; min-height:43px; padding:7px 2px; gap:0;
+    border-radius:11px; font-size:0;
+  }
+  .side-nav-item:hover { transform:none; }
+  .side-nav-item > span:not(.nav-glyph):not(.nav-count) {
+    position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden;
+    clip:rect(0,0,0,0); white-space:nowrap; border:0;
+  }
+  .nav-glyph { width:auto; font-size:18px; }
+  .nav-count { position:absolute; top:1px; inset-inline-start:1px; min-width:14px; padding:0 3px; font-size:8px; }
+  .sidebar-footer { justify-content:center; margin-top:auto; padding:12px 0 2px; }
+  .ens-mark { width:25px; height:25px; flex-basis:25px; }
+  .main-panel { width:calc(100% - 62px); min-width:0; padding:0 12px 18px; }
+  .topbar { height:57px; }
+  .content-wrap { padding-top:22px; }
+  .hero-block { align-items:flex-start; margin-bottom:18px; }
+  .hero-block h1 { font-size:clamp(25px,7vw,32px); }
+  .hero-block p { font-size:11px; }
+  .hero-signal { min-width:40px; height:32px; }
+  .dashboard-grid { display:grid; grid-template-columns:minmax(0,1fr); gap:12px; }
+  .column-main,.column-side { display:grid; grid-template-columns:minmax(0,1fr); gap:12px; }
+  .card { min-width:0; border-radius:15px; }
+  .card-heading { padding:16px 14px 12px; }
+  .card-heading h2 { font-size:15px; }
+  .selection-row { display:grid; grid-template-columns:minmax(0,1fr); }
+  .selection-row .select-field,.selection-row .select-field.wide { width:100%; }
+  .voice-actions { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; }
+  .voice-actions > button { width:100%; min-width:0; padding-inline:7px; }
+  .state-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; padding:0 14px 15px; }
+  .quick-card .state-button { min-height:62px; }
+  .state-button { min-width:0; padding:9px 7px; }
+  .state-button span:not(.state-icon) { font-size:11px; }
+  .state-button small { font-size:9px; }
+  .form-grid { grid-template-columns:minmax(0,1fr); padding-inline:14px; }
+  .setup-actions,.voice-actions { padding-inline:14px; }
+  .bulk-import { margin-inline:14px; }
+  .channel-summary { margin-inline:14px; }
+  .overview-tools { grid-template-columns:minmax(0,1fr); padding-inline:14px; }
+  .profiles-heading,.profiles-list,.tasks-list { padding-inline:14px; }
+  .profiles-pager { margin-inline:14px; }
+  .playing-grid { grid-template-columns:minmax(0,1fr); padding-inline:14px; }
+  .playing-steps,.playing-accounts { padding-inline:14px; }
+  .playing-section-head { padding-inline:14px; }
+  .playing-review-grid { grid-template-columns:minmax(0,1fr); }
+  .app-footer { display:flex; flex-wrap:wrap; gap:8px; }
+}
+@media (max-width:390px) {
+  .sidebar { width:54px; flex-basis:54px; padding-inline:5px; }
+  .main-panel { width:calc(100% - 54px); padding-inline:9px; }
+  .side-nav { gap:6px; margin-top:22px; }
+  .side-nav-item { min-height:40px; }
+  .brand-mark { width:31px; height:31px; }
+  .hero-signal { display:none; }
+  .top-actions { gap:5px; }
+  .icon-button,.language-button { width:31px; height:31px; padding:0; }
+  .selection-row,.state-grid,.overview-tools { padding-inline:11px; }
+}
