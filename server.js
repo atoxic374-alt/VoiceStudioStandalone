@@ -1,5 +1,6 @@
 const express = require('express');
 const path = require('path');
+const os = require('os');
 const fs = require('fs');
 const crypto = require('crypto');
 const { execFileSync, spawn } = require('child_process');
@@ -3009,6 +3010,62 @@ function rateLimit(req, res, next) {
 app.use('/api', rateLimit, originGuard, requireAuth);
 app.get('/version', (_req, res) => res.json({ success: true, version: getBuildVersion() }));
 app.get('/api/health', (_req, res) => ok(res, { service: 'voice-studio', connected: clients.size, savedAccounts: savedAccountRecords.size, dataDir: DATA_DIR, accountFile: path.basename(resolveDataFile('accounts.enc')), watchdog: { enabled: true, intervalMs: WATCHDOG_INTERVAL_MS, running: watchdogRunning, observations: watchdogObservations.size }, accounts: [...clients.entries()].map(([name, entry]) => accountHealth(name, entry)) }));
+let resourceCpuPrevious = process.cpuUsage();
+let resourceCpuAt = process.hrtime.bigint();
+function directoryBytes(root) {
+  let total = 0;
+  const stack = [root];
+  while (stack.length) {
+    const dir = stack.pop();
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      try {
+        if (entry.isDirectory()) stack.push(full);
+        else if (entry.isFile()) total += fs.statSync(full).size;
+      } catch {}
+    }
+  }
+  return total;
+}
+function cgroupMemoryLimit() {
+  for (const file of ['/sys/fs/cgroup/memory.max', '/sys/fs/cgroup/memory/memory.limit_in_bytes']) {
+    try {
+      const raw = fs.readFileSync(file, 'utf8').trim();
+      if (raw !== 'max') {
+        const value = Number(raw);
+        if (Number.isFinite(value) && value > 0 && value < 2 ** 60) return value;
+      }
+    } catch {}
+  }
+  return os.totalmem();
+}
+app.get('/api/resources', (_req, res) => {
+  const now = process.hrtime.bigint();
+  const elapsedMicros = Number(now - resourceCpuAt) / 1000;
+  const cpuNow = process.cpuUsage();
+  const cpuMicros = (cpuNow.user - resourceCpuPrevious.user) + (cpuNow.system - resourceCpuPrevious.system);
+  resourceCpuPrevious = cpuNow;
+  resourceCpuAt = now;
+  const cpuPercent = elapsedMicros > 0 ? Math.max(0, Math.min(100, cpuMicros / elapsedMicros * 100)) : 0;
+  const memory = process.memoryUsage();
+  const memoryLimit = cgroupMemoryLimit();
+  let filesystem = null;
+  try {
+    const stat = fs.statfsSync(DATA_DIR);
+    filesystem = { totalBytes: stat.blocks * stat.bsize, freeBytes: stat.bavail * stat.bsize, usedBytes: (stat.blocks - stat.bfree) * stat.bsize };
+  } catch {}
+  return ok(res, {
+    sampledAt: Date.now(),
+    cpu: { processPercent: cpuPercent, cores: os.cpus().length },
+    memory: { rssBytes: memory.rss, heapUsedBytes: memory.heapUsed, heapTotalBytes: memory.heapTotal, externalBytes: memory.external, limitBytes: memoryLimit },
+    storage: { dataDirectoryBytes: directoryBytes(DATA_DIR), filesystem },
+    source: 'application-container',
+    billing: { available: false, note: 'Railway account usage and billing are not exposed by container measurements.' },
+  });
+});
+
 app.get('/api/storage/status', (_req, res) => {
   const accountFile = resolveDataFile('accounts.enc');
   const files = ['accounts.enc', 'voice-sessions.json', 'automation-tasks.json', 'playing-sessions.json'].map((name) => {

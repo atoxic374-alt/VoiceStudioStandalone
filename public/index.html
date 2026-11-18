@@ -27,6 +27,7 @@
         <button class="side-nav-item" type="button" data-section="automation"><span class="nav-glyph">↻</span><span>Automation</span></button>
         <button class="side-nav-item" type="button" data-section="playing"><span class="nav-glyph">▶</span><span>Playing</span><span id="navPlayingCount" class="nav-count">0</span></button>
         <button class="side-nav-item" type="button" data-section="activity"><span class="nav-glyph">≋</span><span>Activity</span><span id="navSessionCount" class="nav-count">0</span></button>
+        <button class="side-nav-item" type="button" data-section="resources"><span class="nav-glyph">▤</span><span>Resources</span></button>
       </nav>
       <div class="sidebar-footer">
         <div class="ens-mark" aria-label="Ens store">E</div>
@@ -151,6 +152,17 @@
             </article>
 
           </div>
+          <article class="card resource-page" data-panel="resources" hidden>
+            <div class="card-heading"><div><span class="card-kicker">RUNTIME / LIVE TELEMETRY</span><h2>Server resources</h2></div><span id="resourceLiveStatus" class="soft-badge accent">Connecting…</span></div>
+            <p class="resource-note">Live measurements of this application process and its container. These are not Railway plan usage or billing figures.</p>
+            <div class="resource-metrics">
+              <section class="resource-metric"><div class="resource-metric-heading"><strong>CPU</strong><span id="resourceCpuValue">—</span></div><div class="resource-track"><span id="resourceCpuBar"></span></div><small id="resourceCpuDetail">Application process utilization</small></section>
+              <section class="resource-metric"><div class="resource-metric-heading"><strong>RAM</strong><span id="resourceRamValue">—</span></div><div class="resource-track"><span id="resourceRamBar"></span></div><small id="resourceRamDetail">Process resident memory</small></section>
+              <section class="resource-metric"><div class="resource-metric-heading"><strong>Data storage</strong><span id="resourceStorageValue">—</span></div><div class="resource-track"><span id="resourceStorageBar"></span></div><small id="resourceStorageDetail">Application data directory size</small></section>
+            </div>
+            <div class="resource-foot"><span id="resourceFilesystemDetail">Filesystem capacity unavailable</span><span>Updated: <time id="resourceUpdatedAt">—</time></span></div>
+            <div class="resource-platform-note"><strong>Railway usage</strong><span id="resourceBillingNote">Railway account-level usage and billing require an authorized Railway API integration; container metrics cannot provide those figures.</span></div>
+          </article>
           <article class="card activity-card" data-panel="activity"><div class="card-heading compact"><div><span class="card-kicker">ACTIVITY / LOG</span><h2>Recent activity</h2></div><span class="activity-led"></span></div><div id="activityList" class="activity-list"><div class="activity-row"><span class="activity-dot"></span><div><strong>Workspace ready</strong><small>بانتظار أول اتصال</small></div><time>الآن</time></div></div><div class="activity-actions"><button id="activityExpandButton" class="ghost-button activity-expand" type="button">View full activity</button><button id="activityClearButton" class="ghost-button activity-clear" type="button">Clear log</button></div></article>
         </section>
         <footer class="app-footer"><span>Voice Studio v1.0</span><span>By Ahmed. | 4_3a</span></footer>

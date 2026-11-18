@@ -1172,3 +1172,20 @@ body:has(.side-nav-item[data-section="playing"].is-active) .playing-card {
 .membership-result.is-error { border-color: rgba(255,113,139,.35); background: rgba(255,113,139,.04); }
 .membership-result.is-error .membership-result-mark { background: rgba(255,113,139,.13); color: var(--red); }
 @media (max-width: 690px) { .membership-check-panel { margin-left: 18px; margin-right: 18px; padding: 11px; }.membership-check-head { align-items: flex-start; flex-direction: column; }.membership-check-actions { width: 100%; }.membership-check-actions .ghost-button { flex: 1; } }
+
+
+/* Live runtime resource page */
+.resource-page { grid-column: 1 / -1; }
+.resource-note { color: var(--muted, #a9a39a); margin: -4px 0 22px; line-height: 1.6; }
+.resource-metrics { display: grid; gap: 16px; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.resource-metric { min-width: 0; padding: 20px; border: 1px solid var(--line, rgba(255,255,255,.09)); border-radius: 18px; background: rgba(255,255,255,.025); }
+.resource-metric-heading { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; margin-bottom: 17px; }
+.resource-metric-heading strong { font-size: 1rem; }
+.resource-metric-heading span { color: var(--accent, #d4b77b); font-size: 1.25rem; font-variant-numeric: tabular-nums; }
+.resource-track { height: 8px; overflow: hidden; border-radius: 999px; background: rgba(255,255,255,.09); }
+.resource-track span { display: block; width: 0; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #a98b54, #ead7a4); transition: width .35s ease; }
+.resource-metric small { display: block; margin-top: 12px; color: var(--muted, #a9a39a); line-height: 1.45; }
+.resource-foot { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin-top: 20px; color: var(--muted, #a9a39a); font-size: .85rem; }
+.resource-platform-note { display: grid; gap: 6px; margin-top: 20px; padding: 16px 18px; border-inline-start: 3px solid var(--accent, #d4b77b); border-radius: 10px; background: rgba(255,255,255,.03); }
+.resource-platform-note span { color: var(--muted, #a9a39a); line-height: 1.55; }
+@media (max-width: 760px) { .resource-metrics { grid-template-columns: 1fr; } .resource-metric { padding: 16px; } }

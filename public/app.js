@@ -1009,7 +1009,7 @@ function initLanguage() {
     toast(isArabic ? 'English mode is ready' : 'تم تفعيل العربية', 'success');
   });
 }
-function initNavigation() { document.querySelectorAll('[data-section]').forEach((button) => button.addEventListener('click', () => { const section = button.dataset.section; document.querySelectorAll('.side-nav-item').forEach((item) => item.classList.toggle('is-active', item === button)); const breadcrumb = document.querySelector('.breadcrumb strong'); if (breadcrumb) breadcrumb.textContent = section[0].toUpperCase() + section.slice(1); document.querySelectorAll('[data-panel]').forEach((panel) =>
+function initNavigation() { document.querySelectorAll('[data-section]').forEach((button) => button.addEventListener('click', () => { const section = button.dataset.section; if (section === 'resources') setTimeout(refreshResourceMetrics, 0); document.querySelectorAll('.side-nav-item').forEach((item) => item.classList.toggle('is-active', item === button)); const breadcrumb = document.querySelector('.breadcrumb strong'); if (breadcrumb) breadcrumb.textContent = section[0].toUpperCase() + section.slice(1); document.querySelectorAll('[data-panel]').forEach((panel) =>
  { const panels = panel.dataset.panel.split(/\s+/); panel.hidden = !panels.includes(section); }); })); document.querySelector('[data-section="dashboard"]')?.click(); }
 function initCustomSelects() {
   document.querySelectorAll('.site-select, .automation-guild').forEach((select) => {
@@ -1026,6 +1026,44 @@ function initCustomSelects() {
   });
   document.addEventListener('click', (event) => { if (!event.target.closest('.custom-select')) document.querySelectorAll('.custom-select.is-open').forEach((item) => item.classList.remove('is-open')); });
 }
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes < 0) return '—';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let value = bytes, unit = 0;
+  while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++; }
+  return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+}
+async function refreshResourceMetrics() {
+  if (document.visibilityState !== 'visible' || !document.querySelector('[data-panel="resources"]') || document.querySelector('[data-panel="resources"]').hidden) return;
+  const status = $('#resourceLiveStatus');
+  try {
+    const response = await fetch('/api/resources', { credentials: 'include', cache: 'no-store', headers: { 'X-Voice-Studio': '1' } });
+    if (response.status === 401) { await requestAuthentication(); return refreshResourceMetrics(); }
+    const payload = await response.json();
+    if (!response.ok || payload.success === false) throw new Error(payload.error || 'Metrics unavailable');
+    const data = payload;
+    const percent = Math.max(0, Math.min(100, data.cpu.processPercent || 0));
+    $('#resourceCpuValue').textContent = `${percent.toFixed(1)}%`;
+    $('#resourceCpuBar').style.width = `${percent}%`;
+    $('#resourceCpuDetail').textContent = `Application process · ${data.cpu.cores} logical cores available`;
+    const memoryPct = data.memory.limitBytes ? Math.min(100, data.memory.rssBytes / data.memory.limitBytes * 100) : 0;
+    $('#resourceRamValue').textContent = `${formatBytes(data.memory.rssBytes)} / ${formatBytes(data.memory.limitBytes)}`;
+    $('#resourceRamBar').style.width = `${memoryPct}%`;
+    $('#resourceRamDetail').textContent = `RSS · heap ${formatBytes(data.memory.heapUsedBytes)} used of ${formatBytes(data.memory.heapTotalBytes)}`;
+    $('#resourceStorageValue').textContent = formatBytes(data.storage.dataDirectoryBytes);
+    const fs = data.storage.filesystem;
+    $('#resourceStorageBar').style.width = fs?.totalBytes ? `${Math.min(100, data.storage.dataDirectoryBytes / fs.totalBytes * 100)}%` : '0%';
+    $('#resourceStorageDetail').textContent = fs?.totalBytes ? `Application data directory · ${Math.min(100, data.storage.dataDirectoryBytes / fs.totalBytes * 100).toFixed(2)}% of container filesystem` : 'Application data directory size (not total deploy bundle)';
+    $('#resourceFilesystemDetail').textContent = fs ? `Container filesystem: ${formatBytes(fs.usedBytes)} used of ${formatBytes(fs.totalBytes)}` : 'Container filesystem capacity unavailable';
+    $('#resourceUpdatedAt').textContent = new Date(data.sampledAt).toLocaleTimeString();
+    $('#resourceBillingNote').textContent = data.billing.note;
+    status.textContent = 'Live · 2s';
+    status.classList.add('accent');
+  } catch (error) {
+    status.textContent = 'Temporarily unavailable';
+    status.classList.remove('accent');
+  }
+}
 function init() {
   initTheme(); initLanguage(); initNavigation(); initActivity(); initPlaying(); initCustomSelects();
   $('#profilesPrevButton')?.addEventListener('click', () => { state.profilesPage -= 1; renderProfiles(state.clients); });
@@ -1034,7 +1072,7 @@ function init() {
   $('#connectButton').addEventListener('click', connect); $('#bulkConnectButton').addEventListener('click', bulkConnect); $('#disconnectButton').addEventListener('click', openDisconnect); $('#accountSelect').addEventListener('change', async (event) => { state.selectedAccount = event.target.value; await loadGuilds(); await loadAutomationCatalog(); }); $('#automationGuild').addEventListener('change', renderAutomationChannels); $('#automationChannel').addEventListener('change', renderTargetAccounts); $('#rotationRoomFilter').addEventListener('input', (event) => { state.rotationRoomFilter = event.target.value; state.rotationRoomPage = 0; renderRotationRooms(); }); $('#rotationPrevButton').addEventListener('click', () => { state.rotationRoomPage -= 1; renderRotationRooms(); }); $('#rotationNextButton').addEventListener('click', () => { state.rotationRoomPage += 1; renderRotationRooms(); }); $('#bulkJoinButton').addEventListener('click', bulkJoinSelected); $('#channelSelect').addEventListener('change', handleChannelChange); $('#joinButton').addEventListener('click', join); $('#joinAllButton').addEventListener('click', joinAll); $('#leaveButton').addEventListener('click', leave); $('#cameraButton')?.addEventListener('click', toggleCamera); $('#screenButton')?.addEventListener('click', toggleScreen); $('#startRotationButton').addEventListener('click', startRotation); $('#startCycleButton').addEventListener('click', startCycle); $('#stopMediaButton')?.addEventListener('click', () => stopCurrentStream()); $('#applyBulkStateButton')?.addEventListener('click', applyBulkState); $('#overviewFilter')?.addEventListener('input', (event) => { state.overviewFilter = event.target.value; refreshSessions(); }); $('#overviewSort')?.addEventListener('change', (event) => { state.overviewSort = event.target.value; refreshSessions(); }); document.querySelectorAll('.state-button').forEach((button) => button.addEventListener('click', () => applyState(button.dataset.state))); document.querySelectorAll('#statePicker input').forEach((input) => input.addEventListener('change', () => input.closest('.state-option')?.classList.toggle('is-selected', input.checked)));
   $('#operationClose').addEventListener('click', () => { $('#operationModal').hidden = true; $('.operation-loader')?.classList.remove('is-done', 'is-error'); }); $('#leaveAllButton')?.addEventListener('click', openLeaveAll); $('#confirmLeaveButton')?.addEventListener('click', leaveAllSelected); $('#cancelLeaveButton')?.addEventListener('click', () => { $('#leaveModal').hidden = true; }); $('#confirmDisconnectButton')?.addEventListener('click', disconnectSelected); $('#cancelDisconnectButton')?.addEventListener('click', () => { $('#disconnectModal').hidden = true; }); $('#disconnectModalClose')?.addEventListener('click', () => { $('#disconnectModal').hidden = true; }); window.addEventListener('beforeunload', () => stopCurrentStream({ updateDiscord: false }));
   document.addEventListener('change', (event) => { if (event.target.closest('#automationAccounts')) updateQuickStateButtons(); });
-  loadClients().then(() => renderPlayingAccounts()).catch(() => {}); refreshSessions(); loadTasks(); loadPlayingSessions(); connectLiveEvents(); state.taskCountdownTimer = setInterval(refreshTaskCountdowns, 1000); setInterval(() => { if (document.visibilityState !== 'visible') return; refreshSessions(); loadTasks(); loadPlayingSessions(); }, 30000);
+  loadClients().then(() => renderPlayingAccounts()).catch(() => {}); refreshSessions(); loadTasks(); loadPlayingSessions(); connectLiveEvents(); state.taskCountdownTimer = setInterval(refreshTaskCountdowns, 1000); refreshResourceMetrics(); setInterval(refreshResourceMetrics, 2000); setInterval(() => { if (document.visibilityState !== 'visible') return; refreshSessions(); loadTasks(); loadPlayingSessions(); }, 30000);
 }
 init();
 $('#joinServerForm')?.addEventListener('submit', joinDiscordServer);
