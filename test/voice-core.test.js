@@ -826,3 +826,141 @@ test('random room rotation assigns independent targets and avoids current rooms 
     Math.random = originalRandom;
   }
 });
+
+
+test('compacts state-cycle history to the current cycle without changing unseen-state selection', () => {
+  const { compactStateHistory } = require('../server');
+  const states = ['one', 'two', 'three'];
+  const history = [0, 1, 2, 1, 0, 2];
+  const compacted = compactStateHistory(states, history);
+  assert.deepEqual(compacted, [1, 0, 2]);
+  assert.equal(compacted.length, states.length);
+  const originalRandom = Math.random;
+  try {
+    Math.random = () => 0;
+    assert.equal(nextStateIndex(states, history), nextStateIndex(states, compacted));
+  } finally {
+    Math.random = originalRandom;
+  }
+});
+
+test('bounds successful state-cycle history even after many completed transitions', () => {
+  const task = { states: ['one', 'two'], stateHistory: { alpha: Array.from({ length: 5000 }, (_, index) => index % 2) }, accountStateIdx: {} };
+  assert.equal(recordSuccessfulCycleState(task, 'alpha', 0, true), true);
+  assert.deepEqual(task.stateHistory.alpha, [0]);
+  assert.equal(task.accountStateIdx.alpha, 0);
+});
+
+test('expires stale rate-limit buckets and caps high-cardinality maps', () => {
+  const { getRateLimitBucket, pruneRateLimitBuckets } = require('../server');
+  const buckets = new Map([
+    ['stale', { start: 0, count: 3 }],
+    ['active', { start: 900, count: 2 }],
+  ]);
+  assert.equal(pruneRateLimitBuckets(buckets, 1000, 500, 2), 1);
+  assert.equal(buckets.has('stale'), false);
+  assert.equal(getRateLimitBucket(buckets, 'next', 1000, 2).count, 0);
+  getRateLimitBucket(buckets, 'overflow', 1001, 2);
+  assert.equal(buckets.size, 2);
+  assert.equal(buckets.has('active'), false, 'the oldest bucket is evicted only when the explicit capacity is reached');
+});
+
+
+test('projects only the account-owned Gateway voice state into a minimal event snapshot', () => {
+  const { projectGatewayVoiceState } = require('../server');
+  const client = { user: { id: 'self-user' } };
+  const guild = { id: 'guild-event-test' };
+  assert.equal(projectGatewayVoiceState(client, null, { id: 'other-user', guild, channelId: 'room-1' }), null);
+  assert.deepEqual(projectGatewayVoiceState(client, null, {
+    id: 'self-user', guild, channelId: 'room-1', selfMute: true,
+    selfDeaf: false, selfVideo: true, streaming: false,
+  }), {
+    guildId: 'guild-event-test', channelId: 'room-1',
+    selfMute: true, selfDeaf: false, selfVideo: true, selfStream: false,
+  });
+  assert.deepEqual(projectGatewayVoiceState(client, { id: 'self-user', guild }, {
+    id: 'self-user', guild, channelId: null,
+  }), {
+    guildId: 'guild-event-test', channelId: null,
+    selfMute: undefined, selfDeaf: undefined, selfVideo: undefined, selfStream: undefined,
+  });
+});
+
+test('caches per-account voice and Playing catalogs until a Gateway invalidation', () => {
+  const { clients, buildVoiceGuildCatalog, buildPlayingChannelCatalog, invalidateVoiceGuildCatalog } = require('../server');
+  const account = `catalog-test-${Date.now()}`;
+  const guildId = `catalog-guild-${Date.now()}`;
+  const voice = {
+    id: `voice-${guildId}`, type: 2, name: 'Voice room', userLimit: 4, bitrate: 64000,
+    members: { size: 1 }, permissionsFor: () => ({ has: () => true }),
+  };
+  const text = {
+    id: `text-${guildId}`, type: 0, name: 'general', isText: () => true,
+    permissionsFor: () => ({ has: () => true }),
+  };
+  const guild = {
+    id: guildId, name: 'Test guild', iconURL: () => null,
+    members: { me: { id: 'self-user' }, cache: new Map() },
+    channels: { cache: new Map([[voice.id, voice], [text.id, text]]) },
+    voiceStates: { cache: new Map() },
+  };
+  clients.set(account, { client: { user: { id: 'self-user' }, guilds: { cache: new Map([[guildId, guild]]) } } });
+  try {
+    invalidateVoiceGuildCatalog(account);
+    assert.equal(buildVoiceGuildCatalog(account)[0].voiceChannels[0].name, 'Voice room');
+    assert.equal(buildPlayingChannelCatalog(guildId).channels[0].name, 'general');
+    voice.name = 'Renamed voice';
+    text.name = 'renamed-general';
+    assert.equal(buildVoiceGuildCatalog(account)[0].voiceChannels[0].name, 'Voice room', 'the derived voice catalog is reused before invalidation');
+    assert.equal(buildPlayingChannelCatalog(guildId).channels[0].name, 'general', 'the Playing catalog is reused before invalidation');
+    invalidateVoiceGuildCatalog(account);
+    assert.equal(buildVoiceGuildCatalog(account)[0].voiceChannels[0].name, 'Renamed voice');
+    assert.equal(buildPlayingChannelCatalog(guildId).channels[0].name, 'renamed-general');
+  } finally {
+    clients.delete(account);
+    invalidateVoiceGuildCatalog(account);
+  }
+});
+
+test('coalesces catalog changes for several accounts in the same guild', async () => {
+  const { liveEvents, scheduleCatalogEvent } = require('../server');
+  const guildId = `catalog-burst-${Date.now()}`;
+  const events = [];
+  const listener = (event) => { if (event.type === 'catalog.changed' && event.guildId === guildId) events.push(event); };
+  liveEvents.on('event', listener);
+  try {
+    scheduleCatalogEvent(guildId, 'alpha');
+    scheduleCatalogEvent(guildId, 'beta');
+    scheduleCatalogEvent(guildId, 'gamma');
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    assert.equal(events.length, 1);
+    assert.deepEqual(events[0].accounts.sort(), ['alpha', 'beta', 'gamma']);
+  } finally {
+    liveEvents.off('event', listener);
+  }
+});
+
+test('reserves account slots up to the configured 30-account limit without concurrent overbooking', () => {
+  const { clients, reserveAccountConnectSlots, releaseAccountConnectSlots } = require('../server');
+  const previous = [...clients.entries()];
+  clients.clear();
+  try {
+    for (let index = 0; index < 29; index += 1) clients.set(`limit-test-${index}`, {});
+    const first = reserveAccountConnectSlots(1);
+    assert.equal(first.accepted, 1);
+    const competing = reserveAccountConnectSlots(1);
+    assert.equal(competing.accepted, 0);
+    assert.match(competing.message, /30/);
+    assert.match(competing.message, /40/);
+    assert.match(competing.message, /20\$/);
+    releaseAccountConnectSlots(first.reserved);
+    clients.set('limit-test-29', {});
+    const atLimit = reserveAccountConnectSlots(1);
+    assert.equal(atLimit.accepted, 0);
+    assert.equal(atLimit.blocked, 1);
+  } finally {
+    releaseAccountConnectSlots(100);
+    clients.clear();
+    for (const [name, entry] of previous) clients.set(name, entry);
+  }
+});

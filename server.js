@@ -5,6 +5,7 @@ const crypto = require('crypto');
 const { execFileSync, spawn } = require('child_process');
 const FFMPEG_PATH = require('ffmpeg-static');
 const { EventEmitter } = require('events');
+const { monitorEventLoopDelay } = require('perf_hooks');
 const { Client, Constants, SnowflakeUtil, Util, Options } = require('discord.js-selfbot-v13');
 const helmet = require('helmet');
 
@@ -433,6 +434,8 @@ app.use(express.static(path.join(__dirname, 'public'), { extensions: ['html'] })
 
 // This standalone app intentionally keeps tokens in memory only.
 const clients = new Map();
+let limit = 30;
+let pendingAccountConnectReservations = 0;
 let savedAccountRecords = new Map();
 const failedAccountRecords = new Map();
 const connectingTokens = new Set();
@@ -456,6 +459,14 @@ const playingEvents = [];
 let videoStreamModulePromise;
 const liveEvents = new EventEmitter();
 liveEvents.setMaxListeners(0);
+let liveEventSequence = 0;
+const eventLoopHistogram = monitorEventLoopDelay({ resolution: 20 });
+eventLoopHistogram.enable();
+const voiceGuildCatalogCache = new Map();
+const playingChannelCatalogCache = new Map();
+const pendingCatalogEvents = new Map();
+const pendingVoiceStateChecks = new Map();
+let sessionPersistTimer = null;
 const accountLocks = new Map();
 const MEDIA_SETTLE_DELAY_MS = 4000;
 const MEDIA_JOIN_TIMEOUT_MS = Math.max(10000, Number(process.env.MEDIA_JOIN_TIMEOUT_MS || 20000));
@@ -518,7 +529,42 @@ function requireAuth(req, res, next) {
   if (hasValidAuth(req)) return next();
   return res.status(401).json({ success: false, error: 'Authentication required' });
 }
-function emitLive(type, payload = {}) { liveEvents.emit('event', { type, at: Date.now(), ...payload }); }
+function emitLive(type, payload = {}) { liveEvents.emit('event', { type, at: Date.now(), seq: ++liveEventSequence, ...payload }); }
+const VOICE_GUILD_CATALOG_TTL_MS = 10 * 60 * 1000;
+const VOICE_RECONCILE_INTERVAL_MS = Math.max(15000, Number(process.env.VOICE_RECONCILE_INTERVAL_MS || 30000));
+function invalidateVoiceGuildCatalog(name) {
+  if (name) voiceGuildCatalogCache.delete(name);
+  else voiceGuildCatalogCache.clear();
+  playingChannelCatalogCache.clear();
+}
+function clearConnectedAccountCache(name) {
+  invalidateVoiceGuildCatalog(name);
+  for (const [key, timer] of pendingVoiceStateChecks) {
+    if (key.startsWith(`${name}__`)) { clearTimeout(timer); pendingVoiceStateChecks.delete(key); }
+  }
+}
+function scheduleCatalogEvent(guildId, account) {
+  const key = String(guildId || '*');
+  let pending = pendingCatalogEvents.get(key);
+  if (!pending) {
+    pending = { accounts: new Set(), timer: null };
+    pending.timer = setTimeout(() => {
+      pendingCatalogEvents.delete(key);
+      emitLive('catalog.changed', { guildId: key === '*' ? null : key, accounts: [...pending.accounts] });
+    }, 300);
+    pending.timer.unref?.();
+    pendingCatalogEvents.set(key, pending);
+  }
+  if (account) pending.accounts.add(account);
+}
+function scheduleSessionPersistence() {
+  if (sessionPersistTimer) return;
+  sessionPersistTimer = setTimeout(() => {
+    sessionPersistTimer = null;
+    try { persistSessions(); } catch (error) { console.warn('[voice] deferred session save failed:', redact(error?.message || error)); }
+  }, 500);
+  sessionPersistTimer.unref?.();
+}
 function accountHealth(name, entry) {
   const client = entry?.client;
   const status = client?.ws?.status;
@@ -572,6 +618,18 @@ function nextStateIndex(states, history = []) {
   const available = Array.from({ length: count }, (_, index) => index).filter((index) => !used.has(index));
   const choices = available.length ? available : Array.from({ length: count }, (_, index) => index).filter((index) => index !== history.at(-1));
   return choices[Math.floor(Math.random() * choices.length)];
+}
+function compactStateHistory(states, history = []) {
+  const count = Array.isArray(states) ? states.length : 0;
+  if (!count || !Array.isArray(history)) return [];
+  const currentCycle = new Set();
+  for (const index of history) {
+    if (!Number.isInteger(index) || index < 0 || index >= count) continue;
+    if (currentCycle.size === count) currentCycle.clear();
+    if (currentCycle.has(index)) currentCycle.delete(index);
+    currentCycle.add(index);
+  }
+  return [...currentCycle];
 }
 async function recoverVoiceAfterStateFailure(name, guildId, current) {
   const client = getClient(name);
@@ -684,7 +742,7 @@ function recordSuccessfulCycleState(task, name, index, succeeded) {
   if (!succeeded || !Number.isInteger(index) || index < 0 || index >= task.states.length) return false;
   task.stateHistory ||= {};
   task.accountStateIdx ||= {};
-  task.stateHistory[name] = [...(task.stateHistory[name] || []), index];
+  task.stateHistory[name] = compactStateHistory(task.states, [...(task.stateHistory[name] || []), index]);
   task.accountStateIdx[name] = index;
   return true;
 }
@@ -2326,6 +2384,7 @@ function markTokenChanged(name, token, error) {
   // Remove the live client, but retain the encrypted record so an account is
   // never silently lost. The owner can explicitly remove it through the
   // disconnect action after replacing or deleting the credential.
+  clearConnectedAccountCache(name);
   clients.delete(name);
   recordFailedAccount(name, token, error, 'invalid-token');
   persistConnectedAccounts();
@@ -2557,6 +2616,234 @@ function readGatewayVoiceState(client, guildId) {
   };
   return { ...observed, ...normalizeExclusiveVoiceState(observed) };
 }
+function readCachedGatewayVoiceState(client, guildId) {
+  return client?.guilds?.cache?.get?.(guildId)?.voiceStates?.cache?.get?.(client.user?.id)
+    || client?.voiceStates?.cache?.get?.(client.user?.id)
+    || null;
+}
+function getVoiceGuildCatalog(name, entry) {
+  const cached = voiceGuildCatalogCache.get(name);
+  if (cached && Date.now() - cached.builtAt < VOICE_GUILD_CATALOG_TTL_MS) return cached.guilds;
+  const client = entry?.client;
+  const guilds = [];
+  if (client?.guilds?.cache) {
+    for (const guild of client.guilds.cache.values()) {
+      const me = guild.members?.me || client.user?.id;
+      const voiceChannels = [...(guild.channels?.cache?.values?.() || [])]
+        .filter((channel) => isVoiceChannel(channel) && canJoin(channel, me))
+        .map((channel) => ({
+          id: channel.id,
+          name: channel.name,
+          userLimit: Number(channel.userLimit || 0),
+          members: channel.members?.size || 0,
+          bitrate: Math.round(Number(channel.bitrate || 64000) / 1000),
+        }))
+        .sort((a, b) => a.name.localeCompare(b.name));
+      if (voiceChannels.length) guilds.push({ account: name, guildId: guild.id, guildName: guild.name, guildIcon: guild.iconURL?.({ size: 64 }) || null, voiceChannels });
+    }
+  }
+  voiceGuildCatalogCache.set(name, { builtAt: Date.now(), guilds });
+  while (voiceGuildCatalogCache.size > 500) voiceGuildCatalogCache.delete(voiceGuildCatalogCache.keys().next().value);
+  return guilds;
+}
+function buildVoiceGuildCatalog(requested = '') {
+  const entries = requested ? [[requested, clients.get(requested)]] : [...clients.entries()];
+  return entries.flatMap(([name, entry]) => getVoiceGuildCatalog(name, entry));
+}
+function buildPlayingChannelCatalog(selectedGuild = '') {
+  const key = selectedGuild || '*';
+  const cached = playingChannelCatalogCache.get(key);
+  if (cached && Date.now() - cached.builtAt < 60000) return cached.value;
+  const channels = new Map();
+  const guilds = new Map();
+  for (const [account, entry] of clients.entries()) {
+    if (!entry?.client) continue;
+    for (const guild of entry.client.guilds?.cache?.values?.() || []) {
+      if (selectedGuild && String(guild.id) !== selectedGuild) continue;
+      let hasAccessibleText = false;
+      for (const channel of guild.channels?.cache?.values?.() || []) {
+        const isText = channel?.isText?.() || [0, 5, 10, 11, 12, 15].includes(Number(channel?.type));
+        if (!isText || !channel.id || channel.isThread?.()) continue;
+        const permissions = channel.permissionsFor?.(entry.client.user?.id);
+        if (permissions?.has?.('VIEW_CHANNEL') === false || permissions?.has?.('READ_MESSAGE_HISTORY') === false) continue;
+        hasAccessibleText = true;
+        if (!selectedGuild) continue;
+        const id = String(channel.id);
+        if (!channels.has(id)) channels.set(id, { id, name: channel.name || id, guildId: guild.id, guildName: guild.name, accounts: [] });
+        channels.get(id).accounts.push(account);
+      }
+      if (hasAccessibleText) guilds.set(guild.id, { id: guild.id, name: guild.name });
+    }
+  }
+  const list = [...channels.values()].sort((a, b) => a.name.localeCompare(b.name));
+  const value = { channels: list, guilds: [...guilds.values()].sort((a, b) => a.name.localeCompare(b.name)) };
+  playingChannelCatalogCache.set(key, { builtAt: Date.now(), value });
+  while (playingChannelCatalogCache.size > 128) playingChannelCatalogCache.delete(playingChannelCatalogCache.keys().next().value);
+  return value;
+}
+function buildClientSnapshots() {
+  normalizeConnectedAccountNames();
+  const sessionByName = new Map([...voiceSessions.values()].map((session) => [session.name, session]));
+  return [...clients.entries()].map(([name, entry]) => {
+    const user = entry.client?.user;
+    const savedVoice = sessionByName.get(name) || null;
+    const actualVoice = entry.client ? readGatewayVoiceState(entry.client, savedVoice?.guildId || '') || null : null;
+    const voice = actualVoice?.channelId ? { ...(savedVoice || {}), ...actualVoice, name } : savedVoice;
+    const guild = voice && entry.client ? entry.client.guilds?.cache?.get?.(voice.guildId) : null;
+    const member = guild?.members?.cache?.get?.(user?.id);
+    const channel = voice ? guild?.channels?.cache?.get?.(voice.channelId) : null;
+    return {
+      name,
+      username: user?.tag || user?.username || name,
+      displayName: user?.globalName || user?.username || name,
+      nickname: member?.displayName || user?.globalName || user?.username || name,
+      id: user?.id || null,
+      avatar: user?.displayAvatarURL?.({ size: 128 }) || null,
+      status: entry.invalidToken ? 'offline' : (user?.presence?.status || 'online'),
+      health: accountHealth(name, entry),
+      voice: voice ? { guildId: voice.guildId, guildName: guild?.name || voice.guildId, guildIcon: guild?.iconURL?.({ size: 64 }) || null, channelId: voice.channelId, channelName: channel?.name || voice.channelId, selfMute: !!voice.selfMute, selfDeaf: !!voice.selfDeaf, selfVideo: !!voice.selfVideo, selfStream: !!voice.selfStream } : null,
+    };
+  });
+}
+function buildVoiceSessionSnapshots() {
+  const sessions = [];
+  const sessionsByName = new Map();
+  for (const session of voiceSessions.values()) {
+    if (!sessionsByName.has(session.name)) sessionsByName.set(session.name, []);
+    sessionsByName.get(session.name).push(session);
+  }
+  for (const [name, entry] of clients.entries()) {
+    if (!entry?.client) continue;
+    for (const session of (sessionsByName.get(name) || [])) {
+      const ready = entry.client?.ws?.status === 0 || entry.client?.isReady?.();
+      const actual = ready ? readGatewayVoiceState(entry.client, session.guildId) : null;
+      if (actual && !actual.channelId) { removeSessionsForAccount(name, session.guildId); continue; }
+      const guild = entry.client.guilds?.cache?.get?.(session.guildId);
+      const channel = guild?.channels?.cache?.get?.(actual?.channelId || session.channelId);
+      sessions.push({ ...session, ...(actual || {}), channelId: actual?.channelId || session.channelId, guildName: guild?.name || session.guildId, channelName: channel?.name || actual?.channelId || session.channelId, guildIcon: guild?.iconURL?.({ size: 64 }) || null, memberCount: channel?.members?.size || 0 });
+    }
+  }
+  return sessions;
+}
+function projectGatewayVoiceState(client, oldState, newState) {
+  const ownId = client?.user?.id;
+  const userId = newState?.id || newState?.userId || newState?.member?.id || newState?.user?.id || oldState?.id || oldState?.userId || oldState?.member?.id;
+  if (!ownId || String(userId || '') !== String(ownId)) return null;
+  const guildId = String(newState?.guild?.id || newState?.guildId || oldState?.guild?.id || oldState?.guildId || '');
+  if (!guildId) return null;
+  return {
+    guildId,
+    channelId: newState?.channelId ? String(newState.channelId) : null,
+    selfMute: newState?.selfMute ?? newState?.self_mute,
+    selfDeaf: newState?.selfDeaf ?? newState?.self_deaf,
+    selfVideo: newState?.selfVideo ?? newState?.self_video,
+    selfStream: newState?.streaming ?? newState?.selfStream ?? newState?.self_stream,
+  };
+}
+function scheduleVoiceStateConfirmation(name, entry, guildId) {
+  const key = sessionKey(name, guildId);
+  clearTimeout(pendingVoiceStateChecks.get(key));
+  const timer = setTimeout(() => {
+    pendingVoiceStateChecks.delete(key);
+    if (clients.get(name) !== entry || pendingMediaRestarts.has(name) || pendingRoomMoves.has(name)) return;
+    const ready = entry.client?.ws?.status === 0 || entry.client?.isReady?.();
+    if (!ready) return;
+    const cached = readCachedGatewayVoiceState(entry.client, guildId);
+    if (cached?.channelId) {
+      upsertSession(name, guildId, cached.channelId, {
+        selfMute: cached.selfMute ?? cached.self_mute,
+        selfDeaf: cached.selfDeaf ?? cached.self_deaf,
+        selfVideo: cached.selfVideo ?? cached.self_video,
+        selfStream: cached.streaming ?? cached.selfStream ?? cached.self_stream,
+        deferPersist: true,
+      });
+    } else if (voiceSessions.has(key)) {
+      removeSessionsForAccount(name, guildId, { deferPersist: true });
+    }
+  }, 1500);
+  timer.unref?.();
+  pendingVoiceStateChecks.set(key, timer);
+}
+function handleGatewayVoiceState(name, entry, oldState, newState) {
+  const client = entry?.client;
+  const observed = projectGatewayVoiceState(client, oldState, newState);
+  if (!observed) return;
+  const { guildId, channelId } = observed;
+  const key = sessionKey(name, guildId);
+  if (!channelId) {
+    scheduleVoiceStateConfirmation(name, entry, guildId);
+    return;
+  }
+  clearTimeout(pendingVoiceStateChecks.get(key));
+  pendingVoiceStateChecks.delete(key);
+  const previous = voiceSessions.get(key);
+  const active = syntheticStreams.get(name);
+  if (previous?.channelId && previous.channelId !== channelId && active) stopSyntheticStream(name, { leaveVoice: true });
+  const state = {
+    selfMute: observed.selfMute,
+    selfDeaf: observed.selfDeaf,
+    selfVideo: active?.mediaKind === 'camera' ? true : observed.selfVideo,
+    selfStream: active?.mediaKind === 'go-live' ? true : observed.selfStream,
+    deferPersist: true,
+  };
+  const normalized = normalizeExclusiveVoiceState(state);
+  const changed = !previous || previous.channelId !== channelId
+    || previous.selfMute !== normalized.selfMute || previous.selfDeaf !== normalized.selfDeaf
+    || previous.selfVideo !== normalized.selfVideo || previous.selfStream !== normalized.selfStream;
+  if (changed) upsertSession(name, guildId, channelId, state);
+}
+function syncInitialGatewayVoiceState(name, entry) {
+  const client = entry?.client;
+  const userId = client?.user?.id;
+  if (!userId || (client?.ws?.status !== 0 && !client?.isReady?.())) return;
+  for (const guild of client.guilds?.cache?.values?.() || []) {
+    const state = guild.voiceStates?.cache?.get?.(userId);
+    if (!state?.channelId) continue;
+    handleGatewayVoiceState(name, entry, null, {
+      id: state.id || state.userId || userId,
+      guild: state.guild || guild,
+      guildId: state.guildId || guild.id,
+      channelId: state.channelId,
+      selfMute: state.selfMute ?? state.self_mute,
+      selfDeaf: state.selfDeaf ?? state.self_deaf,
+      selfVideo: state.selfVideo ?? state.self_video,
+      streaming: state.streaming ?? state.selfStream ?? state.self_stream,
+    });
+  }
+}
+function watchGuildCatalogEvents(name, entry) {
+  const client = entry?.client;
+  if (!client?.on || client.__voiceStudioCatalogHandlersInstalled) return;
+  client.__voiceStudioCatalogHandlersInstalled = true;
+  const changed = (guildOrChannel) => {
+    const guildId = guildOrChannel?.guild?.id || guildOrChannel?.guildId || guildOrChannel?.id || null;
+    invalidateVoiceGuildCatalog(name);
+    scheduleCatalogEvent(guildId, name);
+  };
+  for (const event of ['guildCreate', 'guildDelete', 'guildUpdate', 'channelCreate', 'channelDelete', 'channelUpdate', 'roleCreate', 'roleDelete', 'roleUpdate']) {
+    client.on(event, (...args) => changed(args[1] || args[0]));
+  }
+  client.on('guildMemberUpdate', (oldMember, newMember) => {
+    if (String(newMember?.id || oldMember?.id || '') === String(client.user?.id || '')) changed(newMember || oldMember);
+  });
+}
+function refreshCachedVoiceRoomCounts(name, client, oldState, newState) {
+  const guildId = String(newState?.guild?.id || newState?.guildId || oldState?.guild?.id || oldState?.guildId || '');
+  const cached = voiceGuildCatalogCache.get(name);
+  const guild = guildId ? client?.guilds?.cache?.get?.(guildId) : null;
+  if (!guildId || !cached || !guild) return;
+  let changed = false;
+  const channelIds = new Set([oldState?.channelId, newState?.channelId].filter(Boolean).map(String));
+  for (const group of cached.guilds) {
+    if (String(group.guildId) !== guildId) continue;
+    for (const item of group.voiceChannels) {
+      if (!channelIds.has(String(item.id))) continue;
+      const count = guild.channels?.cache?.get?.(item.id)?.members?.size || 0;
+      if (item.members !== count) { item.members = count; changed = true; }
+    }
+  }
+  if (changed) scheduleCatalogEvent(guildId, name);
+}
 async function waitForConfirmedVoiceChannel(client, guildId, channelId, connection = null, timeoutMs = 6000) {
   const deadline = Date.now() + timeoutMs;
   let last = null;
@@ -2623,13 +2910,15 @@ function upsertSession(name, guildId, channelId, opts = {}) {
     ...flags,
     joinedAt: previous?.joinedAt || Date.now(), updatedAt: Date.now(),
   });
-  persistSessions();
+  if (opts.deferPersist) scheduleSessionPersistence();
+  else persistSessions();
   emitLive('session.updated', { session: voiceSessions.get(sessionKey(name, guildId)) });
 }
-function removeSessionsForAccount(name, guildId) {
+function removeSessionsForAccount(name, guildId, opts = {}) {
   if (guildId) voiceSessions.delete(sessionKey(name, guildId));
   else for (const key of voiceSessions.keys()) if (key.startsWith(`${name}__`)) voiceSessions.delete(key);
-  persistSessions();
+  if (opts.deferPersist) scheduleSessionPersistence();
+  else persistSessions();
   emitLive('session.removed', { name, guildId });
 }
 function reconcileVoiceSessions() {
@@ -2642,6 +2931,7 @@ function reconcileVoiceSessions() {
         // its replacement Streamer is being created. Keep the confirmed
         // session during the bounded restart window.
         if (pendingMediaRestarts.has(name) && session.channelId) continue;
+        if (entry.client?.ws?.status !== 0 && !entry.client?.isReady?.()) continue;
         const active = syntheticStreams.get(name);
         if (active && active.guildId === session.guildId && active.channelId === session.channelId) {
           upsertSession(name, session.guildId, session.channelId, { selfMute: session.selfMute, selfDeaf: false, selfVideo: active.mediaKind === 'camera', selfStream: active.mediaKind === 'go-live' });
@@ -2769,8 +3059,10 @@ function normalizeConnectedAccountNames() {
     if (!/^account-\d+$/i.test(oldName)) continue;
     const preferred = String(entry.client?.user?.globalName || entry.client?.user?.username || entry.client?.user?.tag || entry.client?.user?.id || '').trim().slice(0, 48);
     if (!preferred || preferred === oldName || clients.has(preferred)) continue;
+    clearConnectedAccountCache(oldName);
     clients.delete(oldName);
     clients.set(preferred, entry);
+    invalidateVoiceGuildCatalog(preferred);
     renamePersistedAccount(oldName, preferred);
     emitLive('account.renamed', { oldName, name: preferred });
     changed = true;
@@ -2833,9 +3125,11 @@ async function connectOne(token, name) {
     stopTasksForAccount(duplicateName);
     stopSyntheticStream(duplicateName, { leaveVoice: true });
     try { await clients.get(duplicateName)?.client?.destroy?.(); } catch {}
+    clearConnectedAccountCache(duplicateName);
     clients.delete(duplicateName);
   }
   const entry = { client, token: normalizedToken, savedAt: Date.now(), connectedAt: Date.now(), lastSeenAt: Date.now(), lastError: null };
+  invalidateVoiceGuildCatalog(finalName);
   clients.set(finalName, entry);
   failedAccountRecords.delete(finalName);
   persistConnectedAccounts();
@@ -2851,13 +3145,22 @@ async function connectOne(token, name) {
   client.on?.('error', markError);
   client.on?.('ready', () => { entry.lastError = null; entry.lastSeenAt = Date.now(); emitLive('account.health.changed', { account: accountHealth(finalName, entry) }); });
   client.on?.('disconnect', () => { entry.lastSeenAt = Date.now(); emitLive('account.health.changed', { account: accountHealth(finalName, entry) }); });
+  client.on?.('voiceStateUpdate', (oldState, newState) => {
+    handleGatewayVoiceState(finalName, entry, oldState, newState);
+    refreshCachedVoiceRoomCounts(finalName, client, oldState, newState);
+  });
+  const reportGatewayHealth = () => { entry.lastSeenAt = Date.now(); emitLive('account.health.changed', { account: accountHealth(finalName, entry) }); };
+  for (const event of ['shardReady', 'shardResume', 'shardReconnecting', 'shardDisconnect', 'shardError']) client.on?.(event, reportGatewayHealth);
+  watchGuildCatalogEvents(finalName, entry);
+  queueMicrotask(() => syncInitialGatewayVoiceState(finalName, entry));
   if (!client.__voiceStudioHandlersInstalled) {
     client.__voiceStudioHandlersInstalled = true;
     client.on?.('messageCreate', (message) => {
       Promise.resolve(handlePlayingDiscordCommand(client, message)).catch((error) => console.warn('[playing-command] failed:', redact(error?.message || error)));
     });
   }
-  emitLive('account.connected', { account: accountHealth(finalName, entry) });
+  emitLive('account.connected', { account: accountHealth(finalName, entry), client: buildClientSnapshots().find((item) => item.name === finalName) || null });
+  scheduleCatalogEvent(null, finalName);
 
   // Restore only the channel state; media capture remains browser-owned and must be
   // explicitly re-enabled by the user after reconnecting. Use VoiceManager here
@@ -2898,10 +3201,9 @@ async function connectOne(token, name) {
 app.post('/api/auth', (req, res) => {
   if (!AUTH_ENABLED) return ok(res, { authenticated: true, required: false, role: 'owner' });
   const supplied = String(req.body?.password || '');
-  const ip = req.ip || req.socket.remoteAddress || 'unknown'; const attempt = authAttempts.get(ip) || { start: Date.now(), count: 0 };
-  if (Date.now() - attempt.start > 15 * 60 * 1000) { attempt.start = Date.now(); attempt.count = 0; }
-  attempt.count += 1; authAttempts.set(ip, attempt);
-  if (authAttempts.size > 10000) { for (const [attemptIp, value] of authAttempts) if (Date.now() - value.start > 30 * 60 * 1000) authAttempts.delete(attemptIp); }
+  const ip = req.ip || req.socket.remoteAddress || 'unknown'; const now = Date.now(); const attempt = getRateLimitBucket(authAttempts, ip, now);
+  if (now - attempt.start > 15 * 60 * 1000) { attempt.start = now; attempt.count = 0; }
+  attempt.count += 1;
   if (attempt.count > 10) return fail(res, new Error('Too many authentication attempts; try again later'), 429);
   if (!supplied || supplied.length > 256) return fail(res, new Error('Invalid access password'), 401);
   const ownerPassword = Buffer.from(process.env.APP_PASSWORD || ''); const suppliedPassword = Buffer.from(supplied);
@@ -2936,6 +3238,31 @@ app.get('/api/auth/status', (req, res) => ok(res, { authenticated: hasValidAuth(
 
 const requestBuckets = new Map();
 const authAttempts = new Map();
+const MAX_RATE_LIMIT_BUCKETS = 10000;
+function getRateLimitBucket(map, key, now, maxSize = MAX_RATE_LIMIT_BUCKETS) {
+  const existing = map.get(key);
+  if (existing) return existing;
+  if (map.size >= maxSize) {
+    const oldestKey = map.keys().next().value;
+    if (oldestKey !== undefined) map.delete(oldestKey);
+  }
+  const bucket = { start: now, count: 0 };
+  map.set(key, bucket);
+  return bucket;
+}
+function pruneRateLimitBuckets(map, now, ttlMs, maxSize = MAX_RATE_LIMIT_BUCKETS) {
+  for (const [key, bucket] of map) {
+    if (!Number.isFinite(bucket?.start) || now - bucket.start > ttlMs) map.delete(key);
+  }
+  while (map.size > maxSize) map.delete(map.keys().next().value);
+  return map.size;
+}
+const rateLimitSweepTimer = setInterval(() => {
+  const now = Date.now();
+  pruneRateLimitBuckets(requestBuckets, now, 120000);
+  pruneRateLimitBuckets(authAttempts, now, 30 * 60 * 1000);
+}, 60 * 1000);
+rateLimitSweepTimer.unref?.();
 function originGuard(req, res, next) {
   if (req.method === 'GET' || req.path === '/auth') return next();
   if (req.get('x-voice-studio') !== '1') return res.status(403).json({ success: false, error: 'Invalid request context' });
@@ -2954,10 +3281,9 @@ function rateLimit(req, res, next) {
   const limit = isRead
     ? positiveLimit(process.env.API_READ_LIMIT_PER_MINUTE, 600)
     : positiveLimit(process.env.API_WRITE_LIMIT_PER_MINUTE, 120);
-  const now = Date.now(); const bucket = requestBuckets.get(key) || { start: now, count: 0 };
+  const now = Date.now(); const bucket = getRateLimitBucket(requestBuckets, key, now);
   if (now - bucket.start >= 60000) { bucket.start = now; bucket.count = 0; }
-  bucket.count += 1; requestBuckets.set(key, bucket);
-  if (requestBuckets.size > 10000) { for (const [bucketKey, value] of requestBuckets) if (now - value.start > 120000) requestBuckets.delete(bucketKey); }
+  bucket.count += 1;
   const remaining = Math.max(0, limit - bucket.count);
   res.setHeader('X-RateLimit-Limit', String(limit));
   res.setHeader('X-RateLimit-Remaining', String(remaining));
@@ -2970,7 +3296,36 @@ function rateLimit(req, res, next) {
 }
 app.use('/api', rateLimit, originGuard, requireAuth);
 app.get('/version', (_req, res) => res.json({ success: true, version: getBuildVersion() }));
-app.get('/api/health', (_req, res) => ok(res, { service: 'voice-studio', connected: clients.size, savedAccounts: savedAccountRecords.size, dataDir: DATA_DIR, accountFile: path.basename(resolveDataFile('accounts.enc')), watchdog: { enabled: true, intervalMs: WATCHDOG_INTERVAL_MS, running: watchdogRunning, observations: watchdogObservations.size }, accounts: [...clients.entries()].map(([name, entry]) => accountHealth(name, entry)) }));
+function runtimeResourceMetrics() {
+  let guilds = 0;
+  let channels = 0;
+  let members = 0;
+  let voiceStates = 0;
+  for (const entry of clients.values()) {
+    const guildCache = entry.client?.guilds?.cache;
+    if (!guildCache) continue;
+    guilds += guildCache.size || 0;
+    for (const guild of guildCache.values()) {
+      channels += guild.channels?.cache?.size || 0;
+      members += guild.members?.cache?.size || 0;
+      voiceStates += guild.voiceStates?.cache?.size || 0;
+    }
+  }
+  const memory = process.memoryUsage();
+  const toMs = (value) => Number.isFinite(value) ? Math.round(value / 1e6 * 100) / 100 : 0;
+  const eventLoopDelayMs = { mean: toMs(eventLoopHistogram.mean), p95: toMs(eventLoopHistogram.percentile(95)), max: toMs(eventLoopHistogram.max) };
+  eventLoopHistogram.reset();
+  return {
+    sampledAt: new Date().toISOString(),
+    uptimeSeconds: Math.round(process.uptime()),
+    memoryBytes: { rss: memory.rss, heapUsed: memory.heapUsed, heapTotal: memory.heapTotal, external: memory.external, arrayBuffers: memory.arrayBuffers || 0 },
+    eventLoopDelayMs,
+    active: { accounts: clients.size, voiceSessions: voiceSessions.size },
+    discordCache: { guilds, channels, members, voiceStates },
+    appCache: { voiceGuildCatalogAccounts: voiceGuildCatalogCache.size, pendingVoiceStateChecks: pendingVoiceStateChecks.size },
+  };
+}
+app.get('/api/health', (_req, res) => ok(res, { service: 'voice-studio', connected: clients.size, savedAccounts: savedAccountRecords.size, dataDir: DATA_DIR, accountFile: path.basename(resolveDataFile('accounts.enc')), watchdog: { enabled: true, intervalMs: WATCHDOG_INTERVAL_MS, running: watchdogRunning, observations: watchdogObservations.size }, resources: runtimeResourceMetrics(), accounts: [...clients.entries()].map(([name, entry]) => accountHealth(name, entry)) }));
 app.get('/api/storage/status', (_req, res) => {
   const accountFile = resolveDataFile('accounts.enc');
   const files = ['accounts.enc', 'voice-sessions.json', 'automation-tasks.json', 'playing-sessions.json'].map((name) => {
@@ -2994,64 +3349,93 @@ app.get('/api/storage/portable-backup', (req, res) => {
     return res.status(400).json({ success: false, error: error.message });
   }
 });
-const healthTimer = setInterval(() => {
-  for (const [name, entry] of clients.entries()) {
-    emitLive('health.updated', { account: accountHealth(name, entry) });
-  }
-}, 10000);
-healthTimer.unref?.();
 app.get('/api/events', (req, res) => {
-  res.setHeader('Content-Type', 'text/event-stream'); res.setHeader('Cache-Control', 'no-cache'); res.setHeader('Connection', 'keep-alive'); res.flushHeaders?.();
-  const send = (event) => res.write(`data: ${JSON.stringify(event)}\n\n`);
-  const heartbeat = setInterval(() => res.write(': heartbeat\n\n'), 15000);
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders?.();
+  let blocked = false;
+  let pendingResync = false;
+  let closed = false;
+  const send = (event) => {
+    if (closed || res.destroyed || res.writableEnded) return;
+    if (blocked) { pendingResync = true; return; }
+    if (!res.write(`data: ${JSON.stringify(event)}\n\n`)) blocked = true;
+  };
+  const onDrain = () => {
+    blocked = false;
+    if (pendingResync) { pendingResync = false; send({ type: 'resync.required', at: Date.now(), seq: liveEventSequence }); }
+  };
+  const heartbeat = setInterval(() => { if (!blocked && !closed && !res.destroyed) res.write(': heartbeat\n\n'); }, 25000);
+  heartbeat.unref?.();
+  const cleanup = () => {
+    if (closed) return;
+    closed = true;
+    clearInterval(heartbeat);
+    liveEvents.off('event', send);
+    res.off('drain', onDrain);
+  };
+  res.on('drain', onDrain);
   liveEvents.on('event', send);
-  req.on('close', () => { clearInterval(heartbeat); liveEvents.off('event', send); });
+  send({ type: 'snapshot', at: Date.now(), seq: liveEventSequence, clients: buildClientSnapshots(), sessions: buildVoiceSessionSnapshots() });
+  req.on('close', cleanup);
+  res.on('close', cleanup);
+  res.on('error', cleanup);
 });
 app.get('/api/accounts/health', (_req, res) => ok(res, { accounts: [...clients.entries()].map(([name, entry]) => accountHealth(name, entry)) }));
-app.get('/api/discord/clients', (_req, res) => {
-  normalizeConnectedAccountNames();
-  const sessionByName = new Map([...voiceSessions.values()].map((session) => [session.name, session]));
-  return ok(res, { clients: [...clients.entries()].map(([name, entry]) => {
-    const user = entry.client?.user;
-    const savedVoice = sessionByName.get(name) || null;
-    const actualVoice = entry.client ? readGatewayVoiceState(entry.client, savedVoice?.guildId || '') || null : null;
-    const voice = actualVoice?.channelId ? { ...(savedVoice || {}), ...actualVoice, name } : savedVoice;
-    const guild = voice && entry.client ? entry.client.guilds?.cache?.get?.(voice.guildId) : null;
-    const member = guild?.members?.cache?.get?.(user?.id);
-    const channel = voice ? guild?.channels?.cache?.get?.(voice.channelId) : null;
-    return {
-      name,
-      username: user?.tag || user?.username || name,
-      displayName: user?.globalName || user?.username || name,
-      nickname: member?.displayName || user?.globalName || user?.username || name,
-      id: user?.id || null,
-      avatar: user?.displayAvatarURL?.({ size: 128 }) || null,
-      status: entry.invalidToken ? 'offline' : (user?.presence?.status || 'online'),
-      health: accountHealth(name, entry),
-      voice: voice ? { guildId: voice.guildId, guildName: guild?.name || voice.guildId, guildIcon: guild?.iconURL?.({ size: 64 }) || null, channelId: voice.channelId, channelName: channel?.name || voice.channelId, selfMute: !!voice.selfMute, selfDeaf: !!voice.selfDeaf, selfVideo: !!voice.selfVideo, selfStream: !!voice.selfStream } : null,
-    };
-  }) });
-});
+app.get('/api/discord/clients', (_req, res) => ok(res, { clients: buildClientSnapshots() }));
+app.get('/api/dashboard/snapshot', (_req, res) => ok(res, { clients: buildClientSnapshots(), sessions: buildVoiceSessionSnapshots() }));
+function accountLimitMessage() {
+  return `وصلت إلى الحد الحالي (${limit} حسابًا). يُرجى دفع 20$ لزيادة الحد إلى ${limit + 10} حسابًا.`;
+}
+function reserveAccountConnectSlots(requestedCount) {
+  const available = Math.max(0, limit - clients.size - pendingAccountConnectReservations);
+  const accepted = Math.min(Math.max(0, Math.floor(Number(requestedCount) || 0)), available);
+  pendingAccountConnectReservations += accepted;
+  return { accepted, reserved: accepted, blocked: Math.max(0, requestedCount - accepted), message: accountLimitMessage() };
+}
+function releaseAccountConnectSlots(count) {
+  pendingAccountConnectReservations = Math.max(0, pendingAccountConnectReservations - Math.max(0, Number(count) || 0));
+}
 app.post('/api/discord/connect', async (req, res) => {
-  try { return ok(res, await connectOneWithRetry(req.body?.token, req.body?.name)); }
+  const reservation = reserveAccountConnectSlots(1);
+  if (!reservation.accepted) return fail(res, new Error(reservation.message), 402, { accountLimit: limit, suggestedLimit: limit + 10 });
+  try {
+    const result = await connectOneWithRetry(req.body?.token, req.body?.name);
+    const limitReached = clients.size >= limit;
+    return ok(res, { ...result, limitReached, ...(limitReached ? { accountLimit: limit, suggestedLimit: limit + 10, limitMessage: accountLimitMessage() } : {}) });
+  }
   catch (error) { return fail(res, error, 400); }
+  finally { releaseAccountConnectSlots(reservation.reserved); }
 });
 app.post('/api/discord/connect-bulk', async (req, res) => {
   const items = Array.isArray(req.body?.accounts) ? req.body.accounts.slice(0, 500) : [];
   if (!items.length) return fail(res, new Error('accounts must contain at least one token'), 400);
+  const reservation = reserveAccountConnectSlots(items.length);
+  const acceptedItems = items.slice(0, reservation.accepted);
+  const blockedItems = items.slice(reservation.accepted);
+  if (!acceptedItems.length) return fail(res, new Error(reservation.message), 402, { accountLimit: limit, suggestedLimit: limit + 10 });
   const results = [];
   let cursor = 0;
   const worker = async () => {
-    while (cursor < items.length) {
+    while (cursor < acceptedItems.length) {
       const index = cursor++;
-      const item = items[index] || {};
+      const item = acceptedItems[index] || {};
       results[index] = await connectOneWithRetry(item.token, item.name)
         .then((result) => ({ ok: true, ...result }))
         .catch((error) => ({ ok: false, name: item.name || `bulk-${index + 1}`, error: error.message }));
     }
   };
-  await Promise.all(Array.from({ length: Math.min(ACCOUNT_CONNECT_CONCURRENCY, items.length) }, worker));
-  return ok(res, { results, summary: summary(results) });
+  try {
+    await Promise.all(Array.from({ length: Math.min(ACCOUNT_CONNECT_CONCURRENCY, acceptedItems.length) }, worker));
+    for (let index = 0; index < blockedItems.length; index += 1) {
+      const item = blockedItems[index] || {};
+      results[acceptedItems.length + index] = { ok: false, name: item.name || `bulk-${acceptedItems.length + index + 1}`, error: reservation.message, code: 'ACCOUNT_LIMIT' };
+    }
+    const limitReached = clients.size >= limit;
+    return ok(res, { results, summary: summary(results), accountLimit: limit, suggestedLimit: limit + 10, limitReached, ...(limitReached ? { limitMessage: accountLimitMessage() } : {}) });
+  } finally { releaseAccountConnectSlots(reservation.reserved); }
 });
 app.post('/api/discord/disconnect', async (req, res) => {
   const name = String(req.body?.name || [...clients.keys()][0] || '');
@@ -3060,6 +3444,7 @@ app.post('/api/discord/disconnect', async (req, res) => {
   stopTasksForAccount(name);
   stopSyntheticStream(name, { leaveVoice: true });
   try { await entry.client?.destroy?.(); } catch {}
+  clearConnectedAccountCache(name);
   clients.delete(name);
   forgetPersistedAccount(name);
   persistConnectedAccounts();
@@ -3076,6 +3461,7 @@ app.post('/api/discord/disconnect-bulk', async (req, res) => {
       stopSyntheticStream(name, { leaveVoice: true });
       removeSessionsForAccount(name);
       try { await entry.client?.destroy?.(); } catch (error) { return { name, ok: false, error: error.message }; }
+      clearConnectedAccountCache(name);
       clients.delete(name);
       forgetPersistedAccount(name);
       emitLive('account.disconnected', { name });
@@ -3087,7 +3473,7 @@ app.post('/api/discord/disconnect-bulk', async (req, res) => {
 app.post('/api/discord/disconnect-all', async (_req, res) => {
   for (const name of clients.keys()) { stopTasksForAccount(name); stopSyntheticStream(name, { leaveVoice: true }); }
   for (const entry of clients.values()) { try { await entry.client?.destroy?.(); } catch {} }
-  for (const name of clients.keys()) forgetPersistedAccount(name);
+  for (const name of clients.keys()) { forgetPersistedAccount(name); clearConnectedAccountCache(name); }
   clients.clear();
   persistConnectedAccounts();
   emitLive('account.disconnected-all');
@@ -3096,43 +3482,10 @@ app.post('/api/discord/disconnect-all', async (_req, res) => {
 
 app.get('/api/voice/guilds', (req, res) => {
   const requested = String(req.query?.account || '').trim();
-  const entries = requested ? [[requested, clients.get(requested)]] : [...clients.entries()];
-  const guilds = [];
-  for (const [name, entry] of entries) {
-    if (!entry?.client?.guilds?.cache) continue;
-    for (const guild of entry.client.guilds.cache.values()) {
-      const me = guild.members?.me || entry.client.user?.id;
-      const voiceChannels = [...guild.channels.cache.values()]
-        .filter((channel) => isVoiceChannel(channel) && canJoin(channel, me))
-        .map((channel) => ({
-          id: channel.id,
-          name: channel.name,
-          userLimit: Number(channel.userLimit || 0),
-          members: channel.members?.size || 0,
-          bitrate: Math.round((Number(channel.bitrate || 64000)) / 1000),
-        }))
-        .sort((a, b) => a.name.localeCompare(b.name));
-      if (voiceChannels.length) guilds.push({ account: name, guildId: guild.id, guildName: guild.name, guildIcon: guild.iconURL?.({ size: 64 }) || null, voiceChannels });
-    }
-  }
-  return ok(res, { guilds });
+  return ok(res, { guilds: buildVoiceGuildCatalog(requested) });
 });
 app.get('/api/voice/sessions', (req, res) => {
-  const sessions = [];
-  const sessionsByName = new Map();
-  for (const session of voiceSessions.values()) { if (!sessionsByName.has(session.name)) sessionsByName.set(session.name, []); sessionsByName.get(session.name).push(session); }
-  for (const [name, entry] of clients.entries()) {
-    if (!entry?.client) continue;
-    for (const session of (sessionsByName.get(name) || [])) {
-      const actual = readGatewayVoiceState(entry.client, session.guildId);
-      if (actual && !actual.channelId) { removeSessionsForAccount(name, session.guildId); continue; }
-      const guild = entry.client.guilds?.cache?.get?.(session.guildId);
-      const channel = guild?.channels?.cache?.get?.(actual?.channelId || session.channelId);
-      const merged = { ...session, ...(actual || {}), channelId: actual?.channelId || session.channelId, guildName: guild?.name || session.guildId, channelName: channel?.name || actual?.channelId || session.channelId, guildIcon: guild?.iconURL?.({ size: 64 }) || null, memberCount: channel?.members?.size || 0 };
-      sessions.push(merged);
-    }
-  }
-  return ok(res, { sessions });
+  return ok(res, { sessions: buildVoiceSessionSnapshots() });
 });
 app.get('/api/voice/media-logs', (_req, res) => {
   try {
@@ -3164,24 +3517,8 @@ app.get('/api/voice/rotations', (_req, res) => ok(res, { rotations: [...rotation
 app.get('/api/voice/state-cycles', (_req, res) => ok(res, { cycles: [...stateCycles.values()].map(({ timer, ...item }) => item) }));
 app.get('/api/playing/sessions', (_req, res) => ok(res, { sessions: [...playingSessions.values()].map(({ timer, ...item }) => item), active: [...playingSessions.values()].filter((item) => item.active).length }));
 app.get('/api/playing/channels', (req, res) => {
-  const channels = new Map();
-  for (const [account, entry] of clients.entries()) {
-    if (!entry?.client) continue;
-    for (const guild of entry.client.guilds?.cache?.values?.() || []) {
-      for (const channel of guild.channels?.cache?.values?.() || []) {
-        const isText = channel?.isText?.() || [0, 5, 10, 11, 12, 15].includes(Number(channel?.type));
-        if (!isText || !channel.id || channel.isThread?.()) continue;
-        const key = String(channel.id); const permissions = channel.permissionsFor?.(entry.client.user?.id);
-        if (permissions?.has?.('VIEW_CHANNEL') === false || permissions?.has?.('READ_MESSAGE_HISTORY') === false) continue;
-        if (!channels.has(key)) channels.set(key, { id: key, name: channel.name || key, guildId: guild.id, guildName: guild.name, accounts: [] });
-        channels.get(key).accounts.push(account);
-      }
-    }
-  }
   const selectedGuild = String(req.query?.guildId || '').trim();
-  const filtered = [...channels.values()].filter((channel) => !selectedGuild || channel.guildId === selectedGuild);
-  const guilds = [...new Map(filtered.map((channel) => [channel.guildId, { id: channel.guildId, name: channel.guildName }])).values()].sort((a, b) => a.name.localeCompare(b.name));
-  return ok(res, { channels: filtered.sort((a, b) => a.name.localeCompare(b.name)), guilds });
+  return ok(res, buildPlayingChannelCatalog(selectedGuild));
 });
 app.get('/api/playing/events', (_req, res) => ok(res, { events: readPlayingEvents() }));
 app.post('/api/playing/preview', (req, res) => { const steps = cleanPlayingSteps(req.body?.steps); if (!steps.length) return fail(res, new Error('At least one complete action is required'), 400); return ok(res, { preview: steps.map((step, index) => ({ order: index + 1, button: step.button, phrase: step.phrase || null, messageId: step.messageId || 'auto-detect', customId: step.customId || 'auto-detect' })) }); });
@@ -3679,10 +4016,10 @@ async function restoreAutomationTasks() {
 }
 app.get('/{*splat}', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 if (require.main === module) {
-  app.listen(PORT, '0.0.0.0', () => { console.log(`Voice Studio listening on http://localhost:${PORT}`); console.log(`[storage] dataDir=${DATA_DIR}; accountFile=${resolveDataFile('accounts.enc')}; activeTokensFile=${ACTIVE_TOKENS_FILE}; failedTokensFile=${FAILED_TOKENS_FILE}`); persistAccountSnapshots(); setInterval(() => { try { reconcileVoiceSessions(); } catch (error) { console.warn('[voice] session reconciliation failed:', error.message); } }, 3000).unref?.(); startVoiceWatchdog(); restoreSavedAccounts().then(() => restoreAutomationTasks()).catch((error) => console.warn('[restore] restore failed:', error.message)); });
+  app.listen(PORT, '0.0.0.0', () => { console.log(`Voice Studio listening on http://localhost:${PORT}`); console.log(`[storage] dataDir=${DATA_DIR}; accountFile=${resolveDataFile('accounts.enc')}; activeTokensFile=${ACTIVE_TOKENS_FILE}; failedTokensFile=${FAILED_TOKENS_FILE}`); persistAccountSnapshots(); setInterval(() => { try { reconcileVoiceSessions(); } catch (error) { console.warn('[voice] session reconciliation failed:', error.message); } }, VOICE_RECONCILE_INTERVAL_MS).unref?.(); startVoiceWatchdog(); restoreSavedAccounts().then(() => restoreAutomationTasks()).catch((error) => console.warn('[restore] restore failed:', error.message)); });
   const persistBeforeExit = () => { try { persistConnectedAccounts(); persistAccountSnapshots(); persistSessions(); persistAutomationTasks(); persistPlayingSessions(); } catch (error) { console.warn('[storage] final persistence failed:', error.message); } };
   process.once('SIGTERM', () => { persistBeforeExit(); process.exit(0); });
   process.once('SIGINT', () => { persistBeforeExit(); process.exit(0); });
 }
 
-module.exports = { app, clients, voiceSessions, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, recordSuccessfulCycleState, playingSessions, stopPlayingSession, schedulePlaying, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, hardenVoiceConnection, cleanupPrimaryStreamAttempt, guardVoiceWebSocketTeardown, safeErrorSummary, buildAccountSnapshot, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, registerAccountStreamer, mediaStreamers, mediaQueueSnapshot, ensureSyntheticVideo, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanAccountRecords, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, isRecoverableDiscordInteractionError };
+module.exports = { app, clients, voiceSessions, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, compactStateHistory, recordSuccessfulCycleState, getRateLimitBucket, pruneRateLimitBuckets, reserveAccountConnectSlots, releaseAccountConnectSlots, playingSessions, stopPlayingSession, schedulePlaying, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, hardenVoiceConnection, cleanupPrimaryStreamAttempt, guardVoiceWebSocketTeardown, safeErrorSummary, buildAccountSnapshot, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, registerAccountStreamer, mediaStreamers, mediaQueueSnapshot, ensureSyntheticVideo, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanAccountRecords, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, projectGatewayVoiceState, buildVoiceGuildCatalog, buildPlayingChannelCatalog, invalidateVoiceGuildCatalog, scheduleCatalogEvent, liveEvents, isRecoverableDiscordInteractionError };

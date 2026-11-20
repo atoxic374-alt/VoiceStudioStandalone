@@ -11,7 +11,8 @@
     "start": "node server.js",
     "dev": "node --watch server.js",
     "test": "node --test",
-    "check": "node --check server.js && node --check public/app.js"
+    "check": "node --check server.js && node --check public/app.js && node --check scripts/scale-smoke.js",
+    "test:scale": "node --expose-gc scripts/scale-smoke.js"
   },
   "dependencies": {
     "@dank074/discord-video-stream": "^6.0.0",
