@@ -1,5 +1,6 @@
 const express = require('express');
 const path = require('path');
+const os = require('os');
 const fs = require('fs');
 const crypto = require('crypto');
 const { execFileSync, spawn } = require('child_process');
@@ -508,6 +509,15 @@ function fail(res, error, status = 200, payload = {}) {
   const message = redact(error?.message || String(error || 'Unknown error'));
   return res.status(status).json({ success: false, error: message, ...payload });
 }
+function discordErrorDetails(error, fallback = 'Discord request failed') {
+  const code = error?.code == null ? '' : `Discord code ${String(error.code).slice(0, 40)}`;
+  const status = Number(error?.status || error?.statusCode || error?.httpStatus);
+  const statusText = Number.isInteger(status) && status >= 400 && status <= 599 ? `HTTP ${status}` : '';
+  const detail = error?.rawError?.message && error.rawError.message !== error.message ? String(error.rawError.message).slice(0, 500) : '';
+  let validation = '';
+  try { if (error?.rawError?.errors) validation = JSON.stringify(error.rawError.errors).slice(0, 700); } catch {}
+  return redact([error?.message || fallback, detail, validation, code, statusText].filter(Boolean).join(' — ')).slice(0, 1200);
+}
 function parseCookies(req) { const result = {}; for (const part of String(req.headers.cookie || '').split(';')) { const separator = part.indexOf('='); if (separator < 1) continue; const key = part.slice(0, separator).trim(); const raw = part.slice(separator + 1).trim(); try { result[key] = decodeURIComponent(raw); } catch {} } return result; }
 function authSignature(value, secret = process.env.APP_PASSWORD || 'disabled') { return crypto.createHmac('sha256', secret).update(value).digest('base64url'); }
 function hashSecret(value) { return crypto.createHash('sha256').update(String(value)).digest('hex'); }
@@ -576,6 +586,25 @@ function sessionKey(name, guildId) { return `${name}__${guildId}`; }
 function cleanAccounts(accounts) {
   const values = Array.isArray(accounts) ? accounts : [accounts];
   return [...new Set(values.map((value) => String(value || '').trim()).filter(Boolean))].slice(0, 500);
+}
+function parseDiscordInviteCode(input) {
+  const raw = String(input || '').trim();
+  if (!raw) throw new Error('A Discord invite URL or code is required');
+  if (raw.length > 2048) throw new Error('Discord invite input is too long');
+  if (/^[A-Za-z0-9_-]{2,100}$/.test(raw)) return raw;
+  let url;
+  try { url = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`); }
+  catch { throw new Error('Invalid invite URL; use discord.gg/... or discord.com/invite/...'); }
+  const host = url.hostname.toLowerCase();
+  if (!['discord.gg', 'www.discord.gg', 'discord.com', 'www.discord.com', 'discordapp.com', 'www.discordapp.com'].includes(host)) {
+    throw new Error('Only Discord invite URLs are allowed');
+  }
+  const parts = url.pathname.split('/').filter(Boolean);
+  const code = host.endsWith('discord.gg') ? parts[0] : (parts[0]?.toLowerCase() === 'invite' ? parts[1] : '');
+  if (!/^[A-Za-z0-9_-]{2,100}$/.test(code || '')) {
+    throw new Error('Invalid invite URL; use discord.gg/... or discord.com/invite/...');
+  }
+  return code;
 }
 function normalizeVoiceState(state = {}) {
   return { selfMute: !!state.selfMute, selfDeaf: !!state.selfDeaf, selfVideo: !!state.selfVideo, selfStream: !!state.selfStream };
@@ -1175,6 +1204,11 @@ function isInvalidCredentialError(error) {
   const code = Number(error?.code || 0);
   const text = String(error?.error || error?.message || '').toLowerCase();
   return status === 401 || code === 40001 || code === 4004 || /invalid token|improper token|token is invalid|incorrect login details/.test(text);
+}
+function isCaptchaChallengeError(error) {
+  const code = String(error?.code || '').toUpperCase();
+  const text = String(error?.error || error?.message || '').toLowerCase();
+  return code.includes('CAPTCHA_SOLVER_NOT_IMPLEMENTED') || /captcha|human verification required/.test(text);
 }
 async function withResultRetry(worker, maxRetries = 2) {
   let last = null;
@@ -2399,7 +2433,7 @@ async function connectOneWithRetry(token, name) {
       // A temporary gateway/network/rate-limit failure is not evidence that
       // Discord rotated or revoked the token. Do not label or destroy the
       // account for that case; the caller can retry it later.
-      if (isInvalidCredentialError(error)) break;
+      if (isInvalidCredentialError(error) || isCaptchaChallengeError(error)) break;
       if (attempt === 0) await new Promise((resolve) => setTimeout(resolve, 500));
     }
   }
@@ -2407,6 +2441,11 @@ async function connectOneWithRetry(token, name) {
   if (isInvalidCredentialError(lastError)) {
     markTokenChanged(finalName, String(token || '').trim(), lastError);
     throw new Error('Invalid Discord token: Discord rejected the token or it was revoked');
+  }
+  if (isCaptchaChallengeError(lastError)) {
+    const verificationError = new Error('Discord requires CAPTCHA or additional verification for this account. VoiceStudio cannot solve or bypass this check. Complete any verification in the official Discord app or website, then retry manually if Discord allows it.');
+    recordFailedAccount(finalName, String(token || '').trim(), verificationError, 'verification-required');
+    throw verificationError;
   }
   recordFailedAccount(finalName, String(token || '').trim(), lastError, 'connection-failed');
   throw new Error(`Temporary Discord connection failure after retry: ${lastError?.message || 'Gateway unavailable'}`);
@@ -3326,6 +3365,61 @@ function runtimeResourceMetrics() {
   };
 }
 app.get('/api/health', (_req, res) => ok(res, { service: 'voice-studio', connected: clients.size, savedAccounts: savedAccountRecords.size, dataDir: DATA_DIR, accountFile: path.basename(resolveDataFile('accounts.enc')), watchdog: { enabled: true, intervalMs: WATCHDOG_INTERVAL_MS, running: watchdogRunning, observations: watchdogObservations.size }, resources: runtimeResourceMetrics(), accounts: [...clients.entries()].map(([name, entry]) => accountHealth(name, entry)) }));
+let resourceCpuPrevious = process.cpuUsage();
+let resourceCpuAt = process.hrtime.bigint();
+function directoryBytes(root) {
+  let total = 0;
+  const stack = [root];
+  while (stack.length) {
+    const dir = stack.pop();
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      try {
+        if (entry.isDirectory()) stack.push(full);
+        else if (entry.isFile()) total += fs.statSync(full).size;
+      } catch {}
+    }
+  }
+  return total;
+}
+function cgroupMemoryLimit() {
+  for (const file of ['/sys/fs/cgroup/memory.max', '/sys/fs/cgroup/memory/memory.limit_in_bytes']) {
+    try {
+      const raw = fs.readFileSync(file, 'utf8').trim();
+      if (raw !== 'max') {
+        const value = Number(raw);
+        if (Number.isFinite(value) && value > 0 && value < 2 ** 60) return value;
+      }
+    } catch {}
+  }
+  return os.totalmem();
+}
+app.get('/api/resources', (_req, res) => {
+  const now = process.hrtime.bigint();
+  const elapsedMicros = Number(now - resourceCpuAt) / 1000;
+  const cpuNow = process.cpuUsage();
+  const cpuMicros = (cpuNow.user - resourceCpuPrevious.user) + (cpuNow.system - resourceCpuPrevious.system);
+  resourceCpuPrevious = cpuNow;
+  resourceCpuAt = now;
+  const cpuPercent = elapsedMicros > 0 ? Math.max(0, Math.min(100, cpuMicros / elapsedMicros * 100)) : 0;
+  const memory = process.memoryUsage();
+  const memoryLimit = cgroupMemoryLimit();
+  let filesystem = null;
+  try {
+    const stat = fs.statfsSync(DATA_DIR);
+    filesystem = { totalBytes: stat.blocks * stat.bsize, freeBytes: stat.bavail * stat.bsize, usedBytes: (stat.blocks - stat.bfree) * stat.bsize };
+  } catch {}
+  return ok(res, {
+    sampledAt: Date.now(),
+    cpu: { processPercent: cpuPercent, cores: os.cpus().length },
+    memory: { rssBytes: memory.rss, heapUsedBytes: memory.heapUsed, heapTotalBytes: memory.heapTotal, externalBytes: memory.external, limitBytes: memoryLimit },
+    storage: { dataDirectoryBytes: directoryBytes(DATA_DIR), filesystem },
+    source: 'application-container',
+    billing: { available: false, note: 'Railway account usage and billing are not exposed by container measurements.' },
+  });
+});
 app.get('/api/storage/status', (_req, res) => {
   const accountFile = resolveDataFile('accounts.enc');
   const files = ['accounts.enc', 'voice-sessions.json', 'automation-tasks.json', 'playing-sessions.json'].map((name) => {
@@ -3398,6 +3492,121 @@ function reserveAccountConnectSlots(requestedCount) {
 function releaseAccountConnectSlots(count) {
   pendingAccountConnectReservations = Math.max(0, pendingAccountConnectReservations - Math.max(0, Number(count) || 0));
 }
+const pendingServerJoins = new Set();
+app.post('/api/ts/join-server', async (req, res) => {
+  try {
+    const account = String(req.body?.account || req.body?.name || req.body?.email || '').trim();
+    if (!account) return fail(res, new Error('account is required'), 400);
+    const inviteCode = parseDiscordInviteCode(req.body?.inviteUrl || req.body?.inviteCode);
+    const client = getClient(account);
+    if (!client) return fail(res, new Error(`Discord account is not connected: ${account}`), 404);
+    const operationKey = account.toLocaleLowerCase();
+    if (pendingServerJoins.has(operationKey)) return fail(res, new Error('A server join request is already running for this account'), 409);
+    pendingServerJoins.add(operationKey);
+    try {
+      const invite = await client.fetchInvite(inviteCode);
+      const guildId = String(invite?.guild?.id || '').trim();
+      if (!guildId) throw new Error('This invite does not point to a Discord server');
+      const existingGuild = client.guilds?.cache?.get?.(guildId);
+      if (existingGuild) {
+        return ok(res, {
+          joined: true,
+          verified: true,
+          alreadyJoined: true,
+          inviteCode,
+          guild: { id: guildId, name: String(existingGuild.name || invite.guild?.name || 'Discord server') },
+          message: 'Account is already a member of this server',
+        });
+      }
+
+      // Preserve server onboarding and rule screening instead of bypassing them.
+      const joinedGuild = await client.acceptInvite(inviteCode, { bypassOnboarding: false, bypassVerify: false });
+      const cachedGuild = client.guilds?.cache?.get?.(guildId);
+      const returnedGuild = String(joinedGuild?.id || '') === guildId ? joinedGuild : null;
+      if (!cachedGuild && !returnedGuild) throw new Error('Discord accepted the invite request but did not confirm server membership');
+      const guild = cachedGuild || returnedGuild || invite.guild;
+      const verified = Boolean(client.guilds?.cache?.has?.(guildId));
+      return ok(res, {
+        joined: true,
+        verified,
+        inviteCode,
+        guild: { id: guildId, name: String(guild?.name || invite.guild?.name || 'Discord server') },
+        message: verified ? 'Account joined the server and membership was confirmed' : 'Invite accepted, but membership could not be confirmed yet',
+      });
+    } finally {
+      pendingServerJoins.delete(operationKey);
+    }
+  } catch (error) {
+    const httpStatus = Number(error?.status || error?.statusCode || error?.httpStatus);
+    const status = Number.isInteger(httpStatus) && httpStatus >= 400 && httpStatus <= 599 ? httpStatus : 400;
+    return fail(res, new Error(discordErrorDetails(error, 'Discord invite join failed')), status);
+  }
+});
+app.post('/api/ts/check-membership', async (req, res) => {
+  const inviteCode = (() => {
+    try { return parseDiscordInviteCode(req.body?.inviteUrl || req.body?.inviteCode); }
+    catch (error) { return error; }
+  })();
+  if (inviteCode instanceof Error) return fail(res, inviteCode, 400);
+  const accountNames = cleanAccounts(req.body?.accounts);
+  if (!accountNames.length) return fail(res, new Error('Select at least one connected account'), 400);
+  const inviteResolver = accountNames.map((name) => getClient(name)).find(Boolean);
+  if (!inviteResolver) return fail(res, new Error('None of the selected accounts is connected'), 404);
+
+  let invite;
+  try { invite = await inviteResolver.fetchInvite(inviteCode); }
+  catch (error) {
+    const httpStatus = Number(error?.status || error?.statusCode || error?.httpStatus);
+    const status = Number.isInteger(httpStatus) && httpStatus >= 400 && httpStatus <= 599 ? httpStatus : 400;
+    return fail(res, new Error(discordErrorDetails(error, 'Unable to resolve Discord invite')), status);
+  }
+  const guildId = String(invite?.guild?.id || '').trim();
+  if (!guildId) return fail(res, new Error('This invite does not point to a Discord server'), 400);
+
+  const results = [];
+  for (const name of accountNames) {
+    const client = getClient(name);
+    if (!client) {
+      results.push({ name, ok: false, error: 'Account is not connected' });
+      continue;
+    }
+    if (pendingServerJoins.has(name.toLocaleLowerCase())) {
+      results.push({ name, ok: false, error: 'A server join is currently running for this account' });
+      continue;
+    }
+    try {
+      let guild = client.guilds?.cache?.get?.(guildId) || null;
+      if (!guild) {
+        const guilds = await client.guilds.fetch();
+        guild = guilds?.get?.(guildId) || client.guilds?.cache?.get?.(guildId) || null;
+      }
+      const member = Boolean(guild);
+      results.push({
+        name,
+        ok: true,
+        member,
+        skipped: member,
+        status: member ? 'already_member' : 'not_member',
+        guild: { id: guildId, name: String(guild?.name || invite.guild?.name || 'Discord server') },
+        message: member ? 'Already a member — skipped' : 'Not a member — no join was attempted',
+      });
+    } catch (error) {
+      results.push({ name, ok: false, error: discordErrorDetails(error, 'Membership check failed') });
+    }
+  }
+  const summary = {
+    total: results.length,
+    members: results.filter((item) => item.ok && item.member).length,
+    notMembers: results.filter((item) => item.ok && !item.member).length,
+    failed: results.filter((item) => !item.ok).length,
+  };
+  return ok(res, {
+    inviteCode,
+    guild: { id: guildId, name: String(invite.guild?.name || 'Discord server') },
+    results,
+    summary,
+  });
+});
 app.post('/api/discord/connect', async (req, res) => {
   const reservation = reserveAccountConnectSlots(1);
   if (!reservation.accepted) return fail(res, new Error(reservation.message), 402, { accountLimit: limit, suggestedLimit: limit + 10 });
@@ -4022,4 +4231,4 @@ if (require.main === module) {
   process.once('SIGINT', () => { persistBeforeExit(); process.exit(0); });
 }
 
-module.exports = { app, clients, voiceSessions, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, compactStateHistory, recordSuccessfulCycleState, getRateLimitBucket, pruneRateLimitBuckets, reserveAccountConnectSlots, releaseAccountConnectSlots, playingSessions, stopPlayingSession, schedulePlaying, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, hardenVoiceConnection, cleanupPrimaryStreamAttempt, guardVoiceWebSocketTeardown, safeErrorSummary, buildAccountSnapshot, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, registerAccountStreamer, mediaStreamers, mediaQueueSnapshot, ensureSyntheticVideo, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanAccountRecords, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, projectGatewayVoiceState, buildVoiceGuildCatalog, buildPlayingChannelCatalog, invalidateVoiceGuildCatalog, scheduleCatalogEvent, liveEvents, isRecoverableDiscordInteractionError };
+module.exports = { app, clients, voiceSessions, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, compactStateHistory, recordSuccessfulCycleState, getRateLimitBucket, pruneRateLimitBuckets, reserveAccountConnectSlots, releaseAccountConnectSlots, playingSessions, stopPlayingSession, schedulePlaying, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, hardenVoiceConnection, cleanupPrimaryStreamAttempt, guardVoiceWebSocketTeardown, safeErrorSummary, buildAccountSnapshot, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, registerAccountStreamer, mediaStreamers, mediaQueueSnapshot, ensureSyntheticVideo, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, isCaptchaChallengeError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanAccountRecords, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, projectGatewayVoiceState, buildVoiceGuildCatalog, buildPlayingChannelCatalog, invalidateVoiceGuildCatalog, scheduleCatalogEvent, liveEvents, isRecoverableDiscordInteractionError };

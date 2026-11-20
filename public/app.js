@@ -22,6 +22,7 @@ const state = {
   dashboardRenderTimer: null, dashboardRenderNeedsPlaying: false,
   playingGuilds: [], playingGuildsLoaded: false, playingChannelCatalog: new Map(), playingRefreshTimer: null,
   playingSessions: [], playingSessionsPromise: null,
+  membershipCheckBusy: false,
 };
 
 let authPromptPromise = null;
@@ -224,8 +225,8 @@ function feedback(id, message, tone = '') {
 }
 function setBusy(key, busy) {
   if (busy) state.busy.add(key); else state.busy.delete(key);
-  const button = ({ connect: '#connectButton', join: '#joinButton', joinAll: '#joinAllButton', leave: '#leaveButton' }[key]);
-  if (button) $(button).disabled = busy;
+  const button = ({ connect: '#connectButton', join: '#joinButton', joinAll: '#joinAllButton', leave: '#leaveButton', 'join-server': '#joinServerButton' }[key]);
+  if (button) $(button).disabled = busy || (key === 'join-server' && !state.clients.length);
 }
 function playingSelectedAccounts() { return [...document.querySelectorAll('#playingAccounts input[type="checkbox"]:checked')].map((input) => input.value); }
 function updatePlayingSelection() { const count = playingSelectedAccounts().length; if ($('#playingSelectionCount')) $('#playingSelectionCount').textContent = String(count); renderPlayingChecklist(); savePlayingDraft(); }
@@ -324,6 +325,60 @@ function initPlaying() { addPlayingStep(); restorePlayingDraft(); renderPlayingA
 function applyClientList(clients, preferred = '', { render = true, renderPlaying = true } = {}) {
   const previousAccount = state.selectedAccount;
   state.clients = Array.isArray(clients) ? clients : [];
+function selectedMembershipAccounts() {
+  return [...document.querySelectorAll('#membershipAccountList input[type="checkbox"]:checked')].map((input) => input.value);
+}
+function renderMembershipAccounts() {
+  const root = $('#membershipAccountList');
+  if (!root) return;
+  const selected = new Set(selectedMembershipAccounts());
+  root.innerHTML = state.clients.length
+    ? state.clients.map((client) => `<label class="membership-account-item"><input type="checkbox" value="${escapeHTML(client.name)}" ${selected.has(client.name) ? 'checked' : ''} ${state.membershipCheckBusy ? 'disabled' : ''} /><span class="membership-account-copy"><strong>${escapeHTML(client.nickname || client.displayName || client.username || client.name)}</strong><small>${escapeHTML(client.name)}</small></span></label>`).join('')
+    : '<div class="task-empty">Connect accounts to check membership</div>';
+  root.querySelectorAll('input[type="checkbox"]').forEach((input) => input.addEventListener('change', updateMembershipControls));
+  updateMembershipControls();
+}
+function updateMembershipControls() {
+  const count = selectedMembershipAccounts().length;
+  const connected = state.clients.length > 0;
+  $('#checkMembershipButton').disabled = !connected || !count || state.membershipCheckBusy;
+  $('#selectAllMembershipAccounts').disabled = !connected || state.membershipCheckBusy;
+  $('#clearMembershipAccounts').disabled = !count || state.membershipCheckBusy;
+  if ($('#checkMembershipButton')) $('#checkMembershipButton').textContent = state.membershipCheckBusy ? 'Checking membership…' : `Check selected accounts${count ? ` (${count})` : ''}`;
+}
+function renderMembershipResults(results, guild) {
+  const root = $('#membershipCheckResults');
+  if (!root) return;
+  root.innerHTML = results.length ? `<div class="membership-result-heading">${escapeHTML(guild?.name || 'Discord server')} · ${results.length} account${results.length === 1 ? '' : 's'}</div>` + results.map((result) => {
+    const tone = !result.ok ? 'is-error' : result.member ? 'is-member' : 'is-not-member';
+    const label = !result.ok ? 'Check failed' : result.member ? 'Already a member · skipped' : 'Not a member · no join attempted';
+    const detail = result.ok ? (result.message || '') : (result.error || 'Membership check failed');
+    return `<div class="membership-result ${tone}"><span class="membership-result-mark" aria-hidden="true">${!result.ok ? '!' : result.member ? '✓' : '–'}</span><span><strong>${escapeHTML(accountNickname(result.name))}</strong><small>${escapeHTML(result.name)} · ${escapeHTML(label)}</small>${detail ? `<small class="membership-result-detail">${escapeHTML(detail)}</small>` : ''}</span></div>`;
+  }).join('') : '';
+}
+async function checkServerMembership() {
+  const accounts = selectedMembershipAccounts();
+  const inviteUrl = String($('#joinServerInvite')?.value || '').trim();
+  if (!inviteUrl) { feedback('#membershipCheckSummary', 'Enter a Discord invite link or code above first.', 'error'); $('#joinServerInvite')?.focus(); return; }
+  if (!accounts.length) { feedback('#membershipCheckSummary', 'Select at least one connected account.', 'error'); return; }
+  if (state.membershipCheckBusy) return;
+  state.membershipCheckBusy = true;
+  renderMembershipAccounts();
+  feedback('#membershipCheckSummary', `Checking ${accounts.length} selected account${accounts.length === 1 ? '' : 's'}…`);
+  $('#membershipCheckResults').innerHTML = '';
+  try {
+    const result = await api('/api/ts/check-membership', { method: 'POST', body: JSON.stringify({ accounts, inviteUrl }) });
+    renderMembershipResults(result.results || [], result.guild);
+    const summary = result.summary || {};
+    const text = `${summary.members || 0} already members · ${summary.notMembers || 0} not members · ${summary.failed || 0} checks failed`;
+    feedback('#membershipCheckSummary', text, summary.failed ? 'pending' : 'success');
+  } catch (error) {
+    feedback('#membershipCheckSummary', error.message || 'Membership check failed.', 'error');
+  } finally {
+    state.membershipCheckBusy = false;
+    renderMembershipAccounts();
+  }
+}
   const select = $('#accountSelect');
   const current = preferred || state.selectedAccount;
   const optionMarkup = state.clients.length
@@ -332,11 +387,22 @@ function applyClientList(clients, preferred = '', { render = true, renderPlaying
   if (select && select.innerHTML !== optionMarkup) select.innerHTML = optionMarkup;
   state.selectedAccount = state.clients.some((client) => client.name === current) ? current : (state.clients[0]?.name || '');
   if (select) select.value = state.selectedAccount;
+  const inviteAccountSelect = $('#joinServerAccount');
+  if (inviteAccountSelect) {
+    const preferredInviteAccount = inviteAccountSelect.value || state.selectedAccount;
+    inviteAccountSelect.innerHTML = state.clients.length
+      ? state.clients.map((client) => `<option value="${escapeHTML(client.name)}">${escapeHTML(client.nickname || client.displayName || client.username || client.name)}</option>`).join('')
+      : '<option value="">Connect an account first</option>';
+    inviteAccountSelect.value = state.clients.some((client) => client.name === preferredInviteAccount) ? preferredInviteAccount : state.selectedAccount;
+    inviteAccountSelect.disabled = !state.clients.length || state.busy.has('join-server');
+    $('#joinServerButton').disabled = !state.clients.length || state.busy.has('join-server');
+  }
   if ($('#accountBadge')) $('#accountBadge').textContent = state.clients.length ? `${state.clients.length} connected` : 'No accounts';
   if ($('#navAccountCount')) $('#navAccountCount').textContent = String(state.clients.length);
   if ($('#connectionLabel')) $('#connectionLabel').textContent = state.clients.length ? `${state.clients.length} حساب متصل` : 'جاهز للاتصال';
   if (render) renderProfiles(state.clients);
   if (render && renderPlaying) { renderPlayingAccounts(); updatePlayingSelection(); }
+  renderMembershipAccounts();
   return previousAccount !== state.selectedAccount;
 }
 async function loadClients(preferred = '') {
@@ -346,6 +412,51 @@ async function loadClients(preferred = '') {
   await loadGuilds();
   await loadAutomationCatalog();
   state.dashboardInitialized = true;
+}
+async function joinDiscordServer(event) {
+  event.preventDefault();
+  if (state.busy.has('join-server')) return;
+  const account = String($('#joinServerAccount')?.value || '').trim();
+  const inviteUrl = String($('#joinServerInvite')?.value || '').trim();
+  if (!account || !state.clients.some((client) => client.name === account)) {
+    feedback('#joinServerFeedback', 'Connect and select one account first.', 'error');
+    return;
+  }
+  if (!inviteUrl) {
+    feedback('#joinServerFeedback', 'Enter a Discord invite link or code.', 'error');
+    return;
+  }
+  setBusy('join-server', true);
+  $('#joinServerAccount').disabled = true;
+  $('#joinServerInvite').disabled = true;
+  $('#joinServerButton')?.setAttribute('aria-busy', 'true');
+  feedback('#joinServerFeedback', `Processing ${account}…`);
+  try {
+    const result = await api('/api/ts/join-server', {
+      method: 'POST',
+      body: JSON.stringify({ account, inviteUrl }),
+    });
+    const guildName = result.guild?.name || 'the Discord server';
+    const status = result.alreadyJoined
+      ? `${account} is already a member of ${guildName}.`
+      : result.verified === true
+      ? `Success — ${account} joined ${guildName} and membership was confirmed.`
+      : `Request accepted — membership in ${guildName} is not confirmed yet. ${result.message || ''}`.trim();
+    feedback('#joinServerFeedback', status, result.verified === true ? 'success' : 'pending');
+    addActivity('Join Discord server', `${account} · ${guildName}${result.alreadyJoined ? ' · already a member' : result.verified ? ' · confirmed' : ' · unconfirmed'}`, result.verified ? 'success' : '', account);
+    toast(result.alreadyJoined ? 'Account is already a member' : result.verified ? 'Server join confirmed' : 'Join accepted; membership pending', result.verified ? 'success' : '');
+    $('#joinServerInvite').value = '';
+  } catch (error) {
+    const reason = String(error?.message || 'Unknown error').slice(0, 1200);
+    feedback('#joinServerFeedback', `Failed for ${account}: ${reason}`, 'error');
+    addActivity('Server join failed', `${account} · ${reason}`, 'error', account);
+    toast('Server join failed — see the detailed reason below', 'error');
+  } finally {
+    setBusy('join-server', false);
+    $('#joinServerAccount').disabled = !state.clients.length;
+    $('#joinServerInvite').disabled = false;
+    $('#joinServerButton')?.removeAttribute('aria-busy');
+  }
 }
 async function loadAutomationCatalog() {
   const guildSelect = $('#automationGuild');
@@ -1135,13 +1246,11 @@ function initLanguage() {
 function initNavigation() {
   document.querySelectorAll('[data-section]').forEach((button) => button.addEventListener('click', () => {
     const section = button.dataset.section;
+    if (section === 'resources') setTimeout(refreshResourceMetrics, 0);
     document.querySelectorAll('.side-nav-item').forEach((item) => item.classList.toggle('is-active', item === button));
     const breadcrumb = document.querySelector('.breadcrumb strong');
     if (breadcrumb) breadcrumb.textContent = section[0].toUpperCase() + section.slice(1);
-    document.querySelectorAll('[data-panel]').forEach((panel) => {
-      const panels = panel.dataset.panel.split(/\s+/);
-      panel.hidden = !panels.includes(section);
-    });
+    document.querySelectorAll('[data-panel]').forEach((panel) => { panel.hidden = !panel.dataset.panel.split(/\s+/).includes(section); });
     if (section.toLowerCase() === 'automation' && state.catalogDirty) loadAutomationCatalog();
     if (section.toLowerCase() === 'playing' && (!state.playingGuildsLoaded || state.catalogDirty)) loadPlayingChannels();
   }));
@@ -1155,12 +1264,50 @@ function initCustomSelects() {
     select.parentNode.insertBefore(wrapper, select); wrapper.appendChild(select); select.hidden = true;
     const trigger = document.createElement('button'); trigger.type = 'button'; trigger.className = 'custom-select-trigger'; trigger.setAttribute('aria-haspopup', 'listbox');
     const menu = document.createElement('div'); menu.className = 'custom-select-menu'; menu.setAttribute('role', 'listbox'); wrapper.append(trigger, menu);
-    const sync = () => { const selected = select.selectedOptions[0]; trigger.innerHTML = `<span>${escapeHTML(selected?.textContent || 'Select…')}</span><i>⌄</i>`; menu.innerHTML = [...select.options].map((option) => `<button type="button" role="option" data-value="${escapeHTML(option.value)}" ${option.disabled ? 'disabled' : ''} class="${option.value === select.value ? 'is-selected' : ''}">${escapeHTML(option.textContent)}</button>`).join(''); };
-    trigger.addEventListener('click', () => { document.querySelectorAll('.custom-select.is-open').forEach((item) => { if (item !== wrapper) item.classList.remove('is-open'); }); wrapper.classList.toggle('is-open'); });
-    menu.addEventListener('click', (event) => { const option = event.target.closest('[data-value]'); if (!option || option.disabled) return; select.value = option.dataset.value; select.dispatchEvent(new Event('change', { bubbles: true })); wrapper.classList.remove('is-open'); sync(); });
-    new MutationObserver(sync).observe(select, { childList: true, subtree: true }); select.addEventListener('change', sync); sync();
+    const sync = () => { const selected = select.selectedOptions[0]; trigger.disabled = select.disabled; trigger.setAttribute('aria-expanded', String(wrapper.classList.contains('is-open'))); trigger.innerHTML = `<span>${escapeHTML(selected?.textContent || 'Select…')}</span><i>⌄</i>`; menu.innerHTML = [...select.options].map((option) => `<button type="button" role="option" data-value="${escapeHTML(option.value)}" ${select.disabled || option.disabled ? 'disabled' : ''} class="${option.value === select.value ? 'is-selected' : ''}">${escapeHTML(option.textContent)}</button>`).join(''); };
+    trigger.addEventListener('click', () => { if (select.disabled) return; document.querySelectorAll('.custom-select.is-open').forEach((item) => { if (item !== wrapper) item.classList.remove('is-open'); }); wrapper.classList.toggle('is-open'); sync(); });
+    menu.addEventListener('click', (event) => { const option = event.target.closest('[data-value]'); if (!option || option.disabled || select.disabled) return; select.value = option.dataset.value; select.dispatchEvent(new Event('change', { bubbles: true })); wrapper.classList.remove('is-open'); sync(); });
+    new MutationObserver(sync).observe(select, { attributes: true, attributeFilter: ['disabled'], childList: true, subtree: true }); select.addEventListener('change', sync); sync();
   });
   document.addEventListener('click', (event) => { if (!event.target.closest('.custom-select')) document.querySelectorAll('.custom-select.is-open').forEach((item) => item.classList.remove('is-open')); });
+}
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes < 0) return '—';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let value = bytes, unit = 0;
+  while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++; }
+  return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+}
+async function refreshResourceMetrics() {
+  if (document.visibilityState !== 'visible' || !document.querySelector('[data-panel="resources"]') || document.querySelector('[data-panel="resources"]').hidden) return;
+  const status = $('#resourceLiveStatus');
+  try {
+    const response = await fetch('/api/resources', { credentials: 'include', cache: 'no-store', headers: { 'X-Voice-Studio': '1' } });
+    if (response.status === 401) { await requestAuthentication(); return refreshResourceMetrics(); }
+    const payload = await response.json();
+    if (!response.ok || payload.success === false) throw new Error(payload.error || 'Metrics unavailable');
+    const data = payload;
+    const percent = Math.max(0, Math.min(100, data.cpu.processPercent || 0));
+    $('#resourceCpuValue').textContent = `${percent.toFixed(1)}%`;
+    $('#resourceCpuBar').style.width = `${percent}%`;
+    $('#resourceCpuDetail').textContent = `Application process · ${data.cpu.cores} logical cores available`;
+    const memoryPct = data.memory.limitBytes ? Math.min(100, data.memory.rssBytes / data.memory.limitBytes * 100) : 0;
+    $('#resourceRamValue').textContent = `${formatBytes(data.memory.rssBytes)} / ${formatBytes(data.memory.limitBytes)}`;
+    $('#resourceRamBar').style.width = `${memoryPct}%`;
+    $('#resourceRamDetail').textContent = `RSS · heap ${formatBytes(data.memory.heapUsedBytes)} used of ${formatBytes(data.memory.heapTotalBytes)}`;
+    $('#resourceStorageValue').textContent = formatBytes(data.storage.dataDirectoryBytes);
+    const fs = data.storage.filesystem;
+    $('#resourceStorageBar').style.width = fs?.totalBytes ? `${Math.min(100, data.storage.dataDirectoryBytes / fs.totalBytes * 100)}%` : '0%';
+    $('#resourceStorageDetail').textContent = fs?.totalBytes ? `Application data directory · ${Math.min(100, data.storage.dataDirectoryBytes / fs.totalBytes * 100).toFixed(2)}% of container filesystem` : 'Application data directory size (not total deploy bundle)';
+    $('#resourceFilesystemDetail').textContent = fs ? `Container filesystem: ${formatBytes(fs.usedBytes)} used of ${formatBytes(fs.totalBytes)}` : 'Container filesystem capacity unavailable';
+    $('#resourceUpdatedAt').textContent = new Date(data.sampledAt).toLocaleTimeString();
+    $('#resourceBillingNote').textContent = data.billing.note;
+    status.textContent = 'Live · 2s';
+    status.classList.add('accent');
+  } catch (error) {
+    status.textContent = 'Temporarily unavailable';
+    status.classList.remove('accent');
+  }
 }
 function init() {
   initTheme(); initLanguage(); initNavigation(); initActivity(); initPlaying(); initCustomSelects();
@@ -1170,6 +1317,24 @@ function init() {
   $('#connectButton').addEventListener('click', connect); $('#bulkConnectButton').addEventListener('click', bulkConnect); $('#disconnectButton').addEventListener('click', openDisconnect); $('#accountSelect').addEventListener('change', async (event) => { state.selectedAccount = event.target.value; await loadGuilds(); if (state.catalogDirty) scheduleCatalogRefresh(); }); $('#automationGuild').addEventListener('change', renderAutomationChannels); $('#automationChannel').addEventListener('change', renderTargetAccounts); $('#rotationRoomFilter').addEventListener('input', (event) => { state.rotationRoomFilter = event.target.value; state.rotationRoomPage = 0; renderRotationRooms(); }); $('#rotationPrevButton').addEventListener('click', () => { state.rotationRoomPage -= 1; renderRotationRooms(); }); $('#rotationNextButton').addEventListener('click', () => { state.rotationRoomPage += 1; renderRotationRooms(); }); $('#bulkJoinButton').addEventListener('click', bulkJoinSelected); $('#channelSelect').addEventListener('change', handleChannelChange); $('#joinButton').addEventListener('click', join); $('#joinAllButton').addEventListener('click', joinAll); $('#leaveButton').addEventListener('click', leave); $('#cameraButton')?.addEventListener('click', toggleCamera); $('#screenButton')?.addEventListener('click', toggleScreen); $('#startRotationButton').addEventListener('click', startRotation); $('#startCycleButton').addEventListener('click', startCycle); $('#stopMediaButton')?.addEventListener('click', () => stopCurrentStream()); $('#applyBulkStateButton')?.addEventListener('click', applyBulkState); $('#overviewFilter')?.addEventListener('input', (event) => { state.overviewFilter = event.target.value; renderSessions(); }); $('#overviewSort')?.addEventListener('change', (event) => { state.overviewSort = event.target.value; renderSessions(); }); document.querySelectorAll('.state-button').forEach((button) => button.addEventListener('click', () => applyState(button.dataset.state))); document.querySelectorAll('#statePicker input').forEach((input) => input.addEventListener('change', () => input.closest('.state-option')?.classList.toggle('is-selected', input.checked)));
   $('#operationClose').addEventListener('click', () => { $('#operationModal').hidden = true; $('.operation-loader')?.classList.remove('is-done', 'is-error'); }); $('#leaveAllButton')?.addEventListener('click', openLeaveAll); $('#confirmLeaveButton')?.addEventListener('click', leaveAllSelected); $('#cancelLeaveButton')?.addEventListener('click', () => { $('#leaveModal').hidden = true; }); $('#confirmDisconnectButton')?.addEventListener('click', disconnectSelected); $('#cancelDisconnectButton')?.addEventListener('click', () => { $('#disconnectModal').hidden = true; }); $('#disconnectModalClose')?.addEventListener('click', () => { $('#disconnectModal').hidden = true; }); window.addEventListener('beforeunload', () => stopCurrentStream({ updateDiscord: false }));
   document.addEventListener('change', (event) => { if (event.target.closest('#automationAccounts')) updateQuickStateButtons(); });
-  loadTasks(); loadPlayingSessions(); connectLiveEvents(); if (!window.EventSource) refreshSessions(); state.taskCountdownTimer = setInterval(refreshTaskCountdowns, 1000); setInterval(() => { if (document.visibilityState !== 'visible') return; refreshSessions(); if (!state.liveEvents) { loadTasks(); loadPlayingSessions(); } }, 120000); document.addEventListener('visibilitychange', () => { if (document.visibilityState !== 'visible') return; if (!state.liveEvents) connectLiveEvents(); scheduleLiveRefresh(); if (state.catalogDirty) scheduleCatalogRefresh(); if (!state.liveEvents) { loadTasks(); loadPlayingSessions(); } });
+  loadTasks();
+  loadPlayingSessions();
+  connectLiveEvents();
+  if (!window.EventSource) refreshSessions();
+  state.taskCountdownTimer = setInterval(refreshTaskCountdowns, 1000);
+  refreshResourceMetrics();
+  setInterval(refreshResourceMetrics, 2000);
+  setInterval(() => { if (document.visibilityState !== 'visible') return; refreshSessions(); if (!state.liveEvents) { loadTasks(); loadPlayingSessions(); } }, 120000);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') return;
+    if (!state.liveEvents) connectLiveEvents();
+    scheduleLiveRefresh();
+    if (state.catalogDirty) scheduleCatalogRefresh();
+    if (!state.liveEvents) { loadTasks(); loadPlayingSessions(); }
+  });
 }
 init();
+$('#joinServerForm')?.addEventListener('submit', joinDiscordServer);
+$('#checkMembershipButton')?.addEventListener('click', checkServerMembership);
+$('#selectAllMembershipAccounts')?.addEventListener('click', () => { document.querySelectorAll('#membershipAccountList input[type="checkbox"]').forEach((input) => { input.checked = true; }); updateMembershipControls(); });
+$('#clearMembershipAccounts')?.addEventListener('click', () => { document.querySelectorAll('#membershipAccountList input[type="checkbox"]').forEach((input) => { input.checked = false; }); updateMembershipControls(); });
