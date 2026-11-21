@@ -920,8 +920,9 @@ function openTaskDetails(taskId) {
     const voice = client?.voice;
     const result = (task.lastResults || []).find((item) => item.name === name);
     const liveState = voice ? taskStateLabel(voice) : 'ليس داخل روم';
-    const detail = task.type === 'rotation' ? `${voice?.channelName || voice?.channelId || 'لا يوجد روم'} · الحالة: ${liveState}` : `الحالة الحالية: ${liveState} · الهدف: ${taskStateLabel(cycleState)}`;
-    return `<div class="task-detail-account"><div class="task-detail-account-main"><span class="task-detail-avatar">${escapeHTML((name || '?')[0])}</span><div><strong>${escapeHTML(client?.nickname || client?.displayName || client?.username || name)}</strong><small>${escapeHTML(name)}</small></div></div><div class="task-detail-account-state"><span>${escapeHTML(detail)}</span><small class="${result?.ok === false ? 'is-error' : 'is-ok'}">${result?.ok === false ? escapeHTML(result.error || 'فشل آخر تنفيذ') : 'آخر تنفيذ ناجح أو قيد المتابعة'}</small></div></div>`;
+    const paused = (task.pausedAccounts || []).includes(name);
+    const detail = task.type === 'rotation' ? `${paused ? 'التدوير متوقف مؤقتًا · ' : ''}${voice?.channelName || voice?.channelId || 'لا يوجد روم'} · الحالة: ${liveState}` : `${paused ? 'تدوير الحالات متوقف مؤقتًا · ' : ''}الحالة الحالية: ${liveState} · الهدف: ${taskStateLabel(cycleState)}`;
+    return `<div class="task-detail-account"><div class="task-detail-account-main"><span class="task-detail-avatar">${escapeHTML((name || '?')[0])}</span><div><strong>${escapeHTML(client?.nickname || client?.displayName || client?.username || name)}</strong><small>${escapeHTML(name)}</small></div></div><div class="task-detail-account-state"><span>${escapeHTML(detail)}</span><small class="${paused ? '' : result?.ok === false ? 'is-error' : 'is-ok'}">${paused ? 'متوقف بأمر Discord' : result?.ok === false ? escapeHTML(result.error || 'فشل آخر تنفيذ') : 'آخر تنفيذ ناجح أو قيد المتابعة'}</small></div></div>`;
   }).join('') || '<div class="task-empty">لا توجد حسابات في هذه المهمة</div>';
   modal.hidden = false;
 }
@@ -1207,6 +1208,7 @@ function connectLiveEvents() {
         return;
       }
       if (event.type === 'resync.required') { scheduleLiveRefresh(); return; }
+      if (event.type === 'task.started' || event.type === 'task.initialized' || event.type === 'task.stopped') loadTasks();
       if (event.type === 'account.connected') {
         applyRealtimeClient(event.client, event.account);
         scheduleCatalogRefresh();
@@ -1237,6 +1239,11 @@ function connectLiveEvents() {
         if (task && event.result) {
           task.accountStatus = { ...(task.accountStatus || {}), [event.result.name]: event.result };
           task.lastResults = [...(task.lastResults || []).filter((item) => item.name !== event.result.name), event.result];
+          if (event.result.paused !== undefined) {
+            const paused = new Set(task.pausedAccounts || []);
+            if (event.result.paused) paused.add(event.result.name); else paused.delete(event.result.name);
+            task.pausedAccounts = [...paused];
+          }
           task.nextAt = event.nextAt || task.nextAt;
           task.currentIdx = event.currentIdx ?? task.currentIdx;
           renderTasks(state.tasks);

@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
-const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, recordSuccessfulCycleState, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, registerAccountStreamer, mediaStreamers, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, schedulePlaying, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, cleanAccountRecords, buildAccountSnapshot, safeErrorSummary, guardVoiceWebSocketTeardown, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, isCaptchaChallengeError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanupPrimaryStreamAttempt, isRecoverableDiscordInteractionError } = require('../server');
+const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, recordSuccessfulCycleState, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, registerAccountStreamer, mediaStreamers, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, schedulePlaying, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, cleanAccountRecords, buildAccountSnapshot, safeErrorSummary, guardVoiceWebSocketTeardown, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, isCaptchaChallengeError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanupPrimaryStreamAttempt, isRecoverableDiscordInteractionError, parseRotationChannelIds, removeAccountFromAutomationTasks } = require('../server');
 const VoiceWebSocket = require('discord.js-selfbot-v13/src/client/voice/networking/VoiceWebSocket');
 
 test('captures delayed errors from a WebSocket after voice teardown without suppressing live errors', () => {
@@ -545,6 +545,71 @@ test('filters accounts already owned by another live task', () => {
   }
 });
 
+test('parses rot room IDs separated by spaces, commas, Arabic commas, pipes, or Discord channel mentions', () => {
+  const ids = ['123456789012345678', '234567890123456789', '345678901234567890'];
+  assert.deepEqual(parseRotationChannelIds(`${ids[0]} ${ids[1]}, <#${ids[2]}>`), { ok: true, ids });
+  assert.deepEqual(parseRotationChannelIds(`${ids[0]}،${ids[1]}|${ids[2]}`), { ok: true, ids });
+  assert.equal(parseRotationChannelIds(`${ids[0]} ${ids[0]}`).ok, false);
+  assert.equal(parseRotationChannelIds(`${ids[0]} nope ${ids[1]}`).ok, false);
+});
+
+test('automation task conflicts are global by task type, not limited to the selected guild', () => {
+  const taskId = 'global-conflict-rotation';
+  rotations.set(taskId, { id: taskId, type: 'rotation', active: true, guildId: 'guild-old', accounts: ['rot-global-account'] });
+  try {
+    assert.deepEqual(taskConflict(['rot-global-account'], 'guild-new', 'rotation'), [{ id: taskId, accounts: ['rot-global-account'] }]);
+    assert.deepEqual(taskConflict(['rot-global-account'], 'guild-new', 'cycle'), []);
+  } finally {
+    rotations.delete(taskId);
+  }
+});
+
+test('removing an account from old automation tasks preserves peers and deletes emptied task timers', () => {
+  const rotationId = 'remove-old-rotation';
+  const cycleId = 'remove-old-cycle';
+  const rotationTimer = setInterval(() => {}, 60_000);
+  const cycleTimer = setTimeout(() => {}, 60_000);
+  const rotation = { id: rotationId, active: true, guildId: 'guild-old', accounts: ['rot-replaced', 'rot-peer'], pausedAccounts: ['rot-replaced'], accountTargets: { 'rot-replaced': 'room-old', 'rot-peer': 'room-peer' }, accountStatus: { 'rot-replaced': { ok: false }, 'rot-peer': { ok: true } }, timer: rotationTimer };
+  const cycle = { id: cycleId, active: true, guildId: 'guild-old', accounts: ['rot-replaced'], pausedAccounts: [], accountStateIdx: { 'rot-replaced': 2 }, stateHistory: { 'rot-replaced': [0, 2] }, timer: cycleTimer };
+  rotations.set(rotationId, rotation);
+  stateCycles.set(cycleId, cycle);
+  try {
+    assert.equal(removeAccountFromAutomationTasks('rot-replaced'), true);
+    assert.deepEqual(rotation.accounts, ['rot-peer']);
+    assert.deepEqual(rotation.pausedAccounts, []);
+    assert.deepEqual(rotation.accountTargets, { 'rot-peer': 'room-peer' });
+    assert.equal(rotation.accountStatus['rot-replaced'], undefined);
+    assert.equal(rotations.has(rotationId), true);
+    assert.equal(stateCycles.has(cycleId), false);
+    assert.equal(removeAccountFromAutomationTasks('rot-replaced'), false);
+  } finally {
+    clearInterval(rotationTimer);
+    clearTimeout(cycleTimer);
+    rotations.delete(rotationId);
+    stateCycles.delete(cycleId);
+  }
+});
+
+test('same-kind replacement preserves a paused task of the other automation kind', () => {
+  const rotationId = 'same-kind-replace-room';
+  const cycleId = 'same-kind-replace-cycle';
+  const rotation = { id: rotationId, active: true, guildId: 'guild-a', accounts: ['replace-one', 'room-peer'], pausedAccounts: ['replace-one'], accountTargets: { 'replace-one': 'room-a' } };
+  const cycle = { id: cycleId, active: true, guildId: 'guild-a', accounts: ['replace-one'], pausedAccounts: ['replace-one'], stateHistory: { 'replace-one': [0, 1] }, accountStateIdx: { 'replace-one': 1 } };
+  rotations.set(rotationId, rotation);
+  stateCycles.set(cycleId, cycle);
+  try {
+    assert.equal(removeAccountFromAutomationTasks('replace-one', ['rotation']), true);
+    assert.deepEqual(rotation.accounts, ['room-peer']);
+    assert.deepEqual(rotation.pausedAccounts, []);
+    assert.deepEqual(cycle.accounts, ['replace-one']);
+    assert.deepEqual(cycle.pausedAccounts, ['replace-one']);
+    assert.deepEqual(cycle.stateHistory['replace-one'], [0, 1]);
+  } finally {
+    rotations.delete(rotationId);
+    stateCycles.delete(cycleId);
+  }
+});
+
 test('continues Playing when the optional follow-up message cannot be sent', async () => {
   const account = 'playing-message-failure';
   const message = {
@@ -814,6 +879,128 @@ test('Discord start and stop commands control every Playing session with one rea
   }
 });
 
+test('Discord on/off commands control only the rotation of the connected account that wrote them', async () => {
+  const previousOwners = process.env.DISCORD_COMMAND_OWNERS;
+  const previousChannel = process.env.DISCORD_COMMAND_CHANNEL_ID;
+  const previousPrefix = process.env.DISCORD_COMMAND_PREFIX;
+  const savedClients = [...clients.entries()];
+  const taskId = 'discord-rotation-pause-resume';
+  const accountA = 'rotation account a';
+  const accountB = 'rotation account b';
+  const clientA = { user: { id: 'discord-account-a' } };
+  const clientB = { user: { id: 'discord-account-b' } };
+  const task = { id: taskId, type: 'rotation', active: true, running: true, guildId: 'guild-x', channels: ['room-1', 'room-2'], accounts: [accountA, accountB], pausedAccounts: [], accountTargets: { [accountA]: 'room-1', [accountB]: 'room-2' }, accountStatus: {}, lastResults: [] };
+  const cycleId = 'discord-state-cycle-pause-resume';
+  const cycle = { id: cycleId, type: 'cycle', active: true, running: true, guildId: 'guild-x', accounts: [accountA], pausedAccounts: [], states: [{ selfMute: true }, { selfMute: false }], accountStateIdx: { [accountA]: 1 }, stateHistory: { [accountA]: [0, 1] } };
+  process.env.DISCORD_COMMAND_OWNERS = '';
+  process.env.DISCORD_COMMAND_CHANNEL_ID = 'commands';
+  process.env.DISCORD_COMMAND_PREFIX = '!';
+  clients.set(accountA, { client: clientA });
+  clients.set(accountB, { client: clientB });
+  rotations.set(taskId, task);
+  stateCycles.set(cycleId, cycle);
+  const reacted = [];
+  const invoke = (listener, id, content, authorId) => handlePlayingDiscordCommand(listener, { id, content, channel: { id: 'commands' }, author: { id: authorId }, react: async (emoji) => reacted.push(emoji) });
+  try {
+    // Another connected account hearing the same message cannot control account A.
+    assert.equal(await invoke(clientB, 'rotation-wrong-account', '!off', 'discord-account-a'), false);
+    assert.deepEqual(task.pausedAccounts, []);
+    assert.equal(await invoke(clientA, 'rotation-off', '!off', 'discord-account-a'), true);
+    assert.deepEqual(task.pausedAccounts, [accountA]);
+    assert.deepEqual(cycle.pausedAccounts, [accountA]);
+    assert.equal(isAccountManagedByActiveStateCycle(accountA, 'guild-x'), false);
+    assert.deepEqual(task.accounts, [accountA, accountB]);
+    assert.equal(task.accountTargets[accountA], 'room-1');
+    assert.equal(await invoke(clientA, 'rotation-on', '!on', 'discord-account-a'), true);
+    assert.deepEqual(task.pausedAccounts, []);
+    assert.deepEqual(cycle.pausedAccounts, []);
+    assert.equal(isAccountManagedByActiveStateCycle(accountA, 'guild-x'), true);
+    assert.deepEqual(cycle.accountStateIdx, { [accountA]: 1 });
+    assert.deepEqual(cycle.stateHistory, { [accountA]: [0, 1] });
+    assert.deepEqual(task.accounts, [accountA, accountB]);
+    assert.deepEqual(reacted, ['✅', '✅']);
+  } finally {
+    rotations.delete(taskId);
+    stateCycles.delete(cycleId);
+    clients.delete(accountA); clients.delete(accountB);
+    for (const [name, entry] of savedClients) clients.set(name, entry);
+    if (previousOwners === undefined) delete process.env.DISCORD_COMMAND_OWNERS; else process.env.DISCORD_COMMAND_OWNERS = previousOwners;
+    if (previousChannel === undefined) delete process.env.DISCORD_COMMAND_CHANNEL_ID; else process.env.DISCORD_COMMAND_CHANNEL_ID = previousChannel;
+    if (previousPrefix === undefined) delete process.env.DISCORD_COMMAND_PREFIX; else process.env.DISCORD_COMMAND_PREFIX = previousPrefix;
+  }
+});
+
+test('Discord rotation on/off rejects accounts without exactly one active rotation and honors channel restriction', async () => {
+  const previousOwners = process.env.DISCORD_COMMAND_OWNERS;
+  const previousChannel = process.env.DISCORD_COMMAND_CHANNEL_ID;
+  const previousPrefix = process.env.DISCORD_COMMAND_PREFIX;
+  const savedClients = [...clients.entries()];
+  const account = 'rotation-cmd-account';
+  const accountClient = { user: { id: 'rotation-self-id' } };
+  const firstId = 'discord-rotation-task-a';
+  const secondId = 'discord-rotation-task-b';
+  const first = { id: firstId, active: true, guildId: 'guild-x', accounts: [account], pausedAccounts: [] };
+  const second = { id: secondId, active: true, guildId: 'guild-y', accounts: [account], pausedAccounts: [] };
+  process.env.DISCORD_COMMAND_OWNERS = '';
+  process.env.DISCORD_COMMAND_CHANNEL_ID = 'commands';
+  process.env.DISCORD_COMMAND_PREFIX = '!';
+  clients.set(account, { client: accountClient });
+  const reacted = [];
+  const invoke = (id, content, channelId = 'commands') => handlePlayingDiscordCommand(accountClient, { id, content, channel: { id: channelId }, author: { id: 'rotation-self-id' }, react: async (emoji) => reacted.push(emoji) });
+  try {
+    assert.equal(await invoke('discord-rotation-no-task', '!off'), true);
+    assert.deepEqual(reacted, []);
+    rotations.set(firstId, first);
+    rotations.set(secondId, second);
+    assert.equal(await invoke('discord-rotation-ambiguous', '!off'), true);
+    assert.equal(await invoke('discord-rotation-wrong-channel', '!off', 'other-channel'), false);
+    assert.deepEqual(first.pausedAccounts, []);
+    assert.deepEqual(second.pausedAccounts, []);
+    assert.deepEqual(reacted, []);
+  } finally {
+    rotations.delete(firstId); rotations.delete(secondId);
+    clients.delete(account);
+    for (const [name, entry] of savedClients) clients.set(name, entry);
+    if (previousOwners === undefined) delete process.env.DISCORD_COMMAND_OWNERS; else process.env.DISCORD_COMMAND_OWNERS = previousOwners;
+    if (previousChannel === undefined) delete process.env.DISCORD_COMMAND_CHANNEL_ID; else process.env.DISCORD_COMMAND_CHANNEL_ID = previousChannel;
+    if (previousPrefix === undefined) delete process.env.DISCORD_COMMAND_PREFIX; else process.env.DISCORD_COMMAND_PREFIX = previousPrefix;
+  }
+});
+
+test('Discord on is idempotent for an already-running rotation and state cycle', async () => {
+  const previousOwners = process.env.DISCORD_COMMAND_OWNERS;
+  const previousChannel = process.env.DISCORD_COMMAND_CHANNEL_ID;
+  const previousPrefix = process.env.DISCORD_COMMAND_PREFIX;
+  const savedClients = [...clients.entries()];
+  const account = 'rotation-already-on';
+  const client = { user: { id: 'rotation-already-on-user' } };
+  const rotationId = 'rotation-already-on-task';
+  const cycleId = 'cycle-already-on-task';
+  const rotation = { id: rotationId, active: true, running: false, guildId: 'guild-x', channels: [], accounts: [account], pausedAccounts: [] };
+  const cycle = { id: cycleId, active: true, running: false, guildId: 'guild-x', states: [{ selfMute: false }, { selfMute: true }], accounts: [account], pausedAccounts: [] };
+  process.env.DISCORD_COMMAND_OWNERS = '';
+  process.env.DISCORD_COMMAND_CHANNEL_ID = '';
+  process.env.DISCORD_COMMAND_PREFIX = '!';
+  clients.set(account, { client });
+  rotations.set(rotationId, rotation);
+  stateCycles.set(cycleId, cycle);
+  const reacted = [];
+  try {
+    assert.equal(await handlePlayingDiscordCommand(client, { id: 'rotation-already-on-command', content: '!on', author: { id: client.user.id }, channel: {}, react: async (emoji) => reacted.push(emoji) }), true);
+    assert.deepEqual(rotation.pausedAccounts, []);
+    assert.deepEqual(cycle.pausedAccounts, []);
+    assert.deepEqual(reacted, ['✅']);
+  } finally {
+    rotations.delete(rotationId);
+    stateCycles.delete(cycleId);
+    clients.delete(account);
+    for (const [name, entry] of savedClients) clients.set(name, entry);
+    if (previousOwners === undefined) delete process.env.DISCORD_COMMAND_OWNERS; else process.env.DISCORD_COMMAND_OWNERS = previousOwners;
+    if (previousChannel === undefined) delete process.env.DISCORD_COMMAND_CHANNEL_ID; else process.env.DISCORD_COMMAND_CHANNEL_ID = previousChannel;
+    if (previousPrefix === undefined) delete process.env.DISCORD_COMMAND_PREFIX; else process.env.DISCORD_COMMAND_PREFIX = previousPrefix;
+  }
+});
+
 test('random room rotation assigns independent targets and avoids current rooms when possible', () => {
   const originalRandom = Math.random;
   Math.random = () => 0;
@@ -967,5 +1154,52 @@ test('reserves account slots up to the configured 30-account limit without concu
     releaseAccountConnectSlots(100);
     clients.clear();
     for (const [name, entry] of previous) clients.set(name, entry);
+  }
+});
+test('Discord rot is self-authenticated and validates the current server voice rooms before reacting', async () => {
+  const previousChannel = process.env.DISCORD_COMMAND_CHANNEL_ID;
+  const previousPrefix = process.env.DISCORD_COMMAND_PREFIX;
+  const savedClients = [...clients.entries()];
+  const account = 'rot-validation-account';
+  const client = { user: { id: 'rot-validation-self' }, guilds: { cache: new Map() } };
+  const validVoice = { id: '123456789012345678', type: 2, permissionsFor: () => ({ has: () => true }), members: { size: 0 } };
+  const textRoom = { id: '234567890123456789', type: 0 };
+  const guild = { id: 'guild-rot-validation', name: 'Test guild', channels: { cache: new Map([[validVoice.id, validVoice], [textRoom.id, textRoom]]) }, members: { me: {} }, voiceStates: { cache: new Map() } };
+  client.guilds.cache.set(guild.id, guild);
+  clients.set(account, { client });
+  process.env.DISCORD_COMMAND_CHANNEL_ID = '';
+  process.env.DISCORD_COMMAND_PREFIX = '!';
+  const reacted = [];
+  const invoke = (id, authorId, guildArg, content = '!rot 123456789012345678 234567890123456789') => handlePlayingDiscordCommand(client, {
+    id, content, guild: guildArg, channel: { id: 'rot-validation-channel', guild: guildArg }, author: { id: authorId },
+    react: async (emoji) => reacted.push(emoji),
+  });
+  try {
+    assert.equal(await invoke('rot-validation-not-self', 'someone-else', guild), false);
+    assert.equal(await invoke('rot-validation-text-room', client.user.id, guild), true);
+    assert.equal(await invoke('rot-validation-no-guild', client.user.id, null, '!rot 123456789012345678 345678901234567890'), true);
+    assert.deepEqual(reacted, []);
+    assert.equal([...rotations.values()].some((task) => (task.accounts || []).includes(account)), false);
+    assert.equal([...stateCycles.values()].some((task) => (task.accounts || []).includes(account)), false);
+  } finally {
+    clients.delete(account);
+    for (const [name, entry] of savedClients) clients.set(name, entry);
+    if (previousChannel === undefined) delete process.env.DISCORD_COMMAND_CHANNEL_ID; else process.env.DISCORD_COMMAND_CHANNEL_ID = previousChannel;
+    if (previousPrefix === undefined) delete process.env.DISCORD_COMMAND_PREFIX; else process.env.DISCORD_COMMAND_PREFIX = previousPrefix;
+  }
+});
+test('scoped automation cleanup cannot remove a newer replacement task', () => {
+  const oldId = 'stale-rot-setup';
+  const newId = 'newer-rot-setup';
+  rotations.set(oldId, { id: oldId, active: true, accounts: ['rot-race-account'], pausedAccounts: [] });
+  rotations.set(newId, { id: newId, active: true, accounts: ['rot-race-account'], pausedAccounts: [] });
+  try {
+    assert.equal(removeAccountFromAutomationTasks('rot-race-account', ['rotation'], [oldId]), true);
+    assert.equal(rotations.has(oldId), false);
+    assert.equal(rotations.has(newId), true);
+    assert.deepEqual(rotations.get(newId).accounts, ['rot-race-account']);
+  } finally {
+    rotations.delete(oldId);
+    rotations.delete(newId);
   }
 });

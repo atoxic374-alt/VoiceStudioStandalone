@@ -748,7 +748,8 @@ async function executeQuickVoiceControlForAccount(name, guildId, requestedState,
   }
 }
 async function executeStateForAccount(name, task, requestedState, expectedRunToken = null) {
-  const taskIsCurrent = () => task.active !== false && (expectedRunToken == null || task.runToken === expectedRunToken);
+  const taskIsCurrent = () => task.active !== false && !(task.pausedAccounts || []).includes(name)
+    && (expectedRunToken == null || task.runToken === expectedRunToken);
   const exactState = Object.fromEntries(['selfMute', 'selfDeaf', 'selfVideo', 'selfStream'].map((key) => [key, requestedState?.[key] === true]));
   return executeQuickVoiceControlForAccount(name, task.guildId, exactState, { isCurrent: taskIsCurrent, operationType: 'cycle' });
 }
@@ -783,7 +784,7 @@ async function restoreStateCycleAccount(name, task, expectedRunToken = task?.run
   const connection = client?.voice?.connection;
   if (!connection || String(voiceConnectionChannelId(connection) || '') !== String(session.channelId)
       || (connection.status != null && connection.status !== 0)) {
-    const joined = await moveAccount(name, task.guildId, session.channelId, normalizeVoiceState(session));
+    const joined = await moveAccount(name, task.guildId, session.channelId, { ...normalizeVoiceState(session), operationType: 'cycle' });
     if (!joined.ok) return { name, ok: false, error: `Unable to restore saved voice room: ${joined.error || 'voice reconnect failed'}` };
     session = voiceSessions.get(sessionKey(name, task.guildId)) || session;
   }
@@ -1113,9 +1114,201 @@ function playingCommandText(message) {
 const handledPlayingCommands = new Set();
 const channelMismatchLogs = new Map();
 const ownerMismatchLogs = new Map();
+function rotationTasksForAccount(name) {
+  return [...rotations.values()].filter((task) => task.active !== false && (task.accounts || []).includes(name));
+}
+function rotationAccountPaused(task, name) {
+  return (task.pausedAccounts || []).includes(name);
+}
+function setRotationAccountPaused(task, name, paused) {
+  if (!task || task.active === false || !(task.accounts || []).includes(name)) return { ok: false, error: 'No active automation task contains this account' };
+  const current = new Set(task.pausedAccounts || []);
+  if (paused) {
+    current.add(name);
+    const operation = accountOperations.get(operationKey(name));
+    const expectedKind = (task.type === 'cycle' || task.states) ? 'cycle' : 'rotation';
+    if (operation && operation.kind === expectedKind && String(operation.guildId) === String(task.guildId)) {
+      const invalidation = beginAccountOperation(name, task.guildId, 'automation-paused');
+      endAccountOperation(invalidation);
+    }
+  } else current.delete(name);
+  task.pausedAccounts = [...current].filter((account) => (task.accounts || []).includes(account));
+  const previous = task.accountStatus?.[name] || { name, ok: true, channelId: task.accountTargets?.[name] || null, attemptedChannels: [], retries: 0 };
+  const status = { ...previous, name, paused: !!paused, at: Date.now() };
+  task.accountStatus = { ...(task.accountStatus || {}), [name]: status };
+  emitLive('task.account.updated', { id: task.id, taskType: task.type || (task.channels ? 'rotation' : 'cycle'), result: status, nextAt: task.nextAt, currentIdx: task.currentIdx, active: task.active !== false });
+  persistAutomationTasks();
+  return { ok: true, paused: !!paused, taskId: task.id, account: name };
+}
+async function resumeRotationAccount(task, name) {
+  const result = setRotationAccountPaused(task, name, false);
+  if (!result.ok || task.running || task.initializing) return result;
+  // Re-enter the rotation immediately when idle; if a tick is already running,
+  // the account rejoins its normal rotation on the next tick instead.
+  task.running = true;
+  try {
+    const current = voiceSessions.get(sessionKey(name, task.guildId));
+    const preferred = rotationPreferredChannel(name, task, 0);
+    const moved = recordTaskResult(task, await moveRotationAccount(name, task, preferred, normalizeVoiceState(current || {})));
+    task.lastResults = [...(task.lastResults || []).filter((item) => item.name !== name), moved];
+    task.nextAt = Date.now() + task.intervalMs;
+    result.move = moved;
+  } finally {
+    task.running = false;
+    persistAutomationTasks();
+  }
+  return result;
+}
+function parseRotationChannelIds(value) {
+  const normalized = String(value || '').trim().replace(/<#(\d{15,25})>/g, '$1');
+  if (!normalized || /[^\d\s,;\u060c|]+/.test(normalized)) return { ok: false, error: 'اكتب معرفي روم صوتي على الأقل، وافصل بينها بمسافات أو فواصل' };
+  const rawIds = normalized.split(/[\s,;\u060c|]+/).filter(Boolean);
+  if (rawIds.some((id) => !/^\d{15,25}$/.test(id))) return { ok: false, error: 'أحد معرفات الرومات غير صالح' };
+  const ids = [...new Set(rawIds)];
+  if (ids.length < 2) return { ok: false, error: 'يلزم معرفا روم صوتي مختلفان على الأقل' };
+  return { ok: true, ids };
+}
+async function startDiscordAccountRotation(client, message, account, rawIds) {
+  const parsed = parseRotationChannelIds(rawIds);
+  if (!parsed.ok) return parsed;
+  const guildId = String(message.guild?.id || message.channel?.guild?.id || '');
+  if (!guildId) return { ok: false, error: 'أرسل الأمر داخل السيرفر الذي يحتوي الرومات' };
+  const guild = client?.guilds?.cache?.get?.(guildId);
+  if (!guild) return { ok: false, error: 'الحساب الذي أرسل الأمر غير موجود في هذا السيرفر' };
+  for (const channelId of parsed.ids) {
+    const target = validateTarget(client, guildId, channelId);
+    if (!target.ok) return { ok: false, error: `الروم ${channelId}: ${target.error}` };
+  }
+  const rooms = parsed.ids;
+  // Each account owns at most one room task and one state task globally. Remove
+  // stale memberships first so command repetition cannot accumulate timers.
+  removeAccountFromAutomationTasks(account);
+  const now = Date.now();
+  const rotation = {
+    id: crypto.randomUUID(), type: 'rotation', accounts: [account], guildId,
+    guildName: guild.name || guildId, channels: rooms, intervalMs: 15 * 60 * 1000,
+    randomOrder: false, currentIdx: 0, startedAt: now, nextAt: now + 15 * 60 * 1000,
+    accountStatus: {}, accountTargets: {}, pausedAccounts: [], running: true,
+    active: true, initializing: true, lastResults: [],
+  };
+  const states = [
+    { selfMute: false, selfDeaf: false, selfVideo: false, selfStream: false },
+    { selfMute: true, selfDeaf: false, selfVideo: false, selfStream: false },
+    { selfMute: false, selfDeaf: false, selfVideo: true, selfStream: false },
+    { selfMute: false, selfDeaf: false, selfVideo: false, selfStream: true },
+  ];
+  const cycle = {
+    id: crypto.randomUUID(), type: 'cycle', accounts: [account], guildId, states,
+    intervalMs: 10 * 60 * 1000, currentIdx: 0, accountStateIdx: {}, stateHistory: {},
+    pausedAccounts: [], runToken: 0, startedAt: now, nextAt: now + 10 * 60 * 1000,
+    accountStatus: {}, running: true, active: true, lastResults: [],
+  };
+  const isCurrentSetup = () => rotations.get(rotation.id) === rotation && stateCycles.get(cycle.id) === cycle;
+  rotations.set(rotation.id, rotation);
+  stateCycles.set(cycle.id, cycle);
+  persistAutomationTasks();
+  emitLive('task.started', { id: rotation.id, taskType: 'rotation', accounts: [account], guildId, channels: rooms });
+  emitLive('task.started', { id: cycle.id, taskType: 'cycle', accounts: [account], guildId });
+  try {
+    const current = voiceSessions.get(sessionKey(account, guildId));
+    const preferred = rotationPreferredChannel(account, rotation, 0);
+    const roomResult = await moveRotationAccount(account, rotation, preferred, normalizeVoiceState(current || {}));
+    if (!isCurrentSetup()) return { ok: false, error: 'تم استبدال هذه المهمة بأمر rot أحدث' };
+    if (!roomResult.ok || roomResult.skipped) throw new Error(roomResult.error || 'تعذر دخول أول روم في التدوير');
+    recordTaskResult(rotation, roomResult);
+    rotation.lastResults = [roomResult];
+    rotation.initializing = false;
+    rotation.running = false;
+    rotation.nextAt = Date.now() + rotation.intervalMs;
+
+    // nextStateIndex randomizes the initial state and each subsequent state,
+    // avoiding repeats until every configured state has been used once.
+    const initialStateIndex = nextStateIndex(states, []);
+    const stateResult = await withResultRetry(() => withAccountLock(account, () => executeStateForAccount(account, cycle, states[initialStateIndex], cycle.runToken)));
+    if (!isCurrentSetup()) return { ok: false, error: 'تم استبدال هذه المهمة بأمر rot أحدث' };
+    if (!stateResult.ok) throw new Error(stateResult.error || 'تعذر تطبيق أول حالة صوتية');
+    recordSuccessfulCycleState(cycle, account, initialStateIndex, true);
+    cycle.currentIdx = initialStateIndex;
+    recordTaskResult(cycle, stateResult);
+    cycle.lastResults = [stateResult];
+    cycle.running = false;
+    cycle.nextAt = Date.now() + cycle.intervalMs;
+
+    rotation.timer = setInterval(async () => {
+      if (!rotation.active || rotation.running || rotationAccountPaused(rotation, account)) return;
+      rotation.running = true;
+      rotation.currentIdx = (rotation.currentIdx + 1) % rotation.channels.length;
+      rotation.nextAt = Date.now() + rotation.intervalMs;
+      try {
+        const latest = voiceSessions.get(sessionKey(account, guildId));
+        const target = rotationPreferredChannel(account, rotation, 0);
+        const result = recordTaskResult(rotation, await moveRotationAccount(account, rotation, target, normalizeVoiceState(latest || {})));
+        rotation.lastResults = [result];
+        persistAutomationTasks();
+        emitLive('task.completed', { id: rotation.id, taskType: 'rotation', nextAt: rotation.nextAt, currentIdx: rotation.currentIdx, results: rotation.lastResults });
+      } catch (error) {
+        const result = { name: account, ok: false, error: error?.message || String(error) };
+        rotation.lastResults = [recordTaskResult(rotation, result)];
+      } finally {
+        rotation.running = false;
+      }
+    }, rotation.intervalMs);
+    rotation.timer.unref?.();
+
+    const runCycle = async () => {
+      if (!cycle.active) return;
+      if (rotationAccountPaused(cycle, account)) {
+        cycle.nextAt = Date.now() + cycle.intervalMs;
+        persistAutomationTasks();
+        cycle.timer = setTimeout(runCycle, cycle.intervalMs);
+        cycle.timer.unref?.();
+        return;
+      }
+      if (cycle.running) {
+        cycle.timer = setTimeout(runCycle, 1000);
+        cycle.timer.unref?.();
+        return;
+      }
+      cycle.running = true;
+      try {
+        const history = cycle.stateHistory[account] || [];
+        const index = nextStateIndex(cycle.states, history);
+        const result = await withResultRetry(() => withAccountLock(account, () => executeStateForAccount(account, cycle, cycle.states[index], cycle.runToken)));
+        if (result.ok) recordSuccessfulCycleState(cycle, account, index, true);
+        cycle.currentIdx = result.ok ? index : cycle.currentIdx;
+        recordTaskResult(cycle, result);
+        cycle.lastResults = [result];
+        cycle.nextAt = Date.now() + cycle.intervalMs;
+        persistAutomationTasks();
+        emitLive('task.completed', { id: cycle.id, taskType: 'cycle', nextAt: cycle.nextAt, currentIdx: cycle.currentIdx, results: cycle.lastResults });
+      } finally {
+        cycle.running = false;
+        if (cycle.active) {
+          cycle.timer = setTimeout(runCycle, Math.max(1000, cycle.nextAt - Date.now()));
+          cycle.timer.unref?.();
+        }
+      }
+    };
+    cycle.timer = setTimeout(runCycle, cycle.intervalMs);
+    cycle.timer.unref?.();
+    persistAutomationTasks();
+    emitLive('task.initialized', { id: rotation.id, taskType: 'rotation', nextAt: rotation.nextAt, results: rotation.lastResults });
+    emitLive('task.initialized', { id: cycle.id, taskType: 'cycle', nextAt: cycle.nextAt, results: cycle.lastResults });
+    return { ok: true, rotationId: rotation.id, stateCycleId: cycle.id, channels: rooms };
+  } catch (error) {
+    removeAccountFromAutomationTasks(account, ['rotation', 'cycle'], [rotation.id, cycle.id]);
+    logMediaEvent('error', 'automation.discord_rot_setup_failed', { account, guildId, error: error.message });
+    return { ok: false, error: error.message || 'تعذر إنشاء التدوير' };
+  }
+}
+
 async function handlePlayingDiscordCommand(client, message) {
   const command = playingCommandText(message);
-  if (!['start', 'stop'].includes(command)) return false;
+  const isRotationCommand = command === 'on' || command === 'off';
+  const isRotationSetupCommand = /^rot(?:\s|$)/.test(command);
+  const isSelfAutomationCommand = isRotationCommand || isRotationSetupCommand;
+  const isPlayingCommand = command === 'start' || command === 'stop';
+  if (!isPlayingCommand && !isSelfAutomationCommand) return false;
   const configuredChannel = String(process.env.DISCORD_COMMAND_CHANNEL_ID || '').trim();
   if (configuredChannel && String(message.channel?.id || '') !== configuredChannel) {
     const mismatchKey = `${String(message.author?.id || 'unknown')}:${String(message.channel?.id || 'unknown')}:${configuredChannel}`;
@@ -1127,22 +1320,36 @@ async function handlePlayingDiscordCommand(client, message) {
     }
     return false;
   }
-  const owners = String(process.env.DISCORD_COMMAND_OWNERS || '')
-    .split(/[\s,]+/)
-    .map((value) => value.trim())
-    .filter(Boolean);
   const authorId = String(message.author?.id || '');
-  // An explicit allow-list is required. Never fall back to the connected
-  // account, because every connected account can receive the same command.
-  if (!authorId || !owners.includes(authorId)) {
-    const mismatchKey = `${authorId || 'unknown'}:${command}`;
-    const lastLoggedAt = ownerMismatchLogs.get(mismatchKey) || 0;
-    if (Date.now() - lastLoggedAt >= 60_000) {
-      ownerMismatchLogs.set(mismatchKey, Date.now());
-      if (ownerMismatchLogs.size > 1000) ownerMismatchLogs.delete(ownerMismatchLogs.keys().next().value);
-      console.log(`[playing-command] ignored: owner mismatch author=${authorId || 'unknown'} configured=${owners.length ? owners.join(',') : 'none'} command=${command}`);
+  let rotationAccount = null;
+  if (isSelfAutomationCommand) {
+    const listenerId = String(client?.user?.id || '');
+    if (!authorId || !listenerId || authorId !== listenerId) {
+      console.log(`[playing-command] ignored: rotation command must be sent by its own connected account author=${authorId || 'unknown'} listener=${listenerId || 'unknown'}`);
+      return false;
     }
-    return false;
+    const matches = [...clients.entries()].filter(([, entry]) => String(entry?.client?.user?.id || '') === authorId);
+    if (matches.length !== 1) {
+      console.log(`[playing-command] ignored: unable to resolve unique connected account for self-command author=${authorId} matches=${matches.length}`);
+      return false;
+    }
+    rotationAccount = matches[0][0];
+  } else {
+    const owners = String(process.env.DISCORD_COMMAND_OWNERS || '')
+      .split(/[\s,]+/)
+      .map((value) => value.trim())
+      .filter(Boolean);
+    // The all-session Playing commands retain their explicit owner allow-list.
+    if (!authorId || !owners.includes(authorId)) {
+      const mismatchKey = `${authorId || 'unknown'}:${command}`;
+      const lastLoggedAt = ownerMismatchLogs.get(mismatchKey) || 0;
+      if (Date.now() - lastLoggedAt >= 60_000) {
+        ownerMismatchLogs.set(mismatchKey, Date.now());
+        if (ownerMismatchLogs.size > 1000) ownerMismatchLogs.delete(ownerMismatchLogs.keys().next().value);
+        console.log(`[playing-command] ignored: owner mismatch author=${authorId || 'unknown'} configured=${owners.length ? owners.join(',') : 'none'} command=${command}`);
+      }
+      return false;
+    }
   }
   const messageKey = String(message.id || '');
   if (messageKey && handledPlayingCommands.has(messageKey)) return false;
@@ -1151,9 +1358,35 @@ async function handlePlayingDiscordCommand(client, message) {
     if (handledPlayingCommands.size > 1000) handledPlayingCommands.delete(handledPlayingCommands.values().next().value);
   }
   console.log(`[playing-command] accepted command=${command} author=${authorId} listener=${String(client?.user?.id || 'unknown')} sessions=${playingSessions.size}`);
-  const result = command === 'start' ? startAllPlayingSessions() : stopAllPlayingSessions();
+  let accepted = true;
+  if (isRotationSetupCommand) {
+    const result = await startDiscordAccountRotation(client, message, rotationAccount, command.replace(/^rot\s*/, ''));
+    accepted = result.ok;
+    if (!result.ok) console.log(`[playing-command] rot rejected account=${rotationAccount} error=${result.error}`);
+  } else if (isRotationCommand) {
+    const rotationTasks = rotationTasksForAccount(rotationAccount);
+    const cycleTasks = [...stateCycles.values()].filter((task) => task.active !== false && (task.accounts || []).includes(rotationAccount));
+    if (rotationTasks.length > 1 || cycleTasks.length > 1 || (!rotationTasks.length && !cycleTasks.length)) {
+      accepted = false;
+      console.log(`[playing-command] ${command} rejected account=${rotationAccount} rotations=${rotationTasks.length} stateCycles=${cycleTasks.length}`);
+    } else if (command === 'off') {
+      accepted = [...rotationTasks, ...cycleTasks].every((task) => setRotationAccountPaused(task, rotationAccount, true).ok);
+    } else {
+      for (const task of cycleTasks) {
+        if (rotationAccountPaused(task, rotationAccount)) setRotationAccountPaused(task, rotationAccount, false);
+      }
+      let result = { ok: true };
+      if (rotationTasks.length && rotationAccountPaused(rotationTasks[0], rotationAccount)) {
+        result = await resumeRotationAccount(rotationTasks[0], rotationAccount);
+      }
+      accepted = result.ok && (!result.move || result.move.ok === true);
+    }
+  } else {
+    if (command === 'start') startAllPlayingSessions();
+    else stopAllPlayingSessions();
+  }
   try {
-    await message.react?.('✅');
+    if (accepted) await message.react?.('✅');
   } catch (error) {
     // Reactions are optional confirmation and may be forbidden in the source
     // channel. Never turn a successful command into a noisy process error.
@@ -2216,9 +2449,12 @@ async function moveRotationAccount(name, task, preferredChannelId, opts = {}) {
   const wasOutsideRoom = !voiceSessions.has(sessionKey(name, task.guildId));
   const mediaVariants = [roomState];
   for (const channelId of ordered) {
+    if (rotationAccountPaused(task, name)) return { name, ok: true, skipped: true, paused: true, channelId: task.accountTargets?.[name] || null };
     for (let mediaIndex = 0; mediaIndex < mediaVariants.length; mediaIndex += 1) {
+      if (rotationAccountPaused(task, name)) return { name, ok: true, skipped: true, paused: true, channelId: task.accountTargets?.[name] || null };
       const variant = mediaVariants[mediaIndex];
-      const result = await withResultRetry(() => moveAccount(name, task.guildId, channelId, variant));
+      const result = await withResultRetry(() => moveAccount(name, task.guildId, channelId, { ...variant, operationType: 'rotation' }));
+      if (rotationAccountPaused(task, name)) return { name, ok: true, skipped: true, paused: true, channelId: task.accountTargets?.[name] || null };
       if (result.ok) {
         task.accountTargets = { ...(task.accountTargets || {}), [name]: channelId };
         return { ...result, attemptedChannels: [...last.attemptedChannels, channelId], mediaFallback: mediaIndex > 0 ? (variant.selfVideo ? 'camera' : 'live') : null, resumedAfterRemoval: wasOutsideRoom };
@@ -2242,22 +2478,44 @@ async function startRotationMediaWithFallback(name, guildId, next) {
   }
   return last;
 }
-function stopTasksForAccount(name) {
-  stopPlayingSession(name);
+function removeAccountFromAutomationTasks(name, taskTypes = ['rotation', 'cycle'], taskIds = null) {
   let changed = false;
-  for (const [id, task] of rotations.entries()) {
-    const before = task.accounts.length;
-    task.accounts = task.accounts.filter((item) => item !== name);
-    changed ||= before !== task.accounts.length;
-    if (!task.accounts.length) { clearInterval(task.timer); rotations.delete(id); emitLive('task.stopped', { id, reason: 'no accounts remaining' }); }
-  }
-  for (const [id, task] of stateCycles.entries()) {
-    const before = task.accounts.length;
-    task.accounts = task.accounts.filter((item) => item !== name);
-    changed ||= before !== task.accounts.length;
-    if (!task.accounts.length) { clearInterval(task.timer); stateCycles.delete(id); emitLive('task.stopped', { id, reason: 'no accounts remaining' }); }
+  const allowedTypes = new Set(taskTypes);
+  const limitedTaskIds = taskIds ? new Set(taskIds.map(String)) : null;
+  for (const [collection, taskType] of [[rotations, 'rotation'], [stateCycles, 'cycle']]) {
+    if (!allowedTypes.has(taskType)) continue;
+    for (const [id, task] of collection.entries()) {
+      if (limitedTaskIds && !limitedTaskIds.has(String(id))) continue;
+      if (!(task.accounts || []).includes(name)) continue;
+      const operation = accountOperations.get(operationKey(name));
+      const expectedKind = collection === stateCycles ? 'cycle' : 'rotation';
+      if (operation && operation.kind === expectedKind && String(operation.guildId) === String(task.guildId)) {
+        const invalidation = beginAccountOperation(name, task.guildId, 'automation-replaced');
+        endAccountOperation(invalidation);
+      }
+      task.accounts = (task.accounts || []).filter((account) => account !== name);
+      task.pausedAccounts = (task.pausedAccounts || []).filter((account) => account !== name);
+      if (task.accountTargets) delete task.accountTargets[name];
+      if (task.accountStatus) delete task.accountStatus[name];
+      if (task.accountStateIdx) delete task.accountStateIdx[name];
+      if (task.stateHistory) delete task.stateHistory[name];
+      task.lastResults = (task.lastResults || []).filter((result) => result.name !== name);
+      changed = true;
+      if (!task.accounts.length) {
+        task.active = false;
+        clearTimeout(task.timer);
+        clearInterval(task.timer);
+        collection.delete(id);
+        emitLive('task.stopped', { id, reason: 'no accounts remaining' });
+      }
+    }
   }
   if (changed) persistAutomationTasks();
+  return changed;
+}
+function stopTasksForAccount(name) {
+  stopPlayingSession(name);
+  removeAccountFromAutomationTasks(name);
 }
 function watchdogKey(kind, id, account) { return `${kind}:${id}:${account}`; }
 function watchdogIsMismatch(key, mismatch) {
@@ -2280,12 +2538,14 @@ function watchdogMarkRepair(key) {
 function isAccountManagedByActiveStateCycle(name, guildId) {
   return [...stateCycles.values()].some((task) => task.active !== false
     && String(task.guildId) === String(guildId)
-    && (task.accounts || []).includes(name));
+    && (task.accounts || []).includes(name)
+    && !(task.pausedAccounts || []).includes(name));
 }
 function activeStateCycleForAccount(name, guildId) {
   return [...stateCycles.values()].find((task) => task.active !== false && !task.running
     && String(task.guildId) === String(guildId)
-    && (task.accounts || []).includes(name)) || null;
+    && (task.accounts || []).includes(name)
+    && !(task.pausedAccounts || []).includes(name)) || null;
 }
 function expectedMediaStateIsPresent(actual, channelId, mediaKind) {
   if (!actual?.channelId || String(actual.channelId) !== String(channelId)) return false;
@@ -2300,7 +2560,7 @@ function voiceStateMatchesExpected(actual, expected) {
 }
 async function watchdogRotation(task, account) {
   const client = getClient(account);
-  if (!client || !task.active || task.running) return;
+  if (!client || !task.active || task.running || rotationAccountPaused(task, account)) return;
   if (accountOperations.has(operationKey(account, task.guildId))) return;
   const key = watchdogKey('rotation', task.id, account);
   const actual = readGatewayVoiceState(client, task.guildId);
@@ -2454,7 +2714,7 @@ function rotationControlledAccounts(guildId) {
   const controlled = new Set();
   for (const task of rotations.values()) {
     if (String(task.guildId) !== String(guildId)) continue;
-    for (const name of task.accounts || []) controlled.add(name);
+    for (const name of task.accounts || []) if (!rotationAccountPaused(task, name)) controlled.add(name);
   }
   return controlled;
 }
@@ -2478,7 +2738,6 @@ function taskConflict(accounts, guildId, type) {
   const conflicts = [];
   const activeTasks = type === 'rotation' ? rotations.values() : stateCycles.values();
   for (const task of activeTasks) {
-    if (String(task.guildId) !== String(guildId)) continue;
     const overlap = accounts.filter((name) => (task.accounts || []).includes(name));
     if (overlap.length) conflicts.push({ id: task.id, accounts: overlap });
   }
@@ -3002,7 +3261,7 @@ async function moveAccountLocked(name, guildId, channelId, opts = {}) {
   return (async () => {
     const client = getClient(name);
     if (!client) return { name, ok: false, error: 'Account is not connected' };
-    const operation = beginAccountOperation(name, guildId, 'move');
+    const operation = beginAccountOperation(name, guildId, opts.operationType || 'move');
     const target = validateTarget(client, guildId, channelId);
     if (!target.ok) { endAccountOperation(operation); return { name, ok: false, error: target.error }; }
     const saved = voiceSessions.get(sessionKey(name, guildId));
@@ -3074,6 +3333,7 @@ function renamePersistedAccount(oldName, newName) {
   }
   for (const task of [...rotations.values(), ...stateCycles.values()]) {
     task.accounts = (task.accounts || []).map((account) => account === oldName ? newName : account);
+    if (Array.isArray(task.pausedAccounts)) task.pausedAccounts = task.pausedAccounts.map((account) => account === oldName ? newName : account);
     if (task.accountTargets?.[oldName]) {
       task.accountTargets[newName] = task.accountTargets[oldName];
       delete task.accountTargets[oldName];
@@ -3880,14 +4140,15 @@ app.post('/api/voice/rotation/start', async (req, res) => {
   const channelIds = cleanChannelIds(req.body?.channelIds);
   const delay = Math.max(1000, Number(intervalMs || 60000));
   if (!accounts.length || !guildId || !Array.isArray(channelIds) || channelIds.length < 2) return fail(res, new Error('At least two channels and one account are required'), 400);
-  const conflicts = taskAccountConflicts(accounts, guildId, 'rotation');
-  if (conflicts.length) return fail(res, new Error(`These accounts already have a room rotation: ${conflicts.join(', ')}`), 409);
+  // Starting a replacement rotation transfers only these accounts; peers in
+  // their existing task remain enrolled. Registration happens synchronously
+  // below, before any voice/network work, so concurrent starts cannot overlap.
+  for (const name of accounts) removeAccountFromAutomationTasks(name, ['rotation']);
   const initialTargets = randomOrder
     ? randomRotationTargets(accounts, channelIds, (name) => voiceSessions.get(sessionKey(name, guildId))?.channelId)
     : null;
-  const initialTask = { guildId, channels: channelIds, type: 'rotation', accountTargets: {} };
   const id = crypto.randomUUID();
-  const task = { id, accounts, guildId, guildName: guildName || guildId, channels: channelIds, intervalMs: delay, randomOrder: !!randomOrder, currentIdx: 0, startedAt: Date.now(), nextAt: Date.now() + delay, accountStatus: {}, accountTargets: {}, running: true, active: true, initializing: true, lastResults: [] };
+  const task = { id, accounts, guildId, guildName: guildName || guildId, channels: channelIds, intervalMs: delay, randomOrder: !!randomOrder, currentIdx: 0, startedAt: Date.now(), nextAt: Date.now() + delay, accountStatus: {}, accountTargets: {}, pausedAccounts: [], running: true, active: true, initializing: true, lastResults: [] };
   // Register and persist the task before moving any account. Joining a voice
   // room can take several seconds per account; keeping this request open made
   // the browser report "Failed to fetch" and left no automation visible.
@@ -3898,14 +4159,14 @@ app.post('/api/voice/rotation/start', async (req, res) => {
     let initial = [];
     try {
       initial = await mapWithConcurrency(accounts, AUTOMATION_CONCURRENCY, (name, index) => {
+        if (rotationAccountPaused(task, name)) return { name, ok: true, skipped: true, paused: true };
         const current = voiceSessions.get(sessionKey(name, guildId));
         const target = initialTargets?.get(name);
         const currentIndex = channelIds.indexOf(current?.channelId);
         const preferred = target || channelIds[currentIndex >= 0 ? (currentIndex + 1) % channelIds.length : index % channelIds.length];
-        return moveRotationAccount(name, initialTask, preferred, normalizeVoiceState(current || {}));
+        return moveRotationAccount(name, task, preferred, normalizeVoiceState(current || {}));
       });
       initial.forEach((result) => recordTaskResult(task, result));
-      task.accountTargets = { ...initialTask.accountTargets };
       task.lastResults = initial;
       task.nextAt = Date.now() + task.intervalMs;
       emitLive('task.completed', { id: task.id, taskType: 'rotation', initializing: false, nextAt: task.nextAt, currentIdx: task.currentIdx, results: task.lastResults });
@@ -3928,11 +4189,13 @@ app.post('/api/voice/rotation/start', async (req, res) => {
     // Discord operation must not leave the dashboard stuck at 00:00.
     task.nextAt = Date.now() + task.intervalMs;
     task.currentIdx = (task.currentIdx + 1) % task.channels.length;
+    const activeAccounts = task.accounts.filter((name) => !rotationAccountPaused(task, name));
     const randomTargets = task.randomOrder
-      ? randomRotationTargets(task.accounts, task.channels, (name) => voiceSessions.get(sessionKey(name, task.guildId))?.channelId)
+      ? randomRotationTargets(activeAccounts, task.channels, (name) => voiceSessions.get(sessionKey(name, task.guildId))?.channelId)
       : null;
     try {
-      task.lastResults = await mapWithConcurrency(task.accounts, AUTOMATION_CONCURRENCY, async (name, index) => {
+      task.lastResults = await mapWithConcurrency(activeAccounts, AUTOMATION_CONCURRENCY, async (name, index) => {
+        if (rotationAccountPaused(task, name)) return { name, ok: true, skipped: true, paused: true };
         const current = voiceSessions.get(sessionKey(name, task.guildId));
         const randomTarget = randomTargets?.get(name);
         const preferred = rotationPreferredChannel(name, task, index, randomTarget);
@@ -3964,7 +4227,7 @@ function findAutomationTask(type, id) {
 function taskHasAccountElsewhere(name, guildId, type, currentId) {
   const collection = type === 'rotation' ? rotations : stateCycles;
   for (const [id, task] of collection) {
-    if (String(id) === String(currentId) || String(task.guildId) !== String(guildId)) continue;
+    if (String(id) === String(currentId)) continue;
     if ((task.accounts || []).includes(name)) return true;
   }
   return false;
@@ -4049,14 +4312,15 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
   const { guildId, states, intervalMs } = req.body || {};
   const delay = Math.max(1000, Number(intervalMs || 300000));
   if (!accounts.length || !guildId || !Array.isArray(states) || states.length < 2) return fail(res, new Error('At least two states and one account are required'), 400);
-  const conflicts = taskAccountConflicts(accounts, guildId, 'cycle');
-  if (conflicts.length) return fail(res, new Error(`These accounts already have a state rotation: ${conflicts.join(', ')}`), 409);
   const validStates = states.every((item) => item && typeof item === 'object'
     && ['selfMute', 'selfDeaf', 'selfVideo', 'selfStream'].every((key) => item[key] === undefined || typeof item[key] === 'boolean')
     && !(item.selfDeaf === true && (item.selfVideo === true || item.selfStream === true)));
   if (!validStates) return fail(res, new Error('State cycle contains an invalid voice state'), 400);
+  // Same-kind task replacement is consistent with the room UI and `rot`.
+  // Keep the previous cycle intact until the new request is structurally valid.
+  for (const name of accounts) removeAccountFromAutomationTasks(name, ['cycle']);
   const id = crypto.randomUUID();
-  const task = { id, type: 'cycle', accounts, guildId, states, intervalMs: delay, currentIdx: 0, accountStateIdx: {}, stateHistory: {}, runToken: 0, startedAt: Date.now(), nextAt: Date.now() + delay };
+  const task = { id, type: 'cycle', accounts, guildId, states, intervalMs: delay, currentIdx: 0, accountStateIdx: {}, stateHistory: {}, pausedAccounts: [], runToken: 0, startedAt: Date.now(), nextAt: Date.now() + delay };
   task.running = true; task.active = true;
   task.lastResults = [];
   const runStateCycle = async () => {
@@ -4065,10 +4329,12 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
     if (task.running || task.addingAccounts) { task.timer = setTimeout(runStateCycle, 1000); return; }
     task.running = true;
     const runToken = task.runToken;
-    task.currentIdx = (task.currentIdx + 1) % task.states.length;
+    const activeAccounts = task.accounts.filter((name) => !(task.pausedAccounts || []).includes(name));
+    if (activeAccounts.length) task.currentIdx = (task.currentIdx + 1) % task.states.length;
     try {
       task.lastResults = [];
-      await mapWithConcurrency(task.accounts, AUTOMATION_CONCURRENCY, (name) => withResultRetry(() => withAccountLock(name, async () => {
+      await mapWithConcurrency(activeAccounts, AUTOMATION_CONCURRENCY, (name) => withResultRetry(() => withAccountLock(name, async () => {
+        if ((task.pausedAccounts || []).includes(name)) return { name, ok: true, skipped: true, paused: true };
         const history = task.stateHistory[name] || [];
         const stateIndex = nextStateIndex(task.states, history);
         const result = await executeStateForAccount(name, task, task.states[stateIndex], runToken);
@@ -4089,7 +4355,9 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
   setImmediate(async () => {
     task.running = true;
     try {
-      task.lastResults = await mapWithConcurrency(task.accounts, AUTOMATION_CONCURRENCY, (name) => withResultRetry(() => withAccountLock(name, async () => {
+      const activeAccounts = task.accounts.filter((name) => !(task.pausedAccounts || []).includes(name));
+      task.lastResults = await mapWithConcurrency(activeAccounts, AUTOMATION_CONCURRENCY, (name) => withResultRetry(() => withAccountLock(name, async () => {
+        if ((task.pausedAccounts || []).includes(name)) return { name, ok: true, skipped: true, paused: true };
         const index = nextStateIndex(task.states, task.stateHistory[name] || []);
         const result = await executeStateForAccount(name, task, task.states[index], task.runToken);
         recordSuccessfulCycleState(task, name, index, result.ok);
@@ -4134,9 +4402,9 @@ async function restoreAutomationTasks() {
   const saved = loadAutomationTasks();
   for (const item of Array.isArray(saved.rotations) ? saved.rotations : []) {
     if (!item.id || !item.guildId || !Array.isArray(item.channels) || item.channels.length < 2) continue;
-    const accounts = cleanAccounts(item.accounts);
-    if (taskAccountConflicts(accounts, item.guildId, 'rotation').length) continue;
-    const task = { ...item, type: 'rotation', accounts, accountTargets: { ...(item.accountTargets || {}) }, running: false, active: true, intervalMs: Math.max(1000, Number(item.intervalMs || 60000)), nextAt: Number(item.nextAt || Date.now() + Number(item.intervalMs || 60000)) };
+    const accounts = cleanAccounts(item.accounts).filter((name) => !taskAccountConflicts([name], item.guildId, 'rotation').length);
+    if (!accounts.length) continue;
+    const task = { ...item, type: 'rotation', accounts, pausedAccounts: [...new Set((Array.isArray(item.pausedAccounts) ? item.pausedAccounts : []).filter((name) => accounts.includes(name)))], accountTargets: { ...(item.accountTargets || {}) }, running: false, active: true, intervalMs: Math.max(1000, Number(item.intervalMs || 60000)), nextAt: Number(item.nextAt || Date.now() + Number(item.intervalMs || 60000)) };
     const runRotation = async () => {
       if (!task.active) return;
       if (task.nextAt > Date.now()) { task.timer = setTimeout(runRotation, task.nextAt - Date.now()); return; }
@@ -4144,11 +4412,13 @@ async function restoreAutomationTasks() {
       task.running = true;
       task.nextAt = Date.now() + task.intervalMs;
       task.currentIdx = (task.currentIdx + 1) % task.channels.length;
+      const activeAccounts = task.accounts.filter((name) => !rotationAccountPaused(task, name));
       const randomTargets = task.randomOrder
-        ? randomRotationTargets(task.accounts, task.channels, (name) => voiceSessions.get(sessionKey(name, task.guildId))?.channelId)
+        ? randomRotationTargets(activeAccounts, task.channels, (name) => voiceSessions.get(sessionKey(name, task.guildId))?.channelId)
         : null;
       try {
-        task.lastResults = await mapWithConcurrency(task.accounts, AUTOMATION_CONCURRENCY, async (name, index) => {
+        task.lastResults = await mapWithConcurrency(activeAccounts, AUTOMATION_CONCURRENCY, async (name, index) => {
+          if (rotationAccountPaused(task, name)) return { name, ok: true, skipped: true, paused: true };
           const current = voiceSessions.get(sessionKey(name, task.guildId));
           const randomTarget = randomTargets?.get(name);
           const preferred = rotationPreferredChannel(name, task, index, randomTarget);
@@ -4166,24 +4436,26 @@ async function restoreAutomationTasks() {
   }
   for (const item of Array.isArray(saved.stateCycles) ? saved.stateCycles : []) {
     if (!item.id || !item.guildId || !Array.isArray(item.states) || item.states.length < 2) continue;
-    const accounts = cleanAccounts(item.accounts);
-    if (taskAccountConflicts(accounts, item.guildId, 'cycle').length) continue;
+    const accounts = cleanAccounts(item.accounts).filter((name) => !taskAccountConflicts([name], item.guildId, 'cycle').length);
+    if (!accounts.length) continue;
     const firstAccount = accounts[0];
     const firstHistory = item.stateHistory?.[firstAccount];
     const legacyIndex = Number(item.accountStateIdx?.[firstAccount] ?? (Array.isArray(firstHistory) ? firstHistory.at(-1) : NaN));
     const currentStateIdx = Number.isInteger(Number(item.currentStateIdx)) && Number(item.currentStateIdx) >= 0 && Number(item.currentStateIdx) < item.states.length
       ? Number(item.currentStateIdx)
       : Number.isInteger(legacyIndex) && legacyIndex >= 0 && legacyIndex < item.states.length ? legacyIndex : 0;
-    const task = { ...item, type: 'cycle', accounts, currentStateIdx, accountStateIdx: { ...(item.accountStateIdx || {}) }, stateHistory: { ...(item.stateHistory || {}) }, runToken: Number(item.runToken || 0), running: false, addingAccounts: false, active: true, intervalMs: Math.max(1000, Number(item.intervalMs || 300000)), nextAt: Number(item.nextAt || Date.now() + Number(item.intervalMs || 300000)) };
+    const task = { ...item, type: 'cycle', accounts, pausedAccounts: [...new Set((Array.isArray(item.pausedAccounts) ? item.pausedAccounts : []).filter((name) => accounts.includes(name)))], currentStateIdx, accountStateIdx: { ...(item.accountStateIdx || {}) }, stateHistory: { ...(item.stateHistory || {}) }, runToken: Number(item.runToken || 0), running: false, addingAccounts: false, active: true, intervalMs: Math.max(1000, Number(item.intervalMs || 300000)), nextAt: Number(item.nextAt || Date.now() + Number(item.intervalMs || 300000)) };
     const runStateCycle = async () => {
       if (!task.active) return;
       if (task.nextAt > Date.now()) { task.timer = setTimeout(runStateCycle, task.nextAt - Date.now()); return; }
       if (task.running || task.addingAccounts) { task.timer = setTimeout(runStateCycle, 1000); return; }
       task.running = true;
       task.nextAt = Date.now() + task.intervalMs;
-      task.currentIdx = (task.currentIdx + 1) % task.states.length;
+      const activeAccounts = task.accounts.filter((name) => !(task.pausedAccounts || []).includes(name));
+      if (activeAccounts.length) task.currentIdx = (task.currentIdx + 1) % task.states.length;
       try {
-        task.lastResults = await mapWithConcurrency(task.accounts, AUTOMATION_CONCURRENCY, (name) => withResultRetry(() => withAccountLock(name, async () => {
+        task.lastResults = await mapWithConcurrency(activeAccounts, AUTOMATION_CONCURRENCY, (name) => withResultRetry(() => withAccountLock(name, async () => {
+          if ((task.pausedAccounts || []).includes(name)) return { name, ok: true, skipped: true, paused: true };
           const history = task.stateHistory[name] || [];
           const index = nextStateIndex(task.states, history);
           const result = await executeStateForAccount(name, task, task.states[index]);
@@ -4206,7 +4478,9 @@ async function restoreAutomationTasks() {
     const restoreRunToken = task.runToken;
     setImmediate(async () => {
       try {
-        task.lastResults = await mapWithConcurrency(task.accounts, AUTOMATION_CONCURRENCY, async (name) => {
+        const activeAccounts = task.accounts.filter((name) => !(task.pausedAccounts || []).includes(name));
+        task.lastResults = await mapWithConcurrency(activeAccounts, AUTOMATION_CONCURRENCY, async (name) => {
+          if ((task.pausedAccounts || []).includes(name)) return { name, ok: true, skipped: true, paused: true };
           const result = await withResultRetry(() => restoreStateCycleAccount(name, task, restoreRunToken));
           return recordTaskResult(task, result);
         });
@@ -4231,4 +4505,4 @@ if (require.main === module) {
   process.once('SIGINT', () => { persistBeforeExit(); process.exit(0); });
 }
 
-module.exports = { app, clients, voiceSessions, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, compactStateHistory, recordSuccessfulCycleState, getRateLimitBucket, pruneRateLimitBuckets, reserveAccountConnectSlots, releaseAccountConnectSlots, playingSessions, stopPlayingSession, schedulePlaying, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, rotationControlledAccounts, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, hardenVoiceConnection, cleanupPrimaryStreamAttempt, guardVoiceWebSocketTeardown, safeErrorSummary, buildAccountSnapshot, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, registerAccountStreamer, mediaStreamers, mediaQueueSnapshot, ensureSyntheticVideo, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, isCaptchaChallengeError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanAccountRecords, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, projectGatewayVoiceState, buildVoiceGuildCatalog, buildPlayingChannelCatalog, invalidateVoiceGuildCatalog, scheduleCatalogEvent, liveEvents, isRecoverableDiscordInteractionError };
+module.exports = { app, clients, voiceSessions, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, compactStateHistory, recordSuccessfulCycleState, getRateLimitBucket, pruneRateLimitBuckets, reserveAccountConnectSlots, releaseAccountConnectSlots, playingSessions, stopPlayingSession, schedulePlaying, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, parseRotationChannelIds, startDiscordAccountRotation, removeAccountFromAutomationTasks, rotationTasksForAccount, rotationAccountPaused, setRotationAccountPaused, resumeRotationAccount, rotationControlledAccounts, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, hardenVoiceConnection, cleanupPrimaryStreamAttempt, guardVoiceWebSocketTeardown, safeErrorSummary, buildAccountSnapshot, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, registerAccountStreamer, mediaStreamers, mediaQueueSnapshot, ensureSyntheticVideo, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, isCaptchaChallengeError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanAccountRecords, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, projectGatewayVoiceState, buildVoiceGuildCatalog, buildPlayingChannelCatalog, invalidateVoiceGuildCatalog, scheduleCatalogEvent, liveEvents, isRecoverableDiscordInteractionError };
