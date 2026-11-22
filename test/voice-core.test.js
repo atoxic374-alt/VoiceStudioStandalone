@@ -311,6 +311,18 @@ test('restores the last persisted state-cycle state instead of choosing a new on
   assert.equal(stateCycleStateForAccount({ states: [camera, live], accountStateIdx: {}, stateHistory: {} }, 'alpha'), camera);
 });
 
+test('keeps an in-flight media state available for recovery until that state succeeds', () => {
+  const mute = { selfMute: true, selfDeaf: false, selfVideo: false, selfStream: false };
+  const live = { selfMute: false, selfDeaf: false, selfVideo: false, selfStream: true };
+  const task = { states: [mute, live], accountStateIdx: { alpha: 0 }, accountPendingStateIdx: { alpha: 1 }, stateHistory: { alpha: [0] } };
+  assert.equal(stateCycleStateForAccount(task, 'alpha'), live);
+  assert.equal(recordSuccessfulCycleState(task, 'alpha', 1, false), false);
+  assert.equal(stateCycleStateForAccount(task, 'alpha'), live);
+  assert.equal(recordSuccessfulCycleState(task, 'alpha', 1, true), true);
+  assert.equal(task.accountPendingStateIdx.alpha, undefined);
+  assert.equal(stateCycleStateForAccount(task, 'alpha'), live);
+});
+
 test('keeps state-cycle choices random and independent per account without skipping unseen states', () => {
   const originalRandom = Math.random;
   const states = ['unmute', 'mute', 'camera', 'stream'];
@@ -458,6 +470,12 @@ test('backs off repeated failed primary media starts for the same target', () =>
   } finally {
     primaryMediaFailures.delete(account);
   }
+});
+
+test('does not classify an active media cooldown as an immediate retryable error', () => {
+  assert.equal(retryableError({ ok: false, cooldown: true, retryAfterMs: 20_000, error: 'Media transport is cooling down; retry in 20 seconds' }), false);
+  assert.equal(retryableError({ ok: false, error: 'Media transport is cooling down; retry in 20 seconds' }), false);
+  assert.equal(retryableError({ ok: false, error: 'WebRTC media transport timed out' }), true);
 });
 
 test('confirms a voice state from the gateway', async () => {
