@@ -908,17 +908,23 @@ test('Discord on/off commands control only the rotation of the connected account
     assert.equal(await invoke(clientA, 'rotation-off', '!off', 'discord-account-a'), true);
     assert.deepEqual(task.pausedAccounts, [accountA]);
     assert.deepEqual(cycle.pausedAccounts, [accountA]);
+    assert.equal(await invoke(clientA, 'rotation-off-again', '!off', 'discord-account-a'), true);
+    assert.deepEqual(task.pausedAccounts, [accountA]);
+    assert.deepEqual(cycle.pausedAccounts, [accountA]);
     assert.equal(isAccountManagedByActiveStateCycle(accountA, 'guild-x'), false);
     assert.deepEqual(task.accounts, [accountA, accountB]);
     assert.equal(task.accountTargets[accountA], 'room-1');
     assert.equal(await invoke(clientA, 'rotation-on', '!on', 'discord-account-a'), true);
     assert.deepEqual(task.pausedAccounts, []);
     assert.deepEqual(cycle.pausedAccounts, []);
+    assert.equal(await invoke(clientA, 'rotation-on-again', '!on', 'discord-account-a'), true);
+    assert.deepEqual(task.pausedAccounts, []);
+    assert.deepEqual(cycle.pausedAccounts, []);
     assert.equal(isAccountManagedByActiveStateCycle(accountA, 'guild-x'), true);
     assert.deepEqual(cycle.accountStateIdx, { [accountA]: 1 });
     assert.deepEqual(cycle.stateHistory, { [accountA]: [0, 1] });
     assert.deepEqual(task.accounts, [accountA, accountB]);
-    assert.deepEqual(reacted, ['✅', '✅']);
+    assert.deepEqual(reacted, ['✅', '✅', '✅', '✅']);
   } finally {
     rotations.delete(taskId);
     stateCycles.delete(cycleId);
@@ -990,6 +996,40 @@ test('Discord on is idempotent for an already-running rotation and state cycle',
     assert.deepEqual(rotation.pausedAccounts, []);
     assert.deepEqual(cycle.pausedAccounts, []);
     assert.deepEqual(reacted, ['✅']);
+  } finally {
+    rotations.delete(rotationId);
+    stateCycles.delete(cycleId);
+    clients.delete(account);
+    for (const [name, entry] of savedClients) clients.set(name, entry);
+    if (previousOwners === undefined) delete process.env.DISCORD_COMMAND_OWNERS; else process.env.DISCORD_COMMAND_OWNERS = previousOwners;
+    if (previousChannel === undefined) delete process.env.DISCORD_COMMAND_CHANNEL_ID; else process.env.DISCORD_COMMAND_CHANNEL_ID = previousChannel;
+    if (previousPrefix === undefined) delete process.env.DISCORD_COMMAND_PREFIX; else process.env.DISCORD_COMMAND_PREFIX = previousPrefix;
+  }
+});
+
+test('Discord on keeps both task types paused and emits no reaction if room resumption fails', async () => {
+  const previousOwners = process.env.DISCORD_COMMAND_OWNERS;
+  const previousChannel = process.env.DISCORD_COMMAND_CHANNEL_ID;
+  const previousPrefix = process.env.DISCORD_COMMAND_PREFIX;
+  const savedClients = [...clients.entries()];
+  const account = 'rotation-resume-failure';
+  const client = { user: { id: 'rotation-resume-failure-user' } };
+  const rotationId = 'rotation-resume-failure-task';
+  const cycleId = 'cycle-resume-failure-task';
+  const rotation = { id: rotationId, active: true, running: false, initializing: false, guildId: 'guild-x', channels: [], accounts: [account], pausedAccounts: [account] };
+  const cycle = { id: cycleId, active: true, running: false, guildId: 'guild-x', states: [{ selfMute: false }, { selfMute: true }], accounts: [account], pausedAccounts: [account] };
+  process.env.DISCORD_COMMAND_OWNERS = '';
+  process.env.DISCORD_COMMAND_CHANNEL_ID = '';
+  process.env.DISCORD_COMMAND_PREFIX = '!';
+  clients.set(account, { client });
+  rotations.set(rotationId, rotation);
+  stateCycles.set(cycleId, cycle);
+  const reacted = [];
+  try {
+    assert.equal(await handlePlayingDiscordCommand(client, { id: 'rotation-resume-failure-command', content: '!on', author: { id: client.user.id }, channel: {}, react: async (emoji) => reacted.push(emoji) }), true);
+    assert.deepEqual(rotation.pausedAccounts, [account]);
+    assert.deepEqual(cycle.pausedAccounts, [account]);
+    assert.deepEqual(reacted, []);
   } finally {
     rotations.delete(rotationId);
     stateCycles.delete(cycleId);
@@ -1076,6 +1116,31 @@ test('projects only the account-owned Gateway voice state into a minimal event s
     guildId: 'guild-event-test', channelId: null,
     selfMute: undefined, selfDeaf: undefined, selfVideo: undefined, selfStream: undefined,
   });
+});
+
+test('dashboard snapshots clear an explicitly left room and find voice membership in another guild', () => {
+  const { buildClientSnapshots, voiceSessions } = require('../server');
+  const account = `dashboard-voice-sync-${Date.now()}`;
+  const userId = `dashboard-user-${Date.now()}`;
+  const oldGuildId = `dashboard-old-guild-${Date.now()}`;
+  const newGuildId = `dashboard-new-guild-${Date.now()}`;
+  const oldGuild = { id: oldGuildId, channels: { cache: new Map() }, voiceStates: { cache: new Map([[userId, { id: userId, guildId: oldGuildId, channelId: null }]]) } };
+  const newGuild = { id: newGuildId, channels: { cache: new Map() }, voiceStates: { cache: new Map() } };
+  const client = { user: { id: userId, username: account }, guilds: { cache: new Map([[oldGuildId, oldGuild], [newGuildId, newGuild]]) } };
+  const sessionKey = `${account}__${oldGuildId}`;
+  clients.set(account, { client });
+  voiceSessions.set(sessionKey, { name: account, guildId: oldGuildId, channelId: 'stale-room', selfMute: false, selfDeaf: false, selfVideo: false, selfStream: false });
+  try {
+    assert.equal(buildClientSnapshots().find((item) => item.name === account).voice, null, 'an explicit channelId=null must override a stale saved session');
+    newGuild.voiceStates.cache.set(userId, { id: userId, guildId: newGuildId, channelId: 'current-room', selfMute: true });
+    const voice = buildClientSnapshots().find((item) => item.name === account).voice;
+    assert.equal(voice.guildId, newGuildId);
+    assert.equal(voice.channelId, 'current-room');
+    assert.equal(voice.selfMute, true);
+  } finally {
+    clients.delete(account);
+    voiceSessions.delete(sessionKey);
+  }
 });
 
 test('caches per-account voice and Playing catalogs until a Gateway invalidation', () => {

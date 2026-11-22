@@ -1201,9 +1201,17 @@ async function startDiscordAccountRotation(client, message, account, rawIds) {
     id: crypto.randomUUID(), type: 'cycle', accounts: [account], guildId, states,
     intervalMs: 10 * 60 * 1000, currentIdx: 0, accountStateIdx: {}, stateHistory: {},
     pausedAccounts: [], runToken: 0, startedAt: now, nextAt: now + 10 * 60 * 1000,
-    accountStatus: {}, running: true, active: true, lastResults: [],
+    accountStatus: {}, initializing: true, running: true, active: true, lastResults: [],
   };
-  const isCurrentSetup = () => rotations.get(rotation.id) === rotation && stateCycles.get(cycle.id) === cycle;
+  const isRotationCurrent = () => rotations.get(rotation.id) === rotation;
+  const isCycleCurrent = () => stateCycles.get(cycle.id) === cycle;
+  const abandonIfSuperseded = () => {
+    // A UI task replaces only its own type. Continue initializing the still-live
+    // half of a rot pair; abort only when neither task remains current.
+    if (isRotationCurrent() || isCycleCurrent()) return false;
+    removeAccountFromAutomationTasks(account, ['rotation', 'cycle'], [rotation.id, cycle.id]);
+    return true;
+  };
   rotations.set(rotation.id, rotation);
   stateCycles.set(cycle.id, cycle);
   persistAutomationTasks();
@@ -1212,29 +1220,51 @@ async function startDiscordAccountRotation(client, message, account, rawIds) {
   try {
     const current = voiceSessions.get(sessionKey(account, guildId));
     const preferred = rotationPreferredChannel(account, rotation, 0);
-    const roomResult = await moveRotationAccount(account, rotation, preferred, normalizeVoiceState(current || {}));
-    if (!isCurrentSetup()) return { ok: false, error: 'تم استبدال هذه المهمة بأمر rot أحدث' };
-    if (!roomResult.ok || roomResult.skipped) throw new Error(roomResult.error || 'تعذر دخول أول روم في التدوير');
-    recordTaskResult(rotation, roomResult);
-    rotation.lastResults = [roomResult];
-    rotation.initializing = false;
-    rotation.running = false;
-    rotation.nextAt = Date.now() + rotation.intervalMs;
+    let roomResult = await moveRotationAccount(account, rotation, preferred, normalizeVoiceState(current || {}));
+    if (abandonIfSuperseded()) return { ok: false, error: 'تم استبدال هذه المهمة بأمر rot أحدث' };
+    // If off/on crossed the first move, retry once when the account is now
+    // resumed; if it is still paused, preserve the task rather than deleting it.
+    if (roomResult.skipped && !rotationAccountPaused(rotation, account)) {
+      const latest = voiceSessions.get(sessionKey(account, guildId));
+      const retryTarget = rotationPreferredChannel(account, rotation, 0);
+      roomResult = await moveRotationAccount(account, rotation, retryTarget, normalizeVoiceState(latest || {}));
+      if (abandonIfSuperseded()) return { ok: false, error: 'تم استبدال هذه المهمة بأمر rot أحدث' };
+    }
+    const roomPaused = rotationAccountPaused(rotation, account);
+    if (!roomResult.ok && !roomPaused) throw new Error(roomResult.error || 'تعذر دخول أول روم في التدوير');
+    if (roomPaused) roomResult = { name: account, ok: true, skipped: true, paused: true, channelId: rotation.accountTargets?.[account] || null };
+    if (isRotationCurrent()) {
+      recordTaskResult(rotation, roomResult);
+      rotation.lastResults = [roomResult];
+      rotation.initializing = false;
+      rotation.running = false;
+      rotation.nextAt = Date.now() + rotation.intervalMs;
+    }
 
     // nextStateIndex randomizes the initial state and each subsequent state,
     // avoiding repeats until every configured state has been used once.
-    const initialStateIndex = nextStateIndex(states, []);
-    const stateResult = await withResultRetry(() => withAccountLock(account, () => executeStateForAccount(account, cycle, states[initialStateIndex], cycle.runToken)));
-    if (!isCurrentSetup()) return { ok: false, error: 'تم استبدال هذه المهمة بأمر rot أحدث' };
-    if (!stateResult.ok) throw new Error(stateResult.error || 'تعذر تطبيق أول حالة صوتية');
-    recordSuccessfulCycleState(cycle, account, initialStateIndex, true);
-    cycle.currentIdx = initialStateIndex;
-    recordTaskResult(cycle, stateResult);
-    cycle.lastResults = [stateResult];
-    cycle.running = false;
-    cycle.nextAt = Date.now() + cycle.intervalMs;
+    let stateResult = { name: account, ok: true, skipped: true, paused: true };
+    if (isCycleCurrent() && !rotationAccountPaused(cycle, account)) {
+      const initialStateIndex = nextStateIndex(states, []);
+      stateResult = await withResultRetry(() => withAccountLock(account, () => executeStateForAccount(account, cycle, states[initialStateIndex], cycle.runToken)));
+      if (abandonIfSuperseded()) return { ok: false, error: 'تم استبدال هذه المهمة بأمر rot أحدث' };
+      if (!stateResult.ok) {
+        if (rotationAccountPaused(cycle, account)) stateResult = { name: account, ok: true, skipped: true, paused: true };
+      } else {
+        recordSuccessfulCycleState(cycle, account, initialStateIndex, true);
+        cycle.currentIdx = initialStateIndex;
+      }
+    }
+    const initialStateOk = stateResult.ok;
+    if (isCycleCurrent()) {
+      recordTaskResult(cycle, stateResult);
+      cycle.lastResults = [stateResult];
+      cycle.running = false;
+      cycle.nextAt = Date.now() + cycle.intervalMs;
+      cycle.initializing = false;
+    }
 
-    rotation.timer = setInterval(async () => {
+    if (isRotationCurrent()) rotation.timer = setInterval(async () => {
       if (!rotation.active || rotation.running || rotationAccountPaused(rotation, account)) return;
       rotation.running = true;
       rotation.currentIdx = (rotation.currentIdx + 1) % rotation.channels.length;
@@ -1253,7 +1283,7 @@ async function startDiscordAccountRotation(client, message, account, rawIds) {
         rotation.running = false;
       }
     }, rotation.intervalMs);
-    rotation.timer.unref?.();
+    rotation.timer?.unref?.();
 
     const runCycle = async () => {
       if (!cycle.active) return;
@@ -1289,12 +1319,15 @@ async function startDiscordAccountRotation(client, message, account, rawIds) {
         }
       }
     };
-    cycle.timer = setTimeout(runCycle, cycle.intervalMs);
-    cycle.timer.unref?.();
+    if (isCycleCurrent()) {
+      cycle.timer = setTimeout(runCycle, cycle.intervalMs);
+      cycle.timer.unref?.();
+    }
     persistAutomationTasks();
-    emitLive('task.initialized', { id: rotation.id, taskType: 'rotation', nextAt: rotation.nextAt, results: rotation.lastResults });
-    emitLive('task.initialized', { id: cycle.id, taskType: 'cycle', nextAt: cycle.nextAt, results: cycle.lastResults });
-    return { ok: true, rotationId: rotation.id, stateCycleId: cycle.id, channels: rooms };
+    if (isRotationCurrent()) emitLive('task.initialized', { id: rotation.id, taskType: 'rotation', nextAt: rotation.nextAt, results: rotation.lastResults });
+    if (isCycleCurrent()) emitLive('task.initialized', { id: cycle.id, taskType: 'cycle', nextAt: cycle.nextAt, results: cycle.lastResults });
+    const initialSetupOk = initialStateOk && (isRotationCurrent() || isCycleCurrent());
+    return { ok: initialSetupOk, error: initialSetupOk ? undefined : (stateResult.error || 'تعذر إكمال تهيئة التدوير'), rotationId: isRotationCurrent() ? rotation.id : undefined, stateCycleId: isCycleCurrent() ? cycle.id : undefined, channels: rooms };
   } catch (error) {
     removeAccountFromAutomationTasks(account, ['rotation', 'cycle'], [rotation.id, cycle.id]);
     logMediaEvent('error', 'automation.discord_rot_setup_failed', { account, guildId, error: error.message });
@@ -1372,14 +1405,24 @@ async function handlePlayingDiscordCommand(client, message) {
     } else if (command === 'off') {
       accepted = [...rotationTasks, ...cycleTasks].every((task) => setRotationAccountPaused(task, rotationAccount, true).ok);
     } else {
-      for (const task of cycleTasks) {
-        if (rotationAccountPaused(task, rotationAccount)) setRotationAccountPaused(task, rotationAccount, false);
-      }
       let result = { ok: true };
-      if (rotationTasks.length && rotationAccountPaused(rotationTasks[0], rotationAccount)) {
-        result = await resumeRotationAccount(rotationTasks[0], rotationAccount);
+      const rotationTask = rotationTasks[0];
+      const wasRotationPaused = rotationTask && rotationAccountPaused(rotationTask, rotationAccount);
+      if (wasRotationPaused) result = await resumeRotationAccount(rotationTask, rotationAccount);
+      const rotationStillCurrent = !rotationTask || rotations.get(rotationTask.id) === rotationTask;
+      const rotationRemainsResumed = !rotationTask || !rotationAccountPaused(rotationTask, rotationAccount);
+      accepted = rotationStillCurrent && rotationRemainsResumed && result.ok && (!result.move || result.move.ok === true);
+      if (!accepted && wasRotationPaused && rotationStillCurrent && !rotationAccountPaused(rotationTask, rotationAccount)) {
+        // Do not leave the room task half-resumed when its immediate move fails.
+        setRotationAccountPaused(rotationTask, rotationAccount, true);
       }
-      accepted = result.ok && (!result.move || result.move.ok === true);
+      if (accepted) {
+        for (const task of cycleTasks) {
+          if (stateCycles.get(task.id) === task && rotationAccountPaused(task, rotationAccount)) {
+            setRotationAccountPaused(task, rotationAccount, false);
+          }
+        }
+      }
     }
   } else {
     if (command === 'start') startAllPlayingSessions();
@@ -2985,8 +3028,15 @@ function buildClientSnapshots() {
   return [...clients.entries()].map(([name, entry]) => {
     const user = entry.client?.user;
     const savedVoice = sessionByName.get(name) || null;
-    const actualVoice = entry.client ? readGatewayVoiceState(entry.client, savedVoice?.guildId || '') || null : null;
-    const voice = actualVoice?.channelId ? { ...(savedVoice || {}), ...actualVoice, name } : savedVoice;
+    const guilds = [...(entry.client?.guilds?.cache?.values?.() || [])];
+    const actualVoice = guilds.map((guild) => readGatewayVoiceState(entry.client, guild.id)).find((voice) => voice?.channelId) || null;
+    const savedGuildVoice = savedVoice && entry.client ? readGatewayVoiceState(entry.client, savedVoice.guildId) : null;
+    // A cached VoiceState with channelId=null is authoritative: do not display
+    // the last persisted room as though the account were still connected.
+    // If the account joined another guild, prefer that active state instead.
+    const voice = actualVoice
+      ? { ...(savedVoice || {}), ...actualVoice, name }
+      : savedVoice && savedGuildVoice && !savedGuildVoice.channelId ? null : savedVoice;
     const guild = voice && entry.client ? entry.client.guilds?.cache?.get?.(voice.guildId) : null;
     const member = guild?.members?.cache?.get?.(user?.id);
     const channel = voice ? guild?.channels?.cache?.get?.(voice.channelId) : null;
@@ -4404,7 +4454,7 @@ async function restoreAutomationTasks() {
     if (!item.id || !item.guildId || !Array.isArray(item.channels) || item.channels.length < 2) continue;
     const accounts = cleanAccounts(item.accounts).filter((name) => !taskAccountConflicts([name], item.guildId, 'rotation').length);
     if (!accounts.length) continue;
-    const task = { ...item, type: 'rotation', accounts, pausedAccounts: [...new Set((Array.isArray(item.pausedAccounts) ? item.pausedAccounts : []).filter((name) => accounts.includes(name)))], accountTargets: { ...(item.accountTargets || {}) }, running: false, active: true, intervalMs: Math.max(1000, Number(item.intervalMs || 60000)), nextAt: Number(item.nextAt || Date.now() + Number(item.intervalMs || 60000)) };
+    const task = { ...item, type: 'rotation', accounts, pausedAccounts: [...new Set((Array.isArray(item.pausedAccounts) ? item.pausedAccounts : []).filter((name) => accounts.includes(name)))], accountTargets: { ...(item.accountTargets || {}) }, initializing: false, running: false, active: true, intervalMs: Math.max(1000, Number(item.intervalMs || 60000)), nextAt: Number(item.nextAt || Date.now() + Number(item.intervalMs || 60000)) };
     const runRotation = async () => {
       if (!task.active) return;
       if (task.nextAt > Date.now()) { task.timer = setTimeout(runRotation, task.nextAt - Date.now()); return; }
@@ -4444,7 +4494,7 @@ async function restoreAutomationTasks() {
     const currentStateIdx = Number.isInteger(Number(item.currentStateIdx)) && Number(item.currentStateIdx) >= 0 && Number(item.currentStateIdx) < item.states.length
       ? Number(item.currentStateIdx)
       : Number.isInteger(legacyIndex) && legacyIndex >= 0 && legacyIndex < item.states.length ? legacyIndex : 0;
-    const task = { ...item, type: 'cycle', accounts, pausedAccounts: [...new Set((Array.isArray(item.pausedAccounts) ? item.pausedAccounts : []).filter((name) => accounts.includes(name)))], currentStateIdx, accountStateIdx: { ...(item.accountStateIdx || {}) }, stateHistory: { ...(item.stateHistory || {}) }, runToken: Number(item.runToken || 0), running: false, addingAccounts: false, active: true, intervalMs: Math.max(1000, Number(item.intervalMs || 300000)), nextAt: Number(item.nextAt || Date.now() + Number(item.intervalMs || 300000)) };
+    const task = { ...item, type: 'cycle', accounts, pausedAccounts: [...new Set((Array.isArray(item.pausedAccounts) ? item.pausedAccounts : []).filter((name) => accounts.includes(name)))], currentStateIdx, accountStateIdx: { ...(item.accountStateIdx || {}) }, stateHistory: { ...(item.stateHistory || {}) }, runToken: Number(item.runToken || 0), initializing: false, running: false, addingAccounts: false, active: true, intervalMs: Math.max(1000, Number(item.intervalMs || 300000)), nextAt: Number(item.nextAt || Date.now() + Number(item.intervalMs || 300000)) };
     const runStateCycle = async () => {
       if (!task.active) return;
       if (task.nextAt > Date.now()) { task.timer = setTimeout(runStateCycle, task.nextAt - Date.now()); return; }
@@ -4505,4 +4555,4 @@ if (require.main === module) {
   process.once('SIGINT', () => { persistBeforeExit(); process.exit(0); });
 }
 
-module.exports = { app, clients, voiceSessions, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, compactStateHistory, recordSuccessfulCycleState, getRateLimitBucket, pruneRateLimitBuckets, reserveAccountConnectSlots, releaseAccountConnectSlots, playingSessions, stopPlayingSession, schedulePlaying, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, parseRotationChannelIds, startDiscordAccountRotation, removeAccountFromAutomationTasks, rotationTasksForAccount, rotationAccountPaused, setRotationAccountPaused, resumeRotationAccount, rotationControlledAccounts, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, hardenVoiceConnection, cleanupPrimaryStreamAttempt, guardVoiceWebSocketTeardown, safeErrorSummary, buildAccountSnapshot, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, registerAccountStreamer, mediaStreamers, mediaQueueSnapshot, ensureSyntheticVideo, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, isCaptchaChallengeError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanAccountRecords, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, projectGatewayVoiceState, buildVoiceGuildCatalog, buildPlayingChannelCatalog, invalidateVoiceGuildCatalog, scheduleCatalogEvent, liveEvents, isRecoverableDiscordInteractionError };
+module.exports = { app, clients, voiceSessions, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, compactStateHistory, recordSuccessfulCycleState, getRateLimitBucket, pruneRateLimitBuckets, reserveAccountConnectSlots, releaseAccountConnectSlots, playingSessions, stopPlayingSession, schedulePlaying, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, parseRotationChannelIds, startDiscordAccountRotation, removeAccountFromAutomationTasks, rotationTasksForAccount, rotationAccountPaused, setRotationAccountPaused, resumeRotationAccount, rotationControlledAccounts, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, hardenVoiceConnection, cleanupPrimaryStreamAttempt, guardVoiceWebSocketTeardown, safeErrorSummary, buildAccountSnapshot, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, registerAccountStreamer, mediaStreamers, mediaQueueSnapshot, ensureSyntheticVideo, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, isCaptchaChallengeError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanAccountRecords, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, projectGatewayVoiceState, buildClientSnapshots, buildVoiceGuildCatalog, buildPlayingChannelCatalog, invalidateVoiceGuildCatalog, scheduleCatalogEvent, liveEvents, isRecoverableDiscordInteractionError };
