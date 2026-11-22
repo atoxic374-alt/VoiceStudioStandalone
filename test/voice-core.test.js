@@ -1,6 +1,9 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, recordSuccessfulCycleState, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, registerAccountStreamer, mediaStreamers, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, schedulePlaying, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, cleanAccountRecords, buildAccountSnapshot, safeErrorSummary, guardVoiceWebSocketTeardown, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, isCaptchaChallengeError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanupPrimaryStreamAttempt, isRecoverableDiscordInteractionError, parseRotationChannelIds, removeAccountFromAutomationTasks } = require('../server');
 const VoiceWebSocket = require('discord.js-selfbot-v13/src/client/voice/networking/VoiceWebSocket');
 
@@ -84,6 +87,21 @@ test('cleans saved account records before they can affect the account count', ()
     { name: 'Alpha', token: 'token-a' },
     { name: 'Gamma', token: 'token-c' },
   ]);
+});
+
+test('writes account names and plaintext tokens to a restricted JSON mirror', () => {
+  const { saveReadableAccountJson } = require('../server');
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-studio-account-json-'));
+  const file = path.join(directory, 'accounts.json');
+  try {
+    saveReadableAccountJson([{ name: 'Mirror Account', token: 'example-token', savedAt: 123 }], file);
+    assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), [
+      { name: 'Mirror Account', token: 'example-token', savedAt: 123 },
+    ]);
+    assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test('treats each rotation item as one exclusive voice mode', () => {

@@ -70,6 +70,7 @@ function resolveDataFile(fileName) {
   return path.join(DATA_DIR, fileName);
 }
 const ACCOUNT_FILE = path.join(DATA_DIR, 'accounts.enc');
+const ACCOUNT_JSON_FILE = path.join(DATA_DIR, 'accounts.json');
 const ACTIVE_TOKENS_FILE = path.join(DATA_DIR, 'active-tokens.json');
 const FAILED_TOKENS_FILE = path.join(DATA_DIR, 'failed-tokens.json');
 const VOICE_STATE_FILE = path.join(DATA_DIR, 'voice-sessions.json');
@@ -295,6 +296,14 @@ function saveAccountSnapshot(file, records) {
   fs.renameSync(temp, file);
   try { fs.chmodSync(file, 0o600); } catch {}
 }
+function saveReadableAccountJson(records, file = ACCOUNT_JSON_FILE) {
+  const cleanRecords = cleanAccountRecords(records);
+  const temp = `${file}.tmp`;
+  fs.writeFileSync(temp, JSON.stringify(cleanRecords, null, 2) + '\n', { mode: 0o600 });
+  try { fs.chmodSync(temp, 0o600); } catch {}
+  fs.renameSync(temp, file);
+  try { fs.chmodSync(file, 0o600); } catch {}
+}
 function buildAccountSnapshot(records, defaultStatus = 'unknown') {
   const result = [];
   const seenNames = new Set();
@@ -370,6 +379,7 @@ function loadAccounts() {
   if (validFiles) {
     const records = cleanAccountRecords(recordsFromFiles);
     if (requiresMigration || validFiles > 1) saveAccounts(records);
+    try { saveReadableAccountJson(records); } catch (error) { console.warn('[accounts] unable to update readable account JSON:', error.message); }
     console.log(`[accounts] loaded ${records.length} saved account${records.length === 1 ? '' : 's'} from ${validFiles} compatible encrypted file${validFiles === 1 ? '' : 's'}`);
     return records;
   }
@@ -383,6 +393,7 @@ function persistConnectedAccounts() {
     const records = cleanAccountRecords([...merged.values()]);
     savedAccountRecords = new Map(records.map((item) => [item.name, item]));
     saveAccounts(records);
+    try { saveReadableAccountJson(records); } catch (error) { console.warn('[accounts] unable to update readable account JSON:', error.message); }
     persistAccountSnapshots();
   }
   catch (error) { console.warn('[accounts] unable to persist encrypted account file:', error.message); }
@@ -4560,4 +4571,4 @@ if (require.main === module) {
   process.once('SIGINT', () => { persistBeforeExit(); process.exit(0); });
 }
 
-module.exports = { app, clients, accountLimit: limit, parseAccountLimit, voiceSessions, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, compactStateHistory, recordSuccessfulCycleState, getRateLimitBucket, pruneRateLimitBuckets, reserveAccountConnectSlots, releaseAccountConnectSlots, playingSessions, stopPlayingSession, schedulePlaying, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, parseRotationChannelIds, startDiscordAccountRotation, removeAccountFromAutomationTasks, rotationTasksForAccount, rotationAccountPaused, setRotationAccountPaused, resumeRotationAccount, rotationControlledAccounts, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, hardenVoiceConnection, cleanupPrimaryStreamAttempt, guardVoiceWebSocketTeardown, safeErrorSummary, buildAccountSnapshot, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, registerAccountStreamer, mediaStreamers, mediaQueueSnapshot, ensureSyntheticVideo, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, isCaptchaChallengeError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanAccountRecords, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, projectGatewayVoiceState, buildClientSnapshots, buildVoiceGuildCatalog, buildPlayingChannelCatalog, invalidateVoiceGuildCatalog, scheduleCatalogEvent, liveEvents, isRecoverableDiscordInteractionError };
+module.exports = { app, clients, accountLimit: limit, parseAccountLimit, voiceSessions, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, compactStateHistory, recordSuccessfulCycleState, getRateLimitBucket, pruneRateLimitBuckets, reserveAccountConnectSlots, releaseAccountConnectSlots, playingSessions, stopPlayingSession, schedulePlaying, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, parseRotationChannelIds, startDiscordAccountRotation, removeAccountFromAutomationTasks, rotationTasksForAccount, rotationAccountPaused, setRotationAccountPaused, resumeRotationAccount, rotationControlledAccounts, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, hardenVoiceConnection, cleanupPrimaryStreamAttempt, guardVoiceWebSocketTeardown, safeErrorSummary, buildAccountSnapshot, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, registerAccountStreamer, mediaStreamers, mediaQueueSnapshot, ensureSyntheticVideo, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, isCaptchaChallengeError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanAccountRecords, saveReadableAccountJson, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, projectGatewayVoiceState, buildClientSnapshots, buildVoiceGuildCatalog, buildPlayingChannelCatalog, invalidateVoiceGuildCatalog, scheduleCatalogEvent, liveEvents, isRecoverableDiscordInteractionError };
