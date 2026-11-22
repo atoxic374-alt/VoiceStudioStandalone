@@ -79,6 +79,7 @@ const PLAYING_FILE = path.join(DATA_DIR, 'playing-sessions.json');
 const PLAYING_LOG_FILE = path.join(DATA_DIR, 'playing-events.log');
 const CLIENT_BIND_FILE = path.join(DATA_DIR, 'client-binding.json');
 const MEDIA_LOG_FILE = path.join(DATA_DIR, 'media-events.log');
+const MEDIA_RETRY_STATE_FILE = path.join(DATA_DIR, 'media-retry-state.json');
 const PORTABLE_BACKUP_FILE = path.join(DATA_DIR, 'voice-studio-portable-backup.json');
 const PORTABLE_BACKUP_MARKER = path.join(DATA_DIR, '.voice-studio-portable-backup-applied');
 fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -489,6 +490,10 @@ const MEDIA_SETTLE_DELAY_MS = 4000;
 const MEDIA_JOIN_TIMEOUT_MS = Math.max(10000, Number(process.env.MEDIA_JOIN_TIMEOUT_MS || 20000));
 const MEDIA_WEBRTC_TIMEOUT_MS = Math.max(6000, Number(process.env.MEDIA_WEBRTC_TIMEOUT_MS || 10000));
 const MEDIA_STREAM_TIMEOUT_MS = Math.max(12000, Number(process.env.MEDIA_STREAM_TIMEOUT_MS || 20000));
+const MEDIA_FAILURE_COOLDOWN_BASE_MS = 30_000;
+const MEDIA_FAILURE_COOLDOWN_MAX_MS = 5 * 60 * 1000;
+const MEDIA_CIRCUIT_FAILURE_THRESHOLD = 5;
+const MEDIA_CIRCUIT_OPEN_MS = 15 * 60 * 1000;
 // Saved accounts are all restored, but only a small number connect at once.
 // This keeps 50+ accounts possible without opening every Gateway session at
 // the same instant. REST preflight avoids sessions for revoked tokens.
@@ -1578,28 +1583,91 @@ function summary(results) {
 }
 function retryableError(error) {
   const text = String(error?.error || error?.message || '').toLowerCase();
-  // Cooldown means wait, not retry; otherwise each cycle adds duplicate requests.
-  if (error?.cooldown === true || Number(error?.retryAfterMs) > 0 || /cooling down|retry in\s+\d+\s+seconds/.test(text)) return false;
-  return /timeout|timed out|did not confirm|gateway not ready|no active gateway|web.?rtc|media transport|temporar|rate.?limit|connection|socket|network|live voice target changed|voice state mismatch/.test(text);
+  if (isHardMediaFailure(error) || isRateLimitFailure(error) || error?.cooldown === true || error?.blocked === true || /cooling down|retry in\s+\d+\s+seconds/.test(text)) return false;
+  return /timeout|timed out|did not confirm|gateway not ready|no active gateway|web.?rtc|media transport|temporar|connection|socket|network|live voice target changed|voice state mismatch|transport failed/.test(text);
+}
+function retryAfterValueMs(value, unit = 'seconds') {
+  if (value === undefined || value === null || value === '') return 0;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric > 0) return Math.ceil(numeric * (unit === 'milliseconds' ? 1 : 1000));
+  const dateMs = Date.parse(String(value));
+  return Number.isFinite(dateMs) ? Math.max(0, dateMs - Date.now()) : 0;
+}
+function discordRetryAfterMs(error) {
+  const headers = error?.response?.headers || error?.headers;
+  const header = headers?.get?.('retry-after')
+    ?? headers?.['retry-after']
+    ?? Object.entries(headers || {}).find(([key]) => String(key).toLowerCase() === 'retry-after')?.[1];
+  const candidates = [
+    [error?.retryAfterMs, 'milliseconds'],
+    [error?.retry_after_ms, 'milliseconds'],
+    [error?.timeout, 'milliseconds'],
+    [error?.retryAfter, 'milliseconds'],
+    [error?.retry_after, 'seconds'],
+    [error?.rawError?.retry_after, 'seconds'],
+    [error?.data?.retry_after, 'seconds'],
+    [error?.response?.data?.retry_after, 'seconds'],
+    [header, 'seconds'],
+  ];
+  for (const [value, unit] of candidates) {
+    const parsed = retryAfterValueMs(value, unit);
+    if (parsed > 0) return parsed;
+  }
+  return 0;
+}
+function isRateLimitFailure(error) {
+  const status = Number(error?.status || error?.statusCode || error?.httpStatus || error?.response?.status || 0);
+  const text = String(error?.error || error?.message || error || '').toLowerCase();
+  return error?.rateLimited === true || status === 429 || discordRetryAfterMs(error) > 0 || /rate.?limit|too many requests|http.?429|\b429\b/.test(text);
+}
+function isHardMediaFailure(error) {
+  const status = Number(error?.status || error?.statusCode || error?.httpStatus || error?.response?.status || 0);
+  const code = Number(error?.code || error?.rawError?.code || 0);
+  const text = String(error?.error || error?.message || error || '').toLowerCase();
+  return error?.permanent === true
+    || isCaptchaChallengeError(error)
+    || isInvalidCredentialError(error)
+    || status === 401
+    || status === 403
+    || code === 50001
+    || code === 50013
+    || /missing (?:stream )?permission|permission denied|missing access|not authorized|forbidden|invalid channel|selected channel is not a voice channel/.test(text);
+}
+function failureResultFromError(error) {
+  const result = { ok: false, error: error?.error || error?.message || String(error || 'Media transport failed') };
+  const status = Number(error?.status || error?.statusCode || error?.httpStatus || error?.response?.status || 0);
+  const code = error?.code ?? error?.rawError?.code;
+  const retryAfterMs = discordRetryAfterMs(error);
+  if (status) result.status = status;
+  if (code !== undefined && code !== null) result.code = code;
+  if (retryAfterMs > 0) result.retryAfterMs = retryAfterMs;
+  if (isRateLimitFailure(error)) result.rateLimited = true;
+  if (isHardMediaFailure(error)) result.permanent = true;
+  return result;
+}
+function retryDelayWithJitter(attempt, baseMs = 1000, maxMs = 60_000, random = Math.random) {
+  const ceiling = Math.min(maxMs, baseMs * (2 ** Math.max(0, Number(attempt) || 0)));
+  return Math.max(1, Math.floor(ceiling * (0.5 + Math.max(0, Math.min(1, Number(random()) || 0)) * 0.5)));
 }
 function isInvalidCredentialError(error) {
   const status = Number(error?.status || error?.statusCode || 0);
   const code = Number(error?.code || 0);
-  const text = String(error?.error || error?.message || '').toLowerCase();
+  const text = String(error?.error || error?.message || error || '').toLowerCase();
   return status === 401 || code === 40001 || code === 4004 || /invalid token|improper token|token is invalid|incorrect login details/.test(text);
 }
 function isCaptchaChallengeError(error) {
   const code = String(error?.code || '').toUpperCase();
-  const text = String(error?.error || error?.message || '').toLowerCase();
+  const text = String(error?.error || error?.message || error || '').toLowerCase();
   return code.includes('CAPTCHA_SOLVER_NOT_IMPLEMENTED') || /captcha|human verification required/.test(text);
 }
 async function withResultRetry(worker, maxRetries = 2) {
   let last = null;
   for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
-    try { last = await worker(attempt); } catch (error) { last = { ok: false, error: error?.message || String(error) }; }
+    try { last = await worker(attempt); } catch (error) { last = failureResultFromError(error); }
     if (last?.ok === true || !retryableError(last)) return { ...last, attempts: attempt + 1, retries: attempt };
     if (attempt < maxRetries) {
-      const retryDelay = retryableError(last) && /web.?rtc|media transport/i.test(String(last?.error || '')) ? 1000 * (2 ** attempt) : 250 * (2 ** attempt);
+      const isWebRtcFailure = /web.?rtc|media transport/i.test(String(last?.error || ''));
+      const retryDelay = retryDelayWithJitter(attempt, isWebRtcFailure ? 1000 : 250, isWebRtcFailure ? 30_000 : 4000);
       await new Promise((resolve) => setTimeout(resolve, retryDelay));
     }
   }
@@ -1745,11 +1813,17 @@ function stopSyntheticStream(name, { leaveVoice = false, silent = false, invalid
 }
 function scheduleMediaRecovery(name, target, reason) {
   if (!target || pendingMediaRestarts.has(name)) return;
+  const failureState = primaryMediaFailureForTarget(name, target.guildId, target.channelId, target.mediaKind);
+  if (failureState?.blockedReason) {
+    logMediaEvent('warn', 'media.restart_suppressed', { account: name, guildId: target.guildId, channelId: target.channelId, mediaKind: target.mediaKind, reason: failureState.blockedReason });
+    return;
+  }
   const scheduledGeneration = Number(mediaRunGenerations.get(name) || 0);
   const attempts = Number(mediaRestartAttempts.get(name) || 0) + 1;
   mediaRestartAttempts.set(name, attempts);
   const cooldownMs = primaryMediaRetryAfterMs(name, target.guildId, target.channelId, target.mediaKind);
-  const delayMs = Math.max(cooldownMs, Math.min(5 * 60 * 1000, 1000 * (2 ** Math.min(attempts - 1, 8))));
+  const backoffMs = retryDelayWithJitter(Math.min(attempts - 1, 8), 1000, MEDIA_FAILURE_COOLDOWN_MAX_MS);
+  const delayMs = Math.max(cooldownMs, backoffMs);
   logMediaEvent('warn', 'media.restart_scheduled', { account: name, guildId: target.guildId, channelId: target.channelId, mediaKind: target.mediaKind, reason, attempts, delayMs });
   const restartTimer = setTimeout(async () => {
     pendingMediaRestarts.delete(name);
@@ -1775,7 +1849,7 @@ function scheduleMediaRecovery(name, target, reason) {
           scheduleMediaRecovery(name, target, reason);
           return;
         }
-        if (primaryMediaTransportIsActive(name, target.guildId, target.channelId, target.mediaKind)) return;
+        if (mediaTransportReadyForTarget(name, target.guildId, target.channelId, target.mediaKind)) return;
         const requested = { ...current, ...(observed || {}), ...(target.desiredState || {}), ...expected };
         mediaDesired.set(name, { guildId: target.guildId, channelId: target.channelId, mediaKind: target.mediaKind });
         const result = await startSyntheticStream(name, target.guildId, target.mediaKind, requested);
@@ -1804,9 +1878,10 @@ function scheduleMediaRecovery(name, target, reason) {
   }, delayMs);
   pendingMediaRestarts.set(name, restartTimer);
 }
-function scheduleMediaRestart(name, active, reason) {
+function scheduleMediaRestart(name, active, reason, error = reason) {
   if (!active || active.restarting || pendingMediaRestarts.has(name)) return;
   active.restarting = true;
+  recordPrimaryMediaFailure(name, active.guildId, active.channelId, active.mediaKind, error || reason || 'Media transport ended unexpectedly');
   scheduleMediaRecovery(name, {
     guildId: active.guildId,
     channelId: active.channelId,
@@ -1977,23 +2052,133 @@ function installVoiceWebSocketTeardownGuard() {
   }
 }
 installVoiceWebSocketTeardownGuard();
+function persistPrimaryMediaFailures() {
+  const entries = [...primaryMediaFailures.entries()].map(([name, state]) => [String(name), {
+    guildId: String(state.guildId),
+    channelId: String(state.channelId),
+    mediaKind: state.mediaKind,
+    attempts: Number(state.attempts) || 1,
+    retryAt: Number(state.retryAt) || 0,
+    circuitOpenUntil: Number(state.circuitOpenUntil) || 0,
+    blockedReason: state.blockedReason ? redact(state.blockedReason).slice(0, 300) : null,
+    lastError: state.lastError ? redact(state.lastError).slice(0, 500) : null,
+    updatedAt: Number(state.updatedAt) || Date.now(),
+  }]);
+  if (!entries.length) {
+    try { fs.rmSync(MEDIA_RETRY_STATE_FILE, { force: true }); } catch (error) { console.warn('[media-retry] unable to remove empty state file:', error.message); }
+    return;
+  }
+  const temp = `${MEDIA_RETRY_STATE_FILE}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(temp, JSON.stringify({ version: 1, entries }), { mode: 0o600 });
+    fs.renameSync(temp, MEDIA_RETRY_STATE_FILE);
+  } catch (error) {
+    try { fs.rmSync(temp, { force: true }); } catch {}
+    console.warn('[media-retry] unable to persist retry state:', error.message);
+  }
+}
+function loadPrimaryMediaFailures() {
+  try {
+    const saved = JSON.parse(fs.readFileSync(MEDIA_RETRY_STATE_FILE, 'utf8'));
+    const entries = Array.isArray(saved?.entries) ? saved.entries : [];
+    for (const entry of entries) {
+      if (!Array.isArray(entry) || entry.length < 2) continue;
+      const [rawName, rawState] = entry;
+      const name = String(rawName || '').trim();
+      const state = rawState || {};
+      if (!name || !state.guildId || !state.channelId || !['camera', 'go-live'].includes(state.mediaKind)) continue;
+      const attempts = Number(state.attempts);
+      if (!Number.isFinite(attempts) || attempts < 1) continue;
+      primaryMediaFailures.set(name, {
+        guildId: String(state.guildId),
+        channelId: String(state.channelId),
+        mediaKind: state.mediaKind,
+        attempts: Math.floor(attempts),
+        retryAt: Math.max(0, Number(state.retryAt) || 0),
+        circuitOpenUntil: Math.max(0, Number(state.circuitOpenUntil) || 0),
+        blockedReason: state.blockedReason ? redact(state.blockedReason).slice(0, 300) : null,
+        lastError: state.lastError ? redact(state.lastError).slice(0, 500) : null,
+        updatedAt: Number(state.updatedAt) || Date.now(),
+      });
+    }
+  } catch (error) {
+    if (error.code !== 'ENOENT') console.warn('[media-retry] unable to restore retry state:', error.message);
+  }
+  return primaryMediaFailures.size;
+}
+function clearPrimaryMediaFailure(name) {
+  const removed = primaryMediaFailures.delete(String(name));
+  if (removed) {
+    persistPrimaryMediaFailures();
+    mediaRestartAttempts.delete(String(name));
+  }
+  return removed;
+}
+function primaryMediaFailureForTarget(name, guildId, channelId, mediaKind) {
+  const previous = primaryMediaFailures.get(String(name));
+  if (!previous) return null;
+  if (String(previous.guildId) !== String(guildId) || String(previous.channelId) !== String(channelId) || previous.mediaKind !== mediaKind) {
+    // A changed room or media mode is a new target; do not carry its breaker
+    // into an unrelated handshake.
+    clearPrimaryMediaFailure(name);
+    return null;
+  }
+  return previous;
+}
 function primaryMediaRetryError(name, guildId, channelId, mediaKind) {
-  const previous = primaryMediaFailures.get(name);
-  if (!previous || previous.guildId !== guildId || previous.channelId !== channelId || previous.mediaKind !== mediaKind || previous.retryAt <= Date.now()) return null;
-  return `Media transport is cooling down after a failed Discord handshake; retry in ${Math.ceil((previous.retryAt - Date.now()) / 1000)} seconds`;
+  const previous = primaryMediaFailureForTarget(name, guildId, channelId, mediaKind);
+  if (!previous) return null;
+  if (previous.blockedReason) return `Automatic media recovery is paused: ${previous.blockedReason}. Correct the issue and issue a manual voice-state operation to retry.`;
+  const retryAt = Math.max(Number(previous.retryAt) || 0, Number(previous.circuitOpenUntil) || 0);
+  if (retryAt <= Date.now()) return null;
+  const seconds = Math.ceil((retryAt - Date.now()) / 1000);
+  return previous.circuitOpenUntil > Date.now()
+    ? `Media circuit breaker is open after repeated failures; retry in ${seconds} seconds`
+    : `Media transport is cooling down after a failed Discord handshake; retry in ${seconds} seconds`;
 }
 function primaryMediaRetryAfterMs(name, guildId, channelId, mediaKind) {
-  const previous = primaryMediaFailures.get(name);
-  if (!previous || previous.guildId !== guildId || previous.channelId !== channelId || previous.mediaKind !== mediaKind) return 0;
-  return Math.max(0, previous.retryAt - Date.now());
+  const previous = primaryMediaFailureForTarget(name, guildId, channelId, mediaKind);
+  if (!previous || previous.blockedReason) return 0;
+  return Math.max(0, Math.max(Number(previous.retryAt) || 0, Number(previous.circuitOpenUntil) || 0) - Date.now());
 }
 function recordPrimaryMediaFailure(name, guildId, channelId, mediaKind, error) {
-  const previous = primaryMediaFailures.get(name);
-  const attempts = previous?.guildId === guildId && previous?.channelId === channelId && previous?.mediaKind === mediaKind ? previous.attempts + 1 : 1;
-  const delayMs = Math.min(5 * 60 * 1000, 30_000 * (2 ** (attempts - 1)));
-  primaryMediaFailures.set(name, { guildId, channelId, mediaKind, attempts, retryAt: Date.now() + delayMs });
-  logMediaEvent('warn', 'media.primary_retry_delayed', { account: name, guildId, channelId, mediaKind, attempts, delayMs, error });
+  const normalized = failureResultFromError(error);
+  const previous = primaryMediaFailureForTarget(name, guildId, channelId, mediaKind);
+  const attempts = (previous?.attempts || 0) + 1;
+  const now = Date.now();
+  const permanent = normalized.permanent === true;
+  const rateLimited = normalized.rateLimited === true;
+  const ceiling = Math.min(MEDIA_FAILURE_COOLDOWN_MAX_MS, MEDIA_FAILURE_COOLDOWN_BASE_MS * (2 ** Math.min(attempts - 1, 12)));
+  const delayMs = rateLimited
+    ? Math.max(1000, normalized.retryAfterMs || MEDIA_FAILURE_COOLDOWN_BASE_MS)
+    : Math.min(MEDIA_FAILURE_COOLDOWN_MAX_MS, Math.round(ceiling * (0.75 + Math.random() * 0.5)));
+  const circuitOpenUntil = !permanent && !rateLimited && attempts >= MEDIA_CIRCUIT_FAILURE_THRESHOLD
+    ? now + MEDIA_CIRCUIT_OPEN_MS
+    : Number(previous?.circuitOpenUntil) > now ? Number(previous.circuitOpenUntil) : 0;
+  const blockedReason = permanent
+    ? isCaptchaChallengeError(error)
+      ? 'CAPTCHA or additional Discord verification is required'
+      : isInvalidCredentialError(error)
+        ? 'Discord rejected the account credential'
+        : 'Discord reported a permission or access error'
+    : null;
+  const state = {
+    guildId: String(guildId), channelId: String(channelId), mediaKind, attempts,
+    retryAt: permanent ? 0 : Math.max(now + delayMs, circuitOpenUntil),
+    circuitOpenUntil,
+    blockedReason,
+    lastError: redact(normalized.error || 'Media transport failed').slice(0, 500),
+    updatedAt: now,
+  };
+  primaryMediaFailures.set(String(name), state);
+  persistPrimaryMediaFailures();
+  logMediaEvent(permanent ? 'error' : 'warn', blockedReason ? 'media.automatic_recovery_paused' : circuitOpenUntil > now ? 'media.circuit_opened' : 'media.primary_retry_delayed', {
+    account: name, guildId, channelId, mediaKind, attempts, delayMs, retryAfterMs: normalized.retryAfterMs || 0,
+    circuitOpenUntil: circuitOpenUntil || null, blockedReason, error: state.lastError,
+  });
+  return state;
 }
+loadPrimaryMediaFailures();
 function withTimeout(promise, timeoutMs, message) {
   let timer;
   return Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), timeoutMs); })]).finally(() => clearTimeout(timer));
@@ -2187,17 +2372,39 @@ function waitForPrimaryVideoReady(connection, dispatcher, timeoutMs = 8000) {
     if (connection?.videoStatus === true) finish();
   });
 }
+async function resetFailedCameraState(client, connection, guildId, channelId, session = {}, dispatcher = null, confirmVoiceState = sendVoiceOpConfirmed) {
+  try { dispatcher?.destroy?.(); } catch {}
+  const current = readGatewayVoiceState(client, guildId);
+  if (!current?.channelId || String(current.channelId) !== String(channelId)) {
+    return { ok: false, cancelled: true, error: 'Camera cleanup skipped because the account moved from the failed voice room' };
+  }
+  try {
+    if (connection && String(voiceConnectionChannelId(connection) || '') === String(channelId)) connection.setVideoStatus?.(false);
+  } catch {}
+  try {
+    return await confirmVoiceState(client, guildId, channelId, {
+      selfMute: !!current.selfMute,
+      selfDeaf: false,
+      selfVideo: false,
+      selfStream: false,
+      confirmOmittedFalseFlags: ['selfVideo', 'selfStream'],
+    }, 3000);
+  } catch (error) {
+    return failureResultFromError(error);
+  }
+}
 async function loadVideoStreamModule() {
   videoStreamModulePromise ||= import('@dank074/discord-video-stream');
   return videoStreamModulePromise;
 }
-async function retryMediaTransportImmediately(run, maxAttempts = 2, context = {}) {
+async function retryMediaTransportImmediately(run, maxAttempts = 1, context = {}) {
   let last = { ok: false, error: 'Media transport failed' };
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try { last = await run(attempt); }
-    catch (error) { last = { ok: false, error: error?.message || String(error) }; }
-    if (last?.ok || last?.cancelled || attempt === maxAttempts) return { ...last, attempts: attempt };
+    catch (error) { last = failureResultFromError(error); }
+    if (last?.ok || last?.cancelled || isHardMediaFailure(last) || isRateLimitFailure(last) || !retryableError(last) || attempt === maxAttempts) return { ...last, attempts: attempt };
     logMediaEvent('warn', 'media.primary_retry_immediate', { ...context, attempt, nextAttempt: attempt + 1, error: last?.error || 'media start failed' });
+    await new Promise((resolve) => setTimeout(resolve, retryDelayWithJitter(attempt - 1, 1000, 5000)));
   }
   return { ...last, attempts: maxAttempts };
 }
@@ -2235,6 +2442,12 @@ function mediaWatchdogReadiness(session, client, active = syntheticStreams.get(s
     ? !!active.dispatcher && !active.dispatcher.destroyed && !active.dispatcher.writableEnded && !active.dispatcher.writableFinished
     : !!active?.sourceProcess && active.sourceProcess.exitCode === null && !active.sourceProcess.killed;
   return { expectedKind, primaryTransport, targetMatches, voiceReady, mediaReady, sourceReady };
+}
+function mediaTransportReadyForTarget(name, guildId, channelId, mediaKind, active = syntheticStreams.get(name), client = getClient(name)) {
+  if (!active) return false;
+  const session = { name, guildId, channelId, selfVideo: mediaKind === 'camera', selfStream: mediaKind === 'go-live' };
+  const readiness = mediaWatchdogReadiness(session, client, active);
+  return readiness.targetMatches && readiness.voiceReady && readiness.mediaReady && readiness.sourceReady;
 }
 async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live', isCurrent = () => true) {
   const client = getClient(name);
@@ -2278,7 +2491,7 @@ async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live',
         if (error) logMediaEvent('error', 'stream.runtime_failed', { account: name, guildId, channelId: session.channelId, error: error?.message || String(error) });
         stopSyntheticStream(name, { silent: true, preserveRestartState: true });
         active.restarting = false;
-        scheduleMediaRestart(name, active, reason);
+        scheduleMediaRestart(name, active, reason, error || reason);
       };
       dispatcher.on?.('error', (error) => restartPrimaryMedia('primary dispatcher failed', error));
       dispatcher.once?.('finish', () => restartPrimaryMedia('primary dispatcher finished'));
@@ -2293,26 +2506,32 @@ async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live',
       // media transport. Verify the live transport before tearing it down or
       // issuing another create/start that could stop the working stream.
       if (primaryMediaTransportIsActive(name, guildId, session.channelId, mediaKind)) {
-        primaryMediaFailures.delete(name);
+        clearPrimaryMediaFailure(name);
         logMediaEvent('warn', 'media.active_after_confirmation_timeout', { account: name, guildId, channelId: session.channelId, mediaKind, attempt, error: error?.message || String(error), transportVerified: true });
         return { ok: true, verifiedActive: true, stateConfirmed: false };
       }
-      // Clean up before the immediate retry so the next attempt cannot reuse
-      // a half-open StreamConnection or stale dispatcher.
-      if (syntheticStreams.get(name) === active) stopSyntheticStream(name, { silent: true, invalidate: false });
+      // Tear down the failed transport before the scheduler can create a fresh
+      // one. Camera uses the room's primary voice connection, so only its
+      // dispatcher/video flags are reset; the voice room and mute state survive.
+      const wasTracked = !!active && syntheticStreams.get(name) === active;
+      if (wasTracked) {
+        active.restarting = true;
+        stopSyntheticStream(name, { silent: true, invalidate: false });
+      }
       else {
-        try { dispatcher?.destroy?.(); } catch {}
-        if (mediaKind !== 'camera') cleanupPrimaryStreamAttempt(connection, streamConnection || pendingStreamConnection || connection.streamConnection);
+        if (mediaKind !== 'camera') {
+          try { dispatcher?.destroy?.(); } catch {}
+          cleanupPrimaryStreamAttempt(connection, streamConnection || pendingStreamConnection || connection.streamConnection);
+        }
+      }
+      if (mediaKind === 'camera') {
+        const reset = await resetFailedCameraState(client, connection, guildId, session.channelId, session, wasTracked ? null : dispatcher);
+        if (!reset?.ok) logMediaEvent('warn', 'media.camera_state_reset_unconfirmed', { account: name, guildId, channelId: session.channelId, error: reset?.error || 'Camera state reset was not confirmed' });
       }
       logMediaEvent('warn', 'media.primary_attempt_failed', { account: name, guildId, channelId: session.channelId, mediaKind, attempt, error: error?.message || String(error) });
-      return { ok: false, error: error?.message || 'Unable to start media transport' };
+      return failureResultFromError(error);
     }
-  }, 2, { account: name, guildId, channelId: session.channelId, mediaKind });
-  if (result.ok) primaryMediaFailures.delete(name);
-  else if (!result.cancelled) {
-    recordPrimaryMediaFailure(name, guildId, session.channelId, mediaKind, result.error);
-    result = { ...result, cooldown: true, retryAfterMs: primaryMediaRetryAfterMs(name, guildId, session.channelId, mediaKind) };
-  }
+  }, 1, { account: name, guildId, channelId: session.channelId, mediaKind });
   return result;
 }
 function voiceConnectionChannelId(connection) {
@@ -2374,7 +2593,7 @@ function processGlobalMediaStartQueue() {
     Promise.resolve().then(item.run).then((result) => {
       item.resolve(result || { ok: false, error: 'Global media start completed without a result' });
     }, (error) => {
-      item.resolve({ ok: false, error: error?.message || String(error) });
+      item.resolve(failureResultFromError(error));
     }).finally(() => {
       logMediaEvent('info', 'media.global_complete', { sequence: item.sequence, account: item.name, guildId: item.guildId, mediaKind: item.mediaKind, queueDepth: globalMediaStartQueue.length });
       globalMediaStartActive = null;
@@ -2407,20 +2626,38 @@ async function processMediaStartQueue(name) {
           result = await enqueueGlobalMediaStart(item, () => startSyntheticStreamUnqueued(item.name, item.guildId, item.mediaKind, item.desiredState, item.generation));
         }
       } catch (error) {
-        result = { ok: false, error: error?.message || String(error) };
+        result = failureResultFromError(error);
       } finally {
         logMediaEvent(result?.ok ? 'info' : 'warn', 'media.queue_complete', { sequence: item.sequence, account: item.name, guildId: item.guildId, mediaKind: item.mediaKind, ok: result?.ok === true, cancelled: result?.cancelled === true, durationMs: Date.now() - startedAt, queueDepth: queue.items.length, error: result?.ok ? undefined : result?.error });
-        if (!result?.ok && !result?.cancelled) {
+        if (result?.ok) {
+          clearPrimaryMediaFailure(item.name);
+          mediaRestartAttempts.delete(item.name);
+        } else if (!result?.cancelled) {
           const current = voiceSessions.get(sessionKey(item.name, item.guildId));
           const desiredState = { ...(current || {}), ...(item.desiredState || {}) };
           const channelId = desiredState.channelId || current?.channelId;
-          if (channelId && (desiredState.selfStream === true || desiredState.selfVideo === true)) {
-            scheduleMediaRecovery(item.name, {
-              guildId: item.guildId,
-              channelId,
-              mediaKind: item.mediaKind,
-              desiredState,
-            }, result.error || 'media start failed');
+          if (channelId && ['camera', 'go-live'].includes(item.mediaKind)) {
+            const failure = result.blocked
+              ? primaryMediaFailureForTarget(item.name, item.guildId, channelId, item.mediaKind)
+              : result.cooldown
+              ? primaryMediaFailureForTarget(item.name, item.guildId, channelId, item.mediaKind)
+              : recordPrimaryMediaFailure(item.name, item.guildId, channelId, item.mediaKind, result);
+            const blocked = result.blocked === true || !!failure?.blockedReason;
+            result = {
+              ...result,
+              cooldown: !blocked,
+              blocked,
+              automaticRetryPaused: blocked,
+              retryAfterMs: primaryMediaRetryAfterMs(item.name, item.guildId, channelId, item.mediaKind),
+            };
+            if (!blocked) {
+              scheduleMediaRecovery(item.name, {
+                guildId: item.guildId,
+                channelId,
+                mediaKind: item.mediaKind,
+                desiredState: { ...desiredState, selfVideo: item.mediaKind === 'camera', selfStream: item.mediaKind === 'go-live' },
+              }, result.error || 'media start failed');
+            }
           }
         }
         item.resolve(result || { ok: false, error: 'Media queue item completed without a result' });
@@ -2473,9 +2710,28 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
   if (!isCurrentRun()) return { ok: false, cancelled: true, error: 'Media start cancelled by a newer account operation' };
   if (!client || !session?.channelId) return { ok: false, error: 'Account is not in a voice channel' };
   const existing = syntheticStreams.get(name);
+  if (existing && mediaTransportReadyForTarget(name, guildId, session.channelId, mediaKind, existing, client)) {
+    clearPrimaryMediaFailure(name);
+    return { ok: true, verifiedActive: true };
+  }
   // Replacing a media transport must not send a voice leave for the account.
   // The primary voice connection owns room membership.
-  if (existing) stopSyntheticStream(name, { invalidate: false });
+  if (existing) {
+    existing.restarting = true;
+    stopSyntheticStream(name, { invalidate: false });
+  }
+  const retryError = primaryMediaRetryError(name, guildId, session.channelId, mediaKind);
+  if (retryError) {
+    const failure = primaryMediaFailureForTarget(name, guildId, session.channelId, mediaKind);
+    return {
+      ok: false,
+      error: retryError,
+      cooldown: !failure?.blockedReason,
+      blocked: !!failure?.blockedReason,
+      automaticRetryPaused: !!failure?.blockedReason,
+      retryAfterMs: primaryMediaRetryAfterMs(name, guildId, session.channelId, mediaKind),
+    };
+  }
   // Keep the desired media state visible to the watchdog even if the first
   // transport attempt fails before an active stream object is created.
   mediaDesired.set(name, { guildId, channelId: session.channelId, mediaKind });
@@ -2538,7 +2794,7 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
   }
   logMediaEvent('warn', 'media.primary_transport_unavailable', { account: name, guildId, channelId: session.channelId, mediaKind, hasConnection: !!primaryConnection, connectionChannelId: voiceConnectionChannelId(primaryConnection), hasCreateStreamConnection: typeof primaryConnection?.createStreamConnection === 'function' });
   let lastError;
-  for (let attempt = 1; attempt <= 2; attempt += 1) {
+  for (let attempt = 1; attempt <= 1; attempt += 1) {
     let streamer;
     let controller;
     let source;
@@ -2593,15 +2849,19 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
         if (syntheticStreams.get(name) === active) {
           // The media transport ended; keep the primary voice session alive
           // while a replacement transport is scheduled.
+          active.restarting = true;
           stopSyntheticStream(name, { preserveRestartState: true });
+          active.restarting = false;
           scheduleMediaRestart(name, active, 'media task ended');
         }
       }).catch((error) => {
         logMediaEvent('error', 'media.runtime_failed', { account: name, guildId, channelId: session.channelId, mediaKind, error: error?.message || String(error) });
         if (syntheticStreams.get(name) === active) {
           // Runtime media failures must not turn into a voice-room leave.
+          active.restarting = true;
           stopSyntheticStream(name, { preserveRestartState: true });
-          scheduleMediaRestart(name, active, error?.message || 'media task failed');
+          active.restarting = false;
+          scheduleMediaRestart(name, active, error?.message || 'media task failed', error);
         }
       });
       await withTimeout(new Promise((resolve) => {
@@ -2644,17 +2904,15 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
       try { if (streamer) streamer._voiceConnection = undefined; } catch {}
       if (syntheticStreams.get(name)?.streamer === streamer) syntheticStreams.delete(name);
       if (createdStreamer && mediaStreamers.get(name) === streamer) mediaStreamers.delete(name);
-      logMediaEvent('error', 'media.attempt_failed', { account: name, guildId, channelId: session.channelId, mediaKind, attempt, stage, error: error?.message || String(error) });
-      if (attempt < 2) {
-        // A missing session/token is a gateway ordering failure, not an FFmpeg
-        // failure. Give Discord time to publish the replacement voice server
-        // update before constructing the next dedicated transport.
-        await new Promise((resolve) => setTimeout(resolve, 1000));
+      if (mediaKind === 'camera') {
+        const reset = await resetFailedCameraState(client, client?.voice?.connection, guildId, session.channelId, session);
+        if (!reset?.ok) logMediaEvent('warn', 'media.camera_state_reset_unconfirmed', { account: name, guildId, channelId: session.channelId, error: reset?.error || 'Camera state reset was not confirmed' });
       }
+      logMediaEvent('error', 'media.attempt_failed', { account: name, guildId, channelId: session.channelId, mediaKind, attempt, stage, error: error?.message || String(error) });
     }
   }
   stopSyntheticStream(name);
-  return { ok: false, error: lastError?.message || `Unable to start ${mediaKind}` };
+  return failureResultFromError(lastError || new Error(`Unable to start ${mediaKind}`));
 }
 async function withAccountLock(name, operation) {
   const key = String(name);
@@ -2863,6 +3121,18 @@ async function watchdogMedia(session) {
   const expectedState = cycleState || session;
   const expectedKind = expectedState.selfStream === true ? 'go-live' : expectedState.selfVideo === true ? 'camera' : null;
   if (!expectedKind) return;
+  const failureState = primaryMediaFailureForTarget(session.name, session.guildId, session.channelId, expectedKind);
+  if (failureState?.blockedReason) return;
+  const retryError = primaryMediaRetryError(session.name, session.guildId, session.channelId, expectedKind);
+  if (retryError) {
+    if (!pendingMediaRestarts.has(session.name)) scheduleMediaRecovery(session.name, {
+      guildId: session.guildId,
+      channelId: session.channelId,
+      mediaKind: expectedKind,
+      desiredState: { ...session, ...expectedState },
+    }, 'watchdog waiting for media backoff');
+    return;
+  }
   const desired = mediaDesired.get(session.name);
   if (!cycle && (!desired || String(desired.guildId) !== String(session.guildId) || String(desired.channelId) !== String(session.channelId))) return;
   if (desired && (String(desired.guildId) !== String(session.guildId) || String(desired.channelId) !== String(session.channelId) || desired.mediaKind !== expectedKind)) return;
@@ -4388,6 +4658,7 @@ app.post('/api/voice/state', async (req, res) => {
       const results = await mapWithConcurrency(accounts, 8, async (name) => {
         const result = await withResultRetry(() => withAccountLock(name, async () => {
           if (rotationAccounts.has(name)) return { name, ok: true, skipped: true, reason: 'Account is controlled by an active rotation' };
+          if (requestedState.selfVideo !== undefined || requestedState.selfStream !== undefined) clearPrimaryMediaFailure(name);
           return executeQuickVoiceControlForAccount(name, guildId, requestedState, { operationType: 'state' });
         }));
         emitLive('operation.account.updated', { operation: 'state', operationId, result });
@@ -4839,4 +5110,5 @@ if (require.main === module) {
   process.once('SIGINT', () => { persistBeforeExit(); process.exit(0); });
 }
 
-module.exports = { app, clients, accountLimit: limit, parseAccountLimit, voiceSessions, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, compactStateHistory, recordSuccessfulCycleState, getRateLimitBucket, pruneRateLimitBuckets, reserveAccountConnectSlots, releaseAccountConnectSlots, playingSessions, stopPlayingSession, schedulePlaying, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, parseRotationChannelIds, startDiscordAccountRotation, removeAccountFromAutomationTasks, rotationTasksForAccount, rotationAccountPaused, rotationAccountDeadline, dueRotationAccounts, scheduleRotationTask, setRotationAccountPaused, resumeRotationAccount, rotationControlledAccounts, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, hardenVoiceConnection, cleanupPrimaryStreamAttempt, guardVoiceWebSocketTeardown, safeErrorSummary, buildAccountSnapshot, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, registerAccountStreamer, mediaStreamers, mediaQueueSnapshot, enqueueGlobalMediaStart, ensureSyntheticVideo, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, isCaptchaChallengeError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanAccountRecords, saveReadableAccountJson, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, projectGatewayVoiceState, buildClientSnapshots, buildVoiceGuildCatalog, buildPlayingChannelCatalog, invalidateVoiceGuildCatalog, scheduleCatalogEvent, liveEvents, isRecoverableDiscordInteractionError };
+module.exports = { app, clients, accountLimit: limit, parseAccountLimit, voiceSessions, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, compactStateHistory, recordSuccessfulCycleState, getRateLimitBucket, pruneRateLimitBuckets, reserveAccountConnectSlots, releaseAccountConnectSlots, playingSessions, stopPlayingSession, schedulePlaying, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, parseRotationChannelIds, startDiscordAccountRotation, removeAccountFromAutomationTasks, rotationTasksForAccount, rotationAccountPaused, rotationAccountDeadline, dueRotationAccounts, scheduleRotationTask, setRotationAccountPaused, resumeRotationAccount, rotationControlledAccounts, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, hardenVoiceConnection, cleanupPrimaryStreamAttempt, guardVoiceWebSocketTeardown, safeErrorSummary, buildAccountSnapshot, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, registerAccountStreamer, mediaStreamers, mediaQueueSnapshot, enqueueGlobalMediaStart, ensureSyntheticVideo, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, isCaptchaChallengeError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, mediaTransportReadyForTarget, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanAccountRecords, saveReadableAccountJson, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, projectGatewayVoiceState, buildClientSnapshots, buildVoiceGuildCatalog, buildPlayingChannelCatalog, invalidateVoiceGuildCatalog, scheduleCatalogEvent, liveEvents, isRecoverableDiscordInteractionError };
+Object.assign(module.exports, { clearPrimaryMediaFailure, discordRetryAfterMs, failureResultFromError, isHardMediaFailure, isRateLimitFailure, resetFailedCameraState, retryDelayWithJitter });

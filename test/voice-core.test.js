@@ -4,8 +4,9 @@ const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, recordSuccessfulCycleState, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, registerAccountStreamer, mediaStreamers, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, schedulePlaying, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, cleanAccountRecords, buildAccountSnapshot, safeErrorSummary, guardVoiceWebSocketTeardown, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, isCaptchaChallengeError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanupPrimaryStreamAttempt, isRecoverableDiscordInteractionError, parseRotationChannelIds, removeAccountFromAutomationTasks } = require('../server');
+const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, recordSuccessfulCycleState, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, registerAccountStreamer, mediaStreamers, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, schedulePlaying, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, clearPrimaryMediaFailure, cleanAccountRecords, buildAccountSnapshot, safeErrorSummary, guardVoiceWebSocketTeardown, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, isCaptchaChallengeError, isHardMediaFailure, isRateLimitFailure, discordRetryAfterMs, retryDelayWithJitter, retryMediaTransportImmediately, resetFailedCameraState, primaryMediaTransportIsActive, mediaWatchdogReadiness, mediaTransportReadyForTarget, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanupPrimaryStreamAttempt, isRecoverableDiscordInteractionError, parseRotationChannelIds, removeAccountFromAutomationTasks } = require('../server');
 const { dueRotationAccounts, scheduleRotationTask, setRotationAccountPaused, rotationAccountPaused } = require('../server');
+const { failureResultFromError } = require('../server');
 const VoiceWebSocket = require('discord.js-selfbot-v13/src/client/voice/networking/VoiceWebSocket');
 
 test('captures delayed errors from a WebSocket after voice teardown without suppressing live errors', () => {
@@ -198,15 +199,98 @@ test('retries transient live voice target confirmation failures', () => {
   assert.equal(retryableError({ error: 'Voice state mismatch for channel channel-1: gateway=none, connection=none' }), true);
 });
 
-test('creates a fresh media transport immediately after a failed attempt', async () => {
+test('the optional immediate retry helper creates a fresh transport only for a transient failure', async () => {
   const calls = [];
   const result = await retryMediaTransportImmediately(async (attempt) => {
     calls.push(attempt);
     return attempt === 1 ? { ok: false, error: 'first transport failed' } : { ok: true };
-  });
+  }, 2);
   assert.deepEqual(calls, [1, 2]);
   assert.equal(result.ok, true);
   assert.equal(result.attempts, 2);
+});
+
+test('does not immediately retry permission, CAPTCHA, or rate-limit media failures', async () => {
+  for (const failure of [
+    { ok: false, error: 'Missing Permissions', status: 403 },
+    { ok: false, error: 'CAPTCHA verification required' },
+    { ok: false, error: 'Too many requests', status: 429, retryAfterMs: 2500 },
+  ]) {
+    let attempts = 0;
+    const result = await retryMediaTransportImmediately(async () => { attempts += 1; return failure; }, 3);
+    assert.equal(attempts, 1);
+    assert.equal(result.ok, false);
+  }
+});
+
+test('extracts Discord Retry-After values from numeric fields and HTTP headers', () => {
+  assert.equal(discordRetryAfterMs({ retryAfterMs: 1250 }), 1250);
+  assert.equal(discordRetryAfterMs({ timeout: 4250 }), 4250);
+  assert.equal(discordRetryAfterMs({ retry_after: 2.5 }), 2500);
+  assert.equal(discordRetryAfterMs({ headers: { 'Retry-After': '3' } }), 3000);
+  assert.equal(discordRetryAfterMs({ headers: { 'retry-after': 'not-a-date' } }), 0);
+  assert.deepEqual(failureResultFromError(Object.assign(new Error('Too many requests'), { status: 429, code: 20028, retryAfterMs: 1500 })), {
+    ok: false, error: 'Too many requests', status: 429, code: 20028, retryAfterMs: 1500, rateLimited: true,
+  });
+});
+
+test('classifies permission and CAPTCHA failures as non-retryable hard failures', () => {
+  for (const failure of [
+    { status: 403, message: 'Forbidden' },
+    { code: 50013, message: 'Missing Permissions' },
+    { message: 'Missing Stream permission for Camera or Screen Share in this voice channel' },
+    { message: 'CAPTCHA challenge required' },
+  ]) {
+    assert.equal(isHardMediaFailure(failure), true);
+    assert.equal(retryableError(failure), false);
+  }
+  assert.equal(isHardMediaFailure('CAPTCHA verification required'), true);
+  assert.equal(isRateLimitFailure({ status: 429 }), true);
+  assert.equal(retryableError({ status: 429, error: 'Too many requests' }), false);
+});
+
+test('uses bounded equal jitter for transient exponential retry delays', () => {
+  assert.equal(retryDelayWithJitter(0, 1000, 10_000, () => 0), 500);
+  assert.equal(retryDelayWithJitter(0, 1000, 10_000, () => 1), 1000);
+  assert.equal(retryDelayWithJitter(10, 1000, 10_000, () => 1), 10_000);
+});
+
+test('resets failed camera media flags without leaving the room or changing the current self-mute', async () => {
+  const order = [];
+  const connection = {
+    channel: { id: 'channel-1' }, videoStatus: true,
+    setVideoStatus(value) { order.push(`video:${value}`); this.videoStatus = value; },
+  };
+  const dispatcher = { destroy() { order.push('dispatcher:destroy'); } };
+  const confirmVoiceState = async (_client, _guildId, channelId, state) => {
+    order.push('voice-state:confirm');
+    assert.equal(channelId, 'channel-1');
+    assert.deepEqual(state, {
+      selfMute: false, selfDeaf: false, selfVideo: false, selfStream: false,
+      confirmOmittedFalseFlags: ['selfVideo', 'selfStream'],
+    });
+    return { ok: true };
+  };
+  const client = {
+    user: { id: 'user-1' },
+    guilds: { cache: new Map([['guild-1', { voiceStates: { cache: new Map([['user-1', { guildId: 'guild-1', channelId: 'channel-1', selfMute: false }]]) } }]]) },
+  };
+  const result = await resetFailedCameraState(client, connection, 'guild-1', 'channel-1', { selfMute: true }, dispatcher, confirmVoiceState);
+  assert.equal(result.ok, true);
+  assert.deepEqual(order, ['dispatcher:destroy', 'video:false', 'voice-state:confirm']);
+  assert.equal(connection.videoStatus, false);
+});
+
+test('does not send camera cleanup to a stale room after the account has moved', async () => {
+  const order = [];
+  const connection = { channel: { id: 'channel-1' }, videoStatus: true, setVideoStatus(value) { order.push(`video:${value}`); } };
+  const client = {
+    user: { id: 'user-1' },
+    guilds: { cache: new Map([['guild-1', { voiceStates: { cache: new Map([['user-1', { guildId: 'guild-1', channelId: 'channel-2', selfMute: true }]]) } }]]) },
+  };
+  const result = await resetFailedCameraState(client, connection, 'guild-1', 'channel-1', { selfMute: false }, { destroy() { order.push('dispatcher:destroy'); } }, async () => { order.push('voice-state:confirm'); return { ok: true }; });
+  assert.equal(result.cancelled, true);
+  assert.deepEqual(order, ['dispatcher:destroy']);
 });
 
 test('waits for camera video packets on the primary voice connection', async () => {
@@ -288,6 +372,18 @@ test('treats primary Go Live transport as healthy in the watchdog', () => {
   } finally {
     clients.delete(name);
   }
+});
+
+test('recognizes a healthy dedicated Streamer transport before scheduling another recovery', () => {
+  const name = 'watchdog-dedicated-live-test';
+  const active = {
+    mediaKind: 'go-live', guildId: 'guild-1', channelId: 'channel-1',
+    streamer: { voiceConnection: { webRtcConn: { ready: true }, streamConnection: { webRtcConn: { ready: true } } } },
+    sourceProcess: { exitCode: null, killed: false },
+  };
+  const client = { voice: { connection: null } };
+  assert.equal(mediaTransportReadyForTarget(name, 'guild-1', 'channel-1', 'go-live', active, client), true);
+  assert.equal(mediaTransportReadyForTarget(name, 'guild-1', 'channel-2', 'go-live', active, client), false);
 });
 
 test('state-cycle ownership is discoverable for watchdog media monitoring', () => {
@@ -461,14 +557,53 @@ test('hardens a voice connection without retaining more than three closing liste
 
 test('backs off repeated failed primary media starts for the same target', () => {
   const account = 'primary-retry-test';
-  primaryMediaFailures.delete(account);
+  clearPrimaryMediaFailure(account);
   try {
     assert.equal(primaryMediaRetryError(account, 'guild-1', 'channel-1', 'go-live'), null);
     recordPrimaryMediaFailure(account, 'guild-1', 'channel-1', 'go-live', 'handshake timed out');
     assert.match(primaryMediaRetryError(account, 'guild-1', 'channel-1', 'go-live'), /cooling down/);
     assert.equal(primaryMediaRetryError(account, 'guild-1', 'channel-2', 'go-live'), null);
   } finally {
-    primaryMediaFailures.delete(account);
+    clearPrimaryMediaFailure(account);
+  }
+});
+
+test('honors Retry-After and pauses automatic retries for permission/CAPTCHA failures', () => {
+  const account = 'primary-retry-policy-test';
+  clearPrimaryMediaFailure(account);
+  try {
+    const rateLimited = recordPrimaryMediaFailure(account, 'guild-1', 'channel-1', 'go-live', {
+      status: 429, retryAfterMs: 10_000, error: 'Too many requests',
+    });
+    assert.equal(rateLimited.retryAt - rateLimited.updatedAt, 10_000);
+    assert.match(primaryMediaRetryError(account, 'guild-1', 'channel-1', 'go-live'), /cooling down/);
+    clearPrimaryMediaFailure(account);
+
+    recordPrimaryMediaFailure(account, 'guild-1', 'channel-1', 'camera', { status: 403, error: 'Missing Permissions' });
+    assert.match(primaryMediaRetryError(account, 'guild-1', 'channel-1', 'camera'), /Automatic media recovery is paused/);
+    assert.equal(primaryMediaFailures.get(account).retryAt, 0);
+    assert.equal(primaryMediaRetryError(account, 'guild-1', 'channel-2', 'camera'), null);
+
+    recordPrimaryMediaFailure(account, 'guild-1', 'channel-1', 'camera', { error: 'CAPTCHA verification required' });
+    assert.match(primaryMediaRetryError(account, 'guild-1', 'channel-1', 'camera'), /CAPTCHA/);
+  } finally {
+    clearPrimaryMediaFailure(account);
+  }
+});
+
+test('opens the media circuit breaker after repeated transient failures and retains its probe delay', () => {
+  const account = 'primary-retry-circuit-test';
+  clearPrimaryMediaFailure(account);
+  try {
+    let state;
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      state = recordPrimaryMediaFailure(account, 'guild-1', 'channel-1', 'go-live', 'WebRTC media transport timed out');
+    }
+    assert.equal(state.attempts, 5);
+    assert.ok(state.circuitOpenUntil > Date.now());
+    assert.match(primaryMediaRetryError(account, 'guild-1', 'channel-1', 'go-live'), /circuit breaker is open/);
+  } finally {
+    clearPrimaryMediaFailure(account);
   }
 });
 
