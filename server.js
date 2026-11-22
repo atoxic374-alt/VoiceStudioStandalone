@@ -495,11 +495,13 @@ const MEDIA_STREAM_TIMEOUT_MS = Math.max(12000, Number(process.env.MEDIA_STREAM_
 const ACCOUNT_RESTORE_CONCURRENCY = Math.max(1, Math.min(3, Number(process.env.ACCOUNT_RESTORE_CONCURRENCY || 2)));
 const ACCOUNT_CONNECT_CONCURRENCY = Math.max(1, Math.min(3, Number(process.env.ACCOUNT_CONNECT_CONCURRENCY || 2)));
 const DISCORD_PREFLIGHT_TIMEOUT_MS = Math.max(3000, Math.min(15000, Number(process.env.DISCORD_PREFLIGHT_TIMEOUT_MS || 8000)));
-// Media starts are FIFO-serialized per account, but independent accounts may
-// establish their own transports concurrently. This prevents a slow handshake
-// for one account from blocking or mutating another account's media state.
-// An optional per-account gap can still be configured; the default is zero.
-const MEDIA_START_GAP_MS = Math.max(0, Number(process.env.MEDIA_START_GAP_MS || 0));
+// A single process-wide FIFO gate serializes media handshakes across accounts
+// and callers. It covers setup/confirmation only, not the lifetime of a stream.
+// Starts are spaced by one second by default; set MEDIA_START_GAP_MS=0 to disable the gap.
+const MEDIA_START_GAP_SETTING = process.env.MEDIA_START_GAP_MS;
+const MEDIA_START_GAP_MS = MEDIA_START_GAP_SETTING === undefined
+  ? 1000
+  : Math.max(0, Math.min(60000, Number.isFinite(Number(MEDIA_START_GAP_SETTING)) ? Number(MEDIA_START_GAP_SETTING) : 1000));
 const SYNTHETIC_VIDEO_FILE = path.join(DATA_DIR, 'synthetic-stream-black-v2.mp4');
 const DISCORD_REQUEST_GAP_MS = Math.max(0, Number(process.env.DISCORD_REQUEST_GAP_MS || 120));
 let nextDiscordRequestAt = 0;
@@ -518,6 +520,10 @@ const pendingRoomMoves = new Set();
 let watchdogRunning = false;
 const mediaStartQueues = new Map();
 let mediaStartSequence = 0;
+const globalMediaStartQueue = [];
+let globalMediaStartActive = null;
+let globalMediaStartTimer = null;
+let globalMediaStartNextAt = 0;
 
 function ok(res, payload = {}) { return res.json({ success: true, ...payload }); }
 function redact(value) { return String(value ?? '').replace(/(token|authorization|password|cookie)(["']?\s*[:=]\s*["']?)[^"',;\s}]+/gi, '$1$2[redacted]'); }
@@ -1673,7 +1679,10 @@ function stopSyntheticStream(name, { leaveVoice = false, silent = false, invalid
   // new start's generation. Previously startSyntheticStreamUnqueued() called
   // this function after capturing its generation, so every camera/Go Live
   // replacement cancelled itself with "Media start cancelled...".
-  if (invalidate) mediaRunGenerations.set(name, Number(mediaRunGenerations.get(name) || 0) + 1);
+  if (invalidate) {
+    mediaRunGenerations.set(name, Number(mediaRunGenerations.get(name) || 0) + 1);
+    cancelQueuedGlobalMediaStartsForAccount(name);
+  }
   const pendingRestart = pendingMediaRestarts.get(name);
   if (pendingRestart && !preservePendingRestart) {
     clearTimeout(pendingRestart);
@@ -2322,6 +2331,65 @@ async function startSyntheticStream(name, guildId, mediaKind = 'go-live', desire
   });
   return result;
 }
+function cancelQueuedGlobalMediaStartsForAccount(name) {
+  const currentGeneration = Number(mediaRunGenerations.get(name) || 0);
+  let removed = 0;
+  for (let index = globalMediaStartQueue.length - 1; index >= 0; index -= 1) {
+    const item = globalMediaStartQueue[index];
+    if (item.name !== name || item.generation === currentGeneration) continue;
+    globalMediaStartQueue.splice(index, 1);
+    item.resolve({ ok: false, cancelled: true, error: 'Media start cancelled by a newer account operation' });
+    logMediaEvent('info', 'media.global_queue_cancelled', { sequence: item.sequence, account: item.name, guildId: item.guildId, mediaKind: item.mediaKind });
+    removed += 1;
+  }
+  if (removed && globalMediaStartTimer && !globalMediaStartActive) {
+    clearTimeout(globalMediaStartTimer);
+    globalMediaStartTimer = null;
+  }
+  if (removed) processGlobalMediaStartQueue();
+  return removed;
+}
+function processGlobalMediaStartQueue() {
+  if (globalMediaStartActive || globalMediaStartTimer) return;
+  while (globalMediaStartQueue.length) {
+    const item = globalMediaStartQueue[0];
+    if (item.generation !== Number(mediaRunGenerations.get(item.name) || 0)) {
+      globalMediaStartQueue.shift();
+      item.resolve({ ok: false, cancelled: true, error: 'Media start cancelled by a newer account operation' });
+      logMediaEvent('info', 'media.global_queue_cancelled', { sequence: item.sequence, account: item.name, guildId: item.guildId, mediaKind: item.mediaKind });
+      continue;
+    }
+    const waitMs = globalMediaStartNextAt - Date.now();
+    if (waitMs > 0) {
+      globalMediaStartTimer = setTimeout(() => {
+        globalMediaStartTimer = null;
+        processGlobalMediaStartQueue();
+      }, waitMs);
+      return;
+    }
+    globalMediaStartQueue.shift();
+    globalMediaStartActive = item;
+    globalMediaStartNextAt = Date.now() + MEDIA_START_GAP_MS;
+    logMediaEvent('info', 'media.global_start', { sequence: item.sequence, account: item.name, guildId: item.guildId, mediaKind: item.mediaKind, queueDepth: globalMediaStartQueue.length });
+    Promise.resolve().then(item.run).then((result) => {
+      item.resolve(result || { ok: false, error: 'Global media start completed without a result' });
+    }, (error) => {
+      item.resolve({ ok: false, error: error?.message || String(error) });
+    }).finally(() => {
+      logMediaEvent('info', 'media.global_complete', { sequence: item.sequence, account: item.name, guildId: item.guildId, mediaKind: item.mediaKind, queueDepth: globalMediaStartQueue.length });
+      globalMediaStartActive = null;
+      processGlobalMediaStartQueue();
+    });
+    return;
+  }
+}
+function enqueueGlobalMediaStart(item, run) {
+  return new Promise((resolve) => {
+    globalMediaStartQueue.push({ ...item, run, resolve, enqueuedAt: Date.now() });
+    logMediaEvent('info', 'media.global_queue_enter', { sequence: item.sequence, account: item.name, guildId: item.guildId, mediaKind: item.mediaKind, position: globalMediaStartQueue.length });
+    processGlobalMediaStartQueue();
+  });
+}
 async function processMediaStartQueue(name) {
   const queue = mediaStartQueues.get(name);
   if (!queue || queue.running) return;
@@ -2336,7 +2404,7 @@ async function processMediaStartQueue(name) {
         if (item.generation !== Number(mediaRunGenerations.get(item.name) || 0)) {
           result = { ok: false, cancelled: true, error: 'Media start cancelled by a newer account operation' };
         } else {
-          result = await startSyntheticStreamUnqueued(item.name, item.guildId, item.mediaKind, item.desiredState, item.generation);
+          result = await enqueueGlobalMediaStart(item, () => startSyntheticStreamUnqueued(item.name, item.guildId, item.mediaKind, item.desiredState, item.generation));
         }
       } catch (error) {
         result = { ok: false, error: error?.message || String(error) };
@@ -2356,7 +2424,6 @@ async function processMediaStartQueue(name) {
           }
         }
         item.resolve(result || { ok: false, error: 'Media queue item completed without a result' });
-        if (MEDIA_START_GAP_MS > 0 && queue.items.length) await new Promise((resolve) => setTimeout(resolve, MEDIA_START_GAP_MS));
       }
     }
   } finally {
@@ -2369,11 +2436,21 @@ function mediaQueueSnapshot() {
   const queues = [...mediaStartQueues.entries()];
   const items = queues.flatMap(([account, queue]) => queue.items.map((item, index) => ({ sequence: item.sequence, account, guildId: item.guildId, mediaKind: item.mediaKind, position: index + 1 })));
   const active = queues.filter(([, queue]) => queue.running).length;
+  const globalItems = globalMediaStartQueue.map((item, index) => ({ sequence: item.sequence, account: item.name, guildId: item.guildId, mediaKind: item.mediaKind, position: index + 1, queuedForMs: Math.max(0, Date.now() - item.enqueuedAt) }));
   return {
-    running: active > 0,
+    running: active > 0 || !!globalMediaStartActive,
     active,
     pending: items.length,
     items,
+    global: {
+      concurrency: 1,
+      active: globalMediaStartActive ? 1 : 0,
+      current: globalMediaStartActive ? { sequence: globalMediaStartActive.sequence, account: globalMediaStartActive.name, guildId: globalMediaStartActive.guildId, mediaKind: globalMediaStartActive.mediaKind } : null,
+      pending: globalItems.length,
+      items: globalItems,
+      gapMs: MEDIA_START_GAP_MS,
+      nextStartInMs: Math.max(0, globalMediaStartNextAt - Date.now()),
+    },
   };
 }
 function registerAccountStreamer(name, streamer) {
@@ -4762,4 +4839,4 @@ if (require.main === module) {
   process.once('SIGINT', () => { persistBeforeExit(); process.exit(0); });
 }
 
-module.exports = { app, clients, accountLimit: limit, parseAccountLimit, voiceSessions, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, compactStateHistory, recordSuccessfulCycleState, getRateLimitBucket, pruneRateLimitBuckets, reserveAccountConnectSlots, releaseAccountConnectSlots, playingSessions, stopPlayingSession, schedulePlaying, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, parseRotationChannelIds, startDiscordAccountRotation, removeAccountFromAutomationTasks, rotationTasksForAccount, rotationAccountPaused, rotationAccountDeadline, dueRotationAccounts, scheduleRotationTask, setRotationAccountPaused, resumeRotationAccount, rotationControlledAccounts, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, hardenVoiceConnection, cleanupPrimaryStreamAttempt, guardVoiceWebSocketTeardown, safeErrorSummary, buildAccountSnapshot, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, registerAccountStreamer, mediaStreamers, mediaQueueSnapshot, ensureSyntheticVideo, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, isCaptchaChallengeError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanAccountRecords, saveReadableAccountJson, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, projectGatewayVoiceState, buildClientSnapshots, buildVoiceGuildCatalog, buildPlayingChannelCatalog, invalidateVoiceGuildCatalog, scheduleCatalogEvent, liveEvents, isRecoverableDiscordInteractionError };
+module.exports = { app, clients, accountLimit: limit, parseAccountLimit, voiceSessions, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, compactStateHistory, recordSuccessfulCycleState, getRateLimitBucket, pruneRateLimitBuckets, reserveAccountConnectSlots, releaseAccountConnectSlots, playingSessions, stopPlayingSession, schedulePlaying, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, parseRotationChannelIds, startDiscordAccountRotation, removeAccountFromAutomationTasks, rotationTasksForAccount, rotationAccountPaused, rotationAccountDeadline, dueRotationAccounts, scheduleRotationTask, setRotationAccountPaused, resumeRotationAccount, rotationControlledAccounts, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, hardenVoiceConnection, cleanupPrimaryStreamAttempt, guardVoiceWebSocketTeardown, safeErrorSummary, buildAccountSnapshot, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, registerAccountStreamer, mediaStreamers, mediaQueueSnapshot, enqueueGlobalMediaStart, ensureSyntheticVideo, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, isCaptchaChallengeError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanAccountRecords, saveReadableAccountJson, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, projectGatewayVoiceState, buildClientSnapshots, buildVoiceGuildCatalog, buildPlayingChannelCatalog, invalidateVoiceGuildCatalog, scheduleCatalogEvent, liveEvents, isRecoverableDiscordInteractionError };

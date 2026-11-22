@@ -478,6 +478,73 @@ test('does not classify an active media cooldown as an immediate retryable error
   assert.equal(retryableError({ ok: false, error: 'WebRTC media transport timed out' }), true);
 });
 
+test('serializes media handshakes globally across accounts and applies global pacing', async () => {
+  const { enqueueGlobalMediaStart, mediaQueueSnapshot } = require('../server');
+  let active = 0;
+  let peak = 0;
+  let releaseFirst;
+  let markFirstStarted;
+  const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+  const firstStarted = new Promise((resolve) => { markFirstStarted = resolve; });
+  const starts = [];
+  const run = async (account) => {
+    active += 1;
+    peak = Math.max(peak, active);
+    starts.push({ account, at: Date.now() });
+    if (account === 'global-media-first-test') {
+      markFirstStarted();
+      await firstGate;
+    }
+    active -= 1;
+    return { ok: true, account };
+  };
+  const first = enqueueGlobalMediaStart({ sequence: 900001, name: 'global-media-first-test', guildId: 'guild-test', mediaKind: 'camera', generation: 0 }, () => run('global-media-first-test'));
+  const second = enqueueGlobalMediaStart({ sequence: 900002, name: 'global-media-second-test', guildId: 'guild-test', mediaKind: 'go-live', generation: 0 }, () => run('global-media-second-test'));
+  try {
+    await firstStarted;
+    const snapshot = mediaQueueSnapshot();
+    assert.equal(snapshot.global.concurrency, 1);
+    assert.equal(snapshot.global.active, 1);
+    assert.equal(snapshot.global.pending, 1);
+    releaseFirst();
+    const results = await Promise.all([first, second]);
+    assert.deepEqual(results.map((result) => result.ok), [true, true]);
+    assert.equal(peak, 1);
+    assert.deepEqual(starts.map((item) => item.account), ['global-media-first-test', 'global-media-second-test']);
+    assert.ok(starts[1].at - starts[0].at >= snapshot.global.gapMs - 50);
+  } finally {
+    releaseFirst();
+  }
+});
+
+test('cancels a stale media start while it is waiting in the global queue', async () => {
+  const { enqueueGlobalMediaStart, stopSyntheticStream } = require('../server');
+  let releaseBlocker;
+  let markBlockerStarted;
+  let staleRunStarted = false;
+  const blockerGate = new Promise((resolve) => { releaseBlocker = resolve; });
+  const blockerStarted = new Promise((resolve) => { markBlockerStarted = resolve; });
+  const blocker = enqueueGlobalMediaStart({ sequence: 900003, name: 'global-media-blocker-test', guildId: 'guild-test', mediaKind: 'camera', generation: 0 }, async () => {
+    markBlockerStarted();
+    await blockerGate;
+    return { ok: true };
+  });
+  try {
+    await blockerStarted;
+    const stale = enqueueGlobalMediaStart({ sequence: 900004, name: 'global-media-stale-test', guildId: 'guild-test', mediaKind: 'go-live', generation: 0 }, async () => {
+      staleRunStarted = true;
+      return { ok: true };
+    });
+    stopSyntheticStream('global-media-stale-test');
+    const result = await stale;
+    assert.equal(result.cancelled, true);
+    assert.equal(staleRunStarted, false);
+  } finally {
+    releaseBlocker();
+    await blocker;
+  }
+});
+
 test('confirms a voice state from the gateway', async () => {
   const { client } = fakeClient();
   const result = await sendVoiceOpConfirmed(client, 'guild-1', 'channel-1', { selfVideo: true }, 250);
