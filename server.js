@@ -1170,7 +1170,7 @@ function scheduleRotationTask(task) {
 function setRotationAccountPaused(task, name, paused) {
   if (!task || task.active === false || !(task.accounts || []).includes(name)) return { ok: false, error: 'No active automation task contains this account' };
   const current = new Set(task.pausedAccounts || []);
-  const wasPaused = current.has(name);
+  const wasPaused = current.has(name) || task.accountPauseState?.[name] === true;
   const isCycle = task.type === 'cycle' || Array.isArray(task.states);
   if (paused) {
     if (!isCycle && !wasPaused) {
@@ -1179,8 +1179,7 @@ function setRotationAccountPaused(task, name, paused) {
     }
     current.add(name);
     const operation = accountOperations.get(operationKey(name));
-    const expectedKind = isCycle ? 'cycle' : 'rotation';
-    if (operation && operation.kind === expectedKind && String(operation.guildId) === String(task.guildId)) {
+    if (operation && String(operation.guildId) === String(task.guildId)) {
       const invalidation = beginAccountOperation(name, task.guildId, 'automation-paused');
       endAccountOperation(invalidation);
     }
@@ -1275,7 +1274,7 @@ async function startDiscordAccountRotation(client, message, account, rawIds) {
   const cycle = {
     id: crypto.randomUUID(), type: 'cycle', accounts: [account], guildId, states,
     intervalMs: 10 * 60 * 1000, currentIdx: 0, accountStateIdx: {}, stateHistory: {},
-    pausedAccounts: [], runToken: 0, startedAt: now, nextAt: now + 10 * 60 * 1000,
+    pausedAccounts: [], accountPauseState: {}, runToken: 0, startedAt: now, nextAt: now + 10 * 60 * 1000,
     accountStatus: {}, initializing: true, running: true, active: true, lastResults: [],
   };
   const isRotationCurrent = () => rotations.get(rotation.id) === rotation;
@@ -3406,7 +3405,14 @@ async function moveAccountLocked(name, guildId, channelId, opts = {}) {
   return (async () => {
     const client = getClient(name);
     if (!client) return { name, ok: false, error: 'Account is not connected' };
+    if (typeof opts.isCurrent === 'function' && !opts.isCurrent()) {
+      return { name, ok: false, stale: true, error: 'Voice move was stopped before it started' };
+    }
     const operation = beginAccountOperation(name, guildId, opts.operationType || 'move');
+    if (typeof opts.isCurrent === 'function' && !opts.isCurrent()) {
+      endAccountOperation(operation);
+      return { name, ok: false, stale: true, error: 'Voice move was stopped before it started' };
+    }
     const target = validateTarget(client, guildId, channelId);
     if (!target.ok) { endAccountOperation(operation); return { name, ok: false, error: target.error }; }
     const saved = voiceSessions.get(sessionKey(name, guildId));

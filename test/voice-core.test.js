@@ -119,6 +119,24 @@ test('rotation scheduler clears its timer when every account is off', () => {
   assert.equal(task.nextAt, null);
 });
 
+test('off cancels any in-flight voice operation for the account, not only rotation operations', () => {
+  const account = 'pause-any-operation-account';
+  const operation = beginAccountOperation(account, 'pause-guild', 'state');
+  const task = {
+    id: 'pause-any-operation-task', type: 'rotation', active: true,
+    guildId: 'pause-guild', accounts: [account], pausedAccounts: [], accountPauseState: {},
+    accountNextAt: { [account]: Date.now() + 60_000 }, intervalMs: 60_000,
+    accountTargets: {}, accountStatus: {}, runTick() {}, scheduleNext() {},
+  };
+  try {
+    assert.equal(setRotationAccountPaused(task, account, true).ok, true);
+    assert.equal(operationIsCurrent(operation), false);
+    assert.equal(rotationAccountPaused(task, account), true);
+  } finally {
+    endAccountOperation(operation);
+  }
+});
+
 test('cleans saved account records before they can affect the account count', () => {
   const records = cleanAccountRecords([
     { name: 'Alpha', token: 'token-a' },
