@@ -82,7 +82,7 @@ test('off freezes an account rotation countdown and excludes it from due rotatio
     id: 'pause-resume-rotation-test', type: 'rotation', active: true,
     accounts: ['pause-resume-account'], intervalMs: 60_000,
     accountNextAt: { 'pause-resume-account': now + 5_000 },
-    pausedAccounts: [], pausedRemainingMs: {}, accountTargets: {}, accountStatus: {},
+    pausedAccounts: [], accountPauseState: { 'pause-resume-account': false }, pausedRemainingMs: {}, accountTargets: {}, accountStatus: {},
     runTick() {},
     scheduleNext() { rescheduleCount += 1; scheduleRotationTask(this); },
   };
@@ -91,6 +91,7 @@ test('off freezes an account rotation countdown and excludes it from due rotatio
   assert.ok(task.timer);
   assert.equal(setRotationAccountPaused(task, 'pause-resume-account', true).ok, true);
   assert.equal(task.timer, null);
+  assert.equal(task.accountPauseState['pause-resume-account'], true);
   const savedRemaining = task.pausedRemainingMs['pause-resume-account'];
   assert.ok(savedRemaining > 1_000 && savedRemaining <= 5_000);
   assert.deepEqual(dueRotationAccounts(task, now + 60_000), []);
@@ -98,6 +99,7 @@ test('off freezes an account rotation countdown and excludes it from due rotatio
 
   assert.equal(setRotationAccountPaused(task, 'pause-resume-account', false).ok, true);
   assert.equal(rotationAccountPaused(task, 'pause-resume-account'), false);
+  assert.equal(task.accountPauseState['pause-resume-account'], false);
   assert.ok(task.accountNextAt['pause-resume-account'] > Date.now());
   assert.equal(task.pausedRemainingMs['pause-resume-account'], undefined);
   assert.equal(rescheduleCount, 2);

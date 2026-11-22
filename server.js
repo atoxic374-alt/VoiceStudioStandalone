@@ -1134,7 +1134,7 @@ function rotationTasksForAccount(name) {
   return [...rotations.values()].filter((task) => task.active !== false && (task.accounts || []).includes(name));
 }
 function rotationAccountPaused(task, name) {
-  return (task.pausedAccounts || []).includes(name);
+  return task.accountPauseState?.[name] === true || (task.pausedAccounts || []).includes(name);
 }
 function rotationAccountDeadline(task, name) {
   const ownDeadline = Number(task.accountNextAt?.[name]);
@@ -1198,6 +1198,7 @@ function setRotationAccountPaused(task, name, paused) {
     }
   }
   task.pausedAccounts = [...current].filter((account) => (task.accounts || []).includes(account));
+  task.accountPauseState = Object.fromEntries((task.accounts || []).map((account) => [account, current.has(account)]));
   if (!isCycle) {
     task.accountNextAt ||= {};
     if (!paused) syncRotationTaskNextAt(task);
@@ -1262,7 +1263,7 @@ async function startDiscordAccountRotation(client, message, account, rawIds) {
     guildName: guild.name || guildId, channels: rooms, intervalMs: 15 * 60 * 1000,
     randomOrder: false, currentIdx: 0, startedAt: now, nextAt: now + 15 * 60 * 1000,
     accountNextAt: { [account]: now + 15 * 60 * 1000 }, pausedRemainingMs: {},
-    accountStatus: {}, accountTargets: {}, pausedAccounts: [], running: true,
+    accountStatus: {}, accountTargets: {}, pausedAccounts: [], accountPauseState: {}, running: true,
     active: true, initializing: true, lastResults: [],
   };
   const states = [
@@ -2625,6 +2626,7 @@ function removeAccountFromAutomationTasks(name, taskTypes = ['rotation', 'cycle'
       }
       task.accounts = (task.accounts || []).filter((account) => account !== name);
       task.pausedAccounts = (task.pausedAccounts || []).filter((account) => account !== name);
+      if (task.accountPauseState) delete task.accountPauseState[name];
       if (task.accountNextAt) delete task.accountNextAt[name];
       if (task.pausedRemainingMs) delete task.pausedRemainingMs[name];
       if (task.accountTargets) delete task.accountTargets[name];
@@ -4288,7 +4290,7 @@ app.post('/api/voice/rotation/start', async (req, res) => {
     : null;
   const id = crypto.randomUUID();
   const startedAt = Date.now();
-  const task = { id, accounts, guildId, guildName: guildName || guildId, channels: channelIds, intervalMs: delay, randomOrder: !!randomOrder, currentIdx: 0, startedAt, nextAt: startedAt + delay, accountNextAt: Object.fromEntries(accounts.map((name) => [name, startedAt + delay])), pausedRemainingMs: {}, accountStatus: {}, accountTargets: {}, pausedAccounts: [], running: true, active: true, initializing: true, lastResults: [] };
+  const task = { id, accounts, guildId, guildName: guildName || guildId, channels: channelIds, intervalMs: delay, randomOrder: !!randomOrder, currentIdx: 0, startedAt, nextAt: startedAt + delay, accountNextAt: Object.fromEntries(accounts.map((name) => [name, startedAt + delay])), pausedRemainingMs: {}, accountStatus: {}, accountTargets: {}, pausedAccounts: [], accountPauseState: Object.fromEntries(accounts.map((name) => [name, false])), running: true, active: true, initializing: true, lastResults: [] };
   // Register and persist the task before moving any account. Joining a voice
   // room can take several seconds per account; keeping this request open made
   // the browser report "Failed to fetch" and left no automation visible.
@@ -4447,6 +4449,8 @@ app.post('/api/voice/task/add-accounts', async (req, res) => {
       }
       if (!result.ok) return fail(res, new Error(`${name}: ${result.error || 'تعذر تشغيل الحساب'}`), 409, { added, failed: { name, ...result } });
       task.accounts.push(name);
+      task.accountPauseState ||= {};
+      task.accountPauseState[name] = false;
       if (type === 'rotation') {
         task.accountNextAt ||= {};
         task.accountNextAt[name] = Date.now() + task.intervalMs;
@@ -4476,7 +4480,7 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
   // Keep the previous cycle intact until the new request is structurally valid.
   for (const name of accounts) removeAccountFromAutomationTasks(name, ['cycle']);
   const id = crypto.randomUUID();
-  const task = { id, type: 'cycle', accounts, guildId, states, intervalMs: delay, currentIdx: 0, accountStateIdx: {}, stateHistory: {}, pausedAccounts: [], runToken: 0, startedAt: Date.now(), nextAt: Date.now() + delay };
+  const task = { id, type: 'cycle', accounts, guildId, states, intervalMs: delay, currentIdx: 0, accountStateIdx: {}, stateHistory: {}, pausedAccounts: [], accountPauseState: Object.fromEntries(accounts.map((name) => [name, false])), runToken: 0, startedAt: Date.now(), nextAt: Date.now() + delay };
   task.running = true; task.active = true;
   task.lastResults = [];
   const runStateCycle = async () => {
@@ -4562,9 +4566,12 @@ async function restoreAutomationTasks() {
     if (!accounts.length) continue;
     const intervalMs = Math.max(1000, Number(item.intervalMs || 60000));
     const fallbackDeadline = Number(item.nextAt || Date.now() + intervalMs);
+    const savedPaused = new Set(Array.isArray(item.pausedAccounts) ? item.pausedAccounts : []);
+    const accountPauseState = Object.fromEntries(accounts.map((name) => [name, item.accountPauseState?.[name] === true || savedPaused.has(name)]));
     const task = {
       ...item, type: 'rotation', accounts,
-      pausedAccounts: [...new Set((Array.isArray(item.pausedAccounts) ? item.pausedAccounts : []).filter((name) => accounts.includes(name)))],
+      accountPauseState,
+      pausedAccounts: accounts.filter((name) => accountPauseState[name]),
       accountTargets: { ...(item.accountTargets || {}) }, accountNextAt: { ...(item.accountNextAt || {}) },
       pausedRemainingMs: { ...(item.pausedRemainingMs || {}) }, initializing: false, running: false, active: true,
       intervalMs, nextAt: fallbackDeadline,
@@ -4612,7 +4619,9 @@ async function restoreAutomationTasks() {
     const currentStateIdx = Number.isInteger(Number(item.currentStateIdx)) && Number(item.currentStateIdx) >= 0 && Number(item.currentStateIdx) < item.states.length
       ? Number(item.currentStateIdx)
       : Number.isInteger(legacyIndex) && legacyIndex >= 0 && legacyIndex < item.states.length ? legacyIndex : 0;
-    const task = { ...item, type: 'cycle', accounts, pausedAccounts: [...new Set((Array.isArray(item.pausedAccounts) ? item.pausedAccounts : []).filter((name) => accounts.includes(name)))], currentStateIdx, accountStateIdx: { ...(item.accountStateIdx || {}) }, stateHistory: { ...(item.stateHistory || {}) }, runToken: Number(item.runToken || 0), initializing: false, running: false, addingAccounts: false, active: true, intervalMs: Math.max(1000, Number(item.intervalMs || 300000)), nextAt: Number(item.nextAt || Date.now() + Number(item.intervalMs || 300000)) };
+    const savedPaused = new Set(Array.isArray(item.pausedAccounts) ? item.pausedAccounts : []);
+    const accountPauseState = Object.fromEntries(accounts.map((name) => [name, item.accountPauseState?.[name] === true || savedPaused.has(name)]));
+    const task = { ...item, type: 'cycle', accounts, accountPauseState, pausedAccounts: accounts.filter((name) => accountPauseState[name]), currentStateIdx, accountStateIdx: { ...(item.accountStateIdx || {}) }, stateHistory: { ...(item.stateHistory || {}) }, runToken: Number(item.runToken || 0), initializing: false, running: false, addingAccounts: false, active: true, intervalMs: Math.max(1000, Number(item.intervalMs || 300000)), nextAt: Number(item.nextAt || Date.now() + Number(item.intervalMs || 300000)) };
     const runStateCycle = async () => {
       if (!task.active) return;
       if (task.nextAt > Date.now()) { task.timer = setTimeout(runStateCycle, task.nextAt - Date.now()); return; }
