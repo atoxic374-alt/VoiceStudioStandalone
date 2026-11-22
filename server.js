@@ -2584,7 +2584,11 @@ async function moveRotationAccount(name, task, preferredChannelId, opts = {}) {
     for (let mediaIndex = 0; mediaIndex < mediaVariants.length; mediaIndex += 1) {
       if (rotationAccountPaused(task, name)) return { name, ok: true, skipped: true, paused: true, channelId: task.accountTargets?.[name] || null };
       const variant = mediaVariants[mediaIndex];
-      const result = await withResultRetry(() => moveAccount(name, task.guildId, channelId, { ...variant, operationType: 'rotation' }));
+      const result = await withResultRetry(() => moveAccount(name, task.guildId, channelId, {
+        ...variant,
+        operationType: 'rotation',
+        isCurrent: () => task.active !== false && !rotationAccountPaused(task, name),
+      }));
       if (rotationAccountPaused(task, name)) return { name, ok: true, skipped: true, paused: true, channelId: task.accountTargets?.[name] || null };
       if (result.ok) {
         task.accountTargets = { ...(task.accountTargets || {}), [name]: channelId };
@@ -3447,9 +3451,16 @@ async function moveAccountLocked(name, guildId, channelId, opts = {}) {
     } else {
       result = await sendVoiceOpConfirmed(client, guildId, channelId, { ...desired, selfVideo: false, selfStream: false });
     }
-    if (!operationIsCurrent(operation)) { endAccountOperation(operation); return { name, ok: false, stale: true, error: 'Voice move was superseded by a newer request' }; }
+    if (!operationIsCurrent(operation) || (typeof opts.isCurrent === 'function' && !opts.isCurrent())) {
+      endAccountOperation(operation);
+      return { name, ok: false, stale: true, error: 'Voice move was superseded by a newer request' };
+    }
     if (result.ok) {
       const confirmation = await waitForConfirmedVoiceChannel(client, guildId, channelId, result.connection);
+      if (!operationIsCurrent(operation) || (typeof opts.isCurrent === 'function' && !opts.isCurrent())) {
+        endAccountOperation(operation);
+        return { name, ok: false, stale: true, error: 'Voice move was superseded by a newer request' };
+      }
       const confirmed = confirmation.state;
       if (!confirmation.ok) {
         logMediaEvent('warn', 'voice.room_move_unconfirmed', { account: name, guildId, channelId, observedChannelId: confirmed?.channelId || null, error: confirmation.error });
@@ -3475,6 +3486,10 @@ function renamePersistedAccount(oldName, newName) {
   for (const task of [...rotations.values(), ...stateCycles.values()]) {
     task.accounts = (task.accounts || []).map((account) => account === oldName ? newName : account);
     if (Array.isArray(task.pausedAccounts)) task.pausedAccounts = task.pausedAccounts.map((account) => account === oldName ? newName : account);
+    if (task.accountPauseState?.[oldName] !== undefined) {
+      task.accountPauseState[newName] = task.accountPauseState[oldName];
+      delete task.accountPauseState[oldName];
+    }
     if (task.accountTargets?.[oldName]) {
       task.accountTargets[newName] = task.accountTargets[oldName];
       delete task.accountTargets[oldName];
