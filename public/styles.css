@@ -1169,6 +1169,8 @@ body:has(.side-nav-item[data-section="playing"].is-active) .playing-card {
 .membership-result.is-member { border-color: rgba(197,168,117,.28); }
 .membership-result.is-member .membership-result-mark { background: rgba(197,168,117,.13); color: var(--green); }
 .membership-result.is-not-member .membership-result-mark { background: rgba(140,149,181,.12); color: var(--muted); }
+.membership-result.is-pending { border-color: rgba(255,190,92,.35); background: rgba(255,190,92,.04); }
+.membership-result.is-pending .membership-result-mark { background: rgba(255,190,92,.13); color: #ffbe5c; }
 .membership-result.is-error { border-color: rgba(255,113,139,.35); background: rgba(255,113,139,.04); }
 .membership-result.is-error .membership-result-mark { background: rgba(255,113,139,.13); color: var(--red); }
 @media (max-width: 690px) { .membership-check-panel { margin-left: 18px; margin-right: 18px; padding: 11px; }.membership-check-head { align-items: flex-start; flex-direction: column; }.membership-check-actions { width: 100%; }.membership-check-actions .ghost-button { flex: 1; } }

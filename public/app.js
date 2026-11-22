@@ -23,6 +23,7 @@ const state = {
   playingGuilds: [], playingGuildsLoaded: false, playingChannelCatalog: new Map(), playingRefreshTimer: null,
   playingSessions: [], playingSessionsPromise: null,
   membershipCheckBusy: false,
+  membershipOperation: '',
   guildsRequestId: 0, automationCatalogRequestId: 0, targetAccountsRequestId: 0,
   rotationSelectionGuildId: '', targetAccountsContext: '', playingChannelsRequestId: 0,
 };
@@ -344,16 +345,18 @@ function updateMembershipControls() {
   const count = selectedMembershipAccounts().length;
   const connected = state.clients.length > 0;
   $('#checkMembershipButton').disabled = !connected || !count || state.membershipCheckBusy;
+  $('#joinSelectedServerButton').disabled = !connected || !count || state.membershipCheckBusy;
   $('#selectAllMembershipAccounts').disabled = !connected || state.membershipCheckBusy;
   $('#clearMembershipAccounts').disabled = !count || state.membershipCheckBusy;
-  if ($('#checkMembershipButton')) $('#checkMembershipButton').textContent = state.membershipCheckBusy ? 'Checking membership…' : `Check selected accounts${count ? ` (${count})` : ''}`;
+  if ($('#checkMembershipButton')) $('#checkMembershipButton').textContent = state.membershipCheckBusy && state.membershipOperation === 'check' ? 'Checking membership…' : `Check selected accounts${count ? ` (${count})` : ''}`;
+  if ($('#joinSelectedServerButton')) $('#joinSelectedServerButton').textContent = state.membershipCheckBusy && state.membershipOperation === 'join' ? 'Joining selected accounts…' : `Join selected accounts${count ? ` (${count})` : ''}`;
 }
 function renderMembershipResults(results, guild) {
   const root = $('#membershipCheckResults');
   if (!root) return;
   root.innerHTML = results.length ? `<div class="membership-result-heading">${escapeHTML(guild?.name || 'Discord server')} · ${results.length} account${results.length === 1 ? '' : 's'}</div>` + results.map((result) => {
-    const tone = !result.ok ? 'is-error' : result.member ? 'is-member' : 'is-not-member';
-    const label = !result.ok ? 'Check failed' : result.member ? 'Already a member · skipped' : 'Not a member · no join attempted';
+    const tone = !result.ok ? 'is-error' : result.member ? 'is-member' : result.status === 'pending' ? 'is-pending' : 'is-not-member';
+    const label = !result.ok ? 'Check failed' : result.member ? (result.alreadyJoined ? 'Already a member' : 'Joined · confirmed') : result.status === 'pending' ? 'Join accepted · membership pending' : 'Not a member · no join attempted';
     const detail = result.ok ? (result.message || '') : (result.error || 'Membership check failed');
     return `<div class="membership-result ${tone}"><span class="membership-result-mark" aria-hidden="true">${!result.ok ? '!' : result.member ? '✓' : '–'}</span><span><strong>${escapeHTML(accountNickname(result.name))}</strong><small>${escapeHTML(result.name)} · ${escapeHTML(label)}</small>${detail ? `<small class="membership-result-detail">${escapeHTML(detail)}</small>` : ''}</span></div>`;
   }).join('') : '';
@@ -365,6 +368,7 @@ async function checkServerMembership() {
   if (!accounts.length) { feedback('#membershipCheckSummary', 'Select at least one connected account.', 'error'); return; }
   if (state.membershipCheckBusy) return;
   state.membershipCheckBusy = true;
+  state.membershipOperation = 'check';
   renderMembershipAccounts();
   feedback('#membershipCheckSummary', `Checking ${accounts.length} selected account${accounts.length === 1 ? '' : 's'}…`);
   $('#membershipCheckResults').innerHTML = '';
@@ -378,6 +382,49 @@ async function checkServerMembership() {
     feedback('#membershipCheckSummary', error.message || 'Membership check failed.', 'error');
   } finally {
     state.membershipCheckBusy = false;
+    state.membershipOperation = '';
+    renderMembershipAccounts();
+  }
+}
+async function joinSelectedAccountsToServer() {
+  const accounts = selectedMembershipAccounts();
+  const inviteUrl = String($('#joinServerInvite')?.value || '').trim();
+  if (!inviteUrl) { feedback('#membershipCheckSummary', 'Enter a Discord invite link or code above first.', 'error'); $('#joinServerInvite')?.focus(); return; }
+  if (!accounts.length) { feedback('#membershipCheckSummary', 'Select at least one connected account.', 'error'); return; }
+  if (state.membershipCheckBusy) return;
+  state.membershipCheckBusy = true;
+  state.membershipOperation = 'join';
+  renderMembershipAccounts();
+  feedback('#membershipCheckSummary', `Joining ${accounts.length} selected account${accounts.length === 1 ? '' : 's'}…`);
+  $('#membershipCheckResults').innerHTML = '';
+  const results = [];
+  let guild = null;
+  try {
+    for (let index = 0; index < accounts.length; index += 1) {
+      const name = accounts[index];
+      feedback('#membershipCheckSummary', `Joining account ${index + 1} of ${accounts.length}: ${name}…`);
+      try {
+        const result = await api('/api/ts/join-server', { method: 'POST', body: JSON.stringify({ account: name, inviteUrl }) });
+        guild = result.guild || guild;
+        const member = result.alreadyJoined === true || result.verified === true;
+        results.push({ name, ok: true, member, alreadyJoined: result.alreadyJoined === true, status: member ? 'joined' : 'pending', message: result.message || (member ? 'Membership confirmed' : 'Invite accepted; membership confirmation is pending') });
+      } catch (error) {
+        results.push({ name, ok: false, member: false, error: error.message || 'Server join failed' });
+      }
+      renderMembershipResults(results, guild);
+    }
+    const joined = results.filter((item) => item.member && !item.alreadyJoined).length;
+    const existing = results.filter((item) => item.alreadyJoined).length;
+    const pending = results.filter((item) => item.status === 'pending').length;
+    const failed = results.filter((item) => !item.ok).length;
+    feedback('#membershipCheckSummary', `${joined} joined · ${existing} already members · ${pending} pending · ${failed} failed`, failed ? 'pending' : pending ? 'pending' : 'success');
+    if (results.some((item) => item.member)) {
+      await Promise.all([refreshSessions(), loadGuilds(), loadAutomationCatalog()]);
+    }
+    toast(`${joined} joined · ${existing} already members · ${pending} pending · ${failed} failed`, failed ? 'error' : pending ? '' : 'success');
+  } finally {
+    state.membershipCheckBusy = false;
+    state.membershipOperation = '';
     renderMembershipAccounts();
   }
 }
@@ -1375,5 +1422,6 @@ function init() {
 init();
 $('#joinServerForm')?.addEventListener('submit', joinDiscordServer);
 $('#checkMembershipButton')?.addEventListener('click', checkServerMembership);
+$('#joinSelectedServerButton')?.addEventListener('click', joinSelectedAccountsToServer);
 $('#selectAllMembershipAccounts')?.addEventListener('click', () => { document.querySelectorAll('#membershipAccountList input[type="checkbox"]').forEach((input) => { input.checked = true; }); updateMembershipControls(); });
 $('#clearMembershipAccounts')?.addEventListener('click', () => { document.querySelectorAll('#membershipAccountList input[type="checkbox"]').forEach((input) => { input.checked = false; }); updateMembershipControls(); });
