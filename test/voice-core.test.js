@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, recordSuccessfulCycleState, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, registerAccountStreamer, mediaStreamers, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, schedulePlaying, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, cleanAccountRecords, buildAccountSnapshot, safeErrorSummary, guardVoiceWebSocketTeardown, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, isCaptchaChallengeError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanupPrimaryStreamAttempt, isRecoverableDiscordInteractionError, parseRotationChannelIds, removeAccountFromAutomationTasks } = require('../server');
+const { dueRotationAccounts, scheduleRotationTask, setRotationAccountPaused, rotationAccountPaused } = require('../server');
 const VoiceWebSocket = require('discord.js-selfbot-v13/src/client/voice/networking/VoiceWebSocket');
 
 test('captures delayed errors from a WebSocket after voice teardown without suppressing live errors', () => {
@@ -72,6 +73,48 @@ test('classifies stale Discord component validation failures as recoverable', ()
   assert.equal(isRecoverableDiscordInteractionError({ code: 50035, message: 'DiscordAPIError: Invalid Form Body' }), true);
   assert.equal(isRecoverableDiscordInteractionError({ code: 50035, message: 'Component validation failed' }), true);
   assert.equal(isRecoverableDiscordInteractionError({ code: 50013, message: 'Missing Permissions' }), false);
+});
+
+test('off freezes an account rotation countdown and excludes it from due rotations until on', () => {
+  const now = Date.now();
+  let rescheduleCount = 0;
+  const task = {
+    id: 'pause-resume-rotation-test', type: 'rotation', active: true,
+    accounts: ['pause-resume-account'], intervalMs: 60_000,
+    accountNextAt: { 'pause-resume-account': now + 5_000 },
+    pausedAccounts: [], pausedRemainingMs: {}, accountTargets: {}, accountStatus: {},
+    runTick() {},
+    scheduleNext() { rescheduleCount += 1; scheduleRotationTask(this); },
+  };
+
+  scheduleRotationTask(task);
+  assert.ok(task.timer);
+  assert.equal(setRotationAccountPaused(task, 'pause-resume-account', true).ok, true);
+  assert.equal(task.timer, null);
+  const savedRemaining = task.pausedRemainingMs['pause-resume-account'];
+  assert.ok(savedRemaining > 1_000 && savedRemaining <= 5_000);
+  assert.deepEqual(dueRotationAccounts(task, now + 60_000), []);
+  assert.equal(rotationAccountPaused(task, 'pause-resume-account'), true);
+
+  assert.equal(setRotationAccountPaused(task, 'pause-resume-account', false).ok, true);
+  assert.equal(rotationAccountPaused(task, 'pause-resume-account'), false);
+  assert.ok(task.accountNextAt['pause-resume-account'] > Date.now());
+  assert.equal(task.pausedRemainingMs['pause-resume-account'], undefined);
+  assert.equal(rescheduleCount, 2);
+  assert.ok(task.timer);
+  assert.deepEqual(dueRotationAccounts(task, Date.now()), []);
+  clearTimeout(task.timer);
+});
+
+test('rotation scheduler clears its timer when every account is off', () => {
+  const task = {
+    active: true, running: false, accounts: ['paused-account'],
+    pausedAccounts: ['paused-account'], accountNextAt: { 'paused-account': Date.now() },
+    runTick() {},
+  };
+  scheduleRotationTask(task);
+  assert.equal(task.timer, null);
+  assert.equal(task.nextAt, null);
 });
 
 test('cleans saved account records before they can affect the account count', () => {
