@@ -1197,21 +1197,30 @@ test('coalesces catalog changes for several accounts in the same guild', async (
   }
 });
 
-test('reserves account slots up to the configured 30-account limit without concurrent overbooking', () => {
-  const { clients, reserveAccountConnectSlots, releaseAccountConnectSlots } = require('../server');
+test('parses a positive whole-number account limit and falls back to 30 for invalid values', () => {
+  const { parseAccountLimit } = require('../server');
+  assert.equal(parseAccountLimit('50'), 50);
+  assert.equal(parseAccountLimit('0'), 30);
+  assert.equal(parseAccountLimit('-2'), 30);
+  assert.equal(parseAccountLimit('2.5'), 30);
+  assert.equal(parseAccountLimit('invalid'), 30);
+});
+
+test('reserves account slots up to the configured account limit without concurrent overbooking', () => {
+  const { clients, accountLimit, reserveAccountConnectSlots, releaseAccountConnectSlots } = require('../server');
   const previous = [...clients.entries()];
   clients.clear();
   try {
-    for (let index = 0; index < 29; index += 1) clients.set(`limit-test-${index}`, {});
+    for (let index = 0; index < accountLimit - 1; index += 1) clients.set(`limit-test-${index}`, {});
     const first = reserveAccountConnectSlots(1);
     assert.equal(first.accepted, 1);
     const competing = reserveAccountConnectSlots(1);
     assert.equal(competing.accepted, 0);
-    assert.match(competing.message, /30/);
-    assert.match(competing.message, /40/);
+    assert.ok(competing.message.includes(`(${accountLimit} حسابًا)`));
+    assert.ok(competing.message.includes(`${accountLimit + 10} حسابًا`));
     assert.match(competing.message, /20\$/);
     releaseAccountConnectSlots(first.reserved);
-    clients.set('limit-test-29', {});
+    clients.set(`limit-test-${accountLimit - 1}`, {});
     const atLimit = reserveAccountConnectSlots(1);
     assert.equal(atLimit.accepted, 0);
     assert.equal(atLimit.blocked, 1);

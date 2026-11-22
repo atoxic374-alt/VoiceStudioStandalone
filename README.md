@@ -34,6 +34,10 @@ The tests cover the complete gateway OP4 payload, gateway confirmation, non-read
 
 ## Account dashboard and background tasks
 
+### Configuring the connected-account limit
+
+The connected-account cap is controlled by the `Limit` environment variable. In Railway, open the service's **Variables** settings and add `Limit` with a positive whole number, such as `50`; redeploy or restart the service for the change to take effect. If `Limit` is unset or invalid, the app uses the default of `30`. This only changes the app's cap; increasing it also increases memory, socket, and Discord rate-limit usage, so raise it within the capacity of your Railway service.
+
 The dashboard accepts one account at a time or a bulk list. Bulk lines may be written as `name | token` or as a token alone. The server connects with a small concurrency window rather than opening hundreds of Gateway sessions at once; a single request accepts up to 500 entries and larger collections can be submitted in additional batches. There is no technically safe literal infinity: each connected account consumes memory, sockets, Discord rate-limit budget, and operating-system resources. The UI therefore reports individual successes and failures instead of failing the whole batch.
 
 Each connected account is shown with its avatar, display name, username, guild nickname when available, Discord user ID, presence status, current guild/channel, and current voice flags. Active sessions also show in the session list and refresh automatically.
