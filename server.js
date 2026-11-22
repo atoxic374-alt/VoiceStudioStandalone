@@ -1133,8 +1133,13 @@ const ownerMismatchLogs = new Map();
 function rotationTasksForAccount(name) {
   return [...rotations.values()].filter((task) => task.active !== false && (task.accounts || []).includes(name));
 }
+function persistedAccountPaused(task, name) {
+  return task?.accountPauseState?.[name] === true
+    || (Array.isArray(task?.pausedAccounts) && task.pausedAccounts.includes(name))
+    || task?.accountStatus?.[name]?.paused === true;
+}
 function rotationAccountPaused(task, name) {
-  return task.accountPauseState?.[name] === true || (task.pausedAccounts || []).includes(name);
+  return persistedAccountPaused(task, name);
 }
 function rotationAccountDeadline(task, name) {
   const ownDeadline = Number(task.accountNextAt?.[name]);
@@ -1198,14 +1203,14 @@ function setRotationAccountPaused(task, name, paused) {
   }
   task.pausedAccounts = [...current].filter((account) => (task.accounts || []).includes(account));
   task.accountPauseState = Object.fromEntries((task.accounts || []).map((account) => [account, current.has(account)]));
+  const previous = task.accountStatus?.[name] || { name, ok: true, channelId: task.accountTargets?.[name] || null, attemptedChannels: [], retries: 0 };
+  const status = { ...previous, name, paused: !!paused, at: Date.now() };
+  task.accountStatus = { ...(task.accountStatus || {}), [name]: status };
   if (!isCycle) {
     task.accountNextAt ||= {};
     if (!paused) syncRotationTaskNextAt(task);
     task.scheduleNext?.();
   }
-  const previous = task.accountStatus?.[name] || { name, ok: true, channelId: task.accountTargets?.[name] || null, attemptedChannels: [], retries: 0 };
-  const status = { ...previous, name, paused: !!paused, at: Date.now() };
-  task.accountStatus = { ...(task.accountStatus || {}), [name]: status };
   emitLive('task.account.updated', { id: task.id, taskType: task.type || (task.channels ? 'rotation' : 'cycle'), result: status, nextAt: task.nextAt, currentIdx: task.currentIdx, active: task.active !== false });
   persistAutomationTasks();
   return { ok: true, paused: !!paused, taskId: task.id, account: name };
@@ -4587,8 +4592,7 @@ async function restoreAutomationTasks() {
     if (!accounts.length) continue;
     const intervalMs = Math.max(1000, Number(item.intervalMs || 60000));
     const fallbackDeadline = Number(item.nextAt || Date.now() + intervalMs);
-    const savedPaused = new Set(Array.isArray(item.pausedAccounts) ? item.pausedAccounts : []);
-    const accountPauseState = Object.fromEntries(accounts.map((name) => [name, item.accountPauseState?.[name] === true || savedPaused.has(name)]));
+    const accountPauseState = Object.fromEntries(accounts.map((name) => [name, persistedAccountPaused(item, name)]));
     const task = {
       ...item, type: 'rotation', accounts,
       accountPauseState,
@@ -4640,8 +4644,7 @@ async function restoreAutomationTasks() {
     const currentStateIdx = Number.isInteger(Number(item.currentStateIdx)) && Number(item.currentStateIdx) >= 0 && Number(item.currentStateIdx) < item.states.length
       ? Number(item.currentStateIdx)
       : Number.isInteger(legacyIndex) && legacyIndex >= 0 && legacyIndex < item.states.length ? legacyIndex : 0;
-    const savedPaused = new Set(Array.isArray(item.pausedAccounts) ? item.pausedAccounts : []);
-    const accountPauseState = Object.fromEntries(accounts.map((name) => [name, item.accountPauseState?.[name] === true || savedPaused.has(name)]));
+    const accountPauseState = Object.fromEntries(accounts.map((name) => [name, persistedAccountPaused(item, name)]));
     const task = { ...item, type: 'cycle', accounts, accountPauseState, pausedAccounts: accounts.filter((name) => accountPauseState[name]), currentStateIdx, accountStateIdx: { ...(item.accountStateIdx || {}) }, stateHistory: { ...(item.stateHistory || {}) }, runToken: Number(item.runToken || 0), initializing: false, running: false, addingAccounts: false, active: true, intervalMs: Math.max(1000, Number(item.intervalMs || 300000)), nextAt: Number(item.nextAt || Date.now() + Number(item.intervalMs || 300000)) };
     const runStateCycle = async () => {
       if (!task.active) return;

@@ -119,6 +119,11 @@ test('rotation scheduler clears its timer when every account is off', () => {
   assert.equal(task.nextAt, null);
 });
 
+test('restored legacy accountStatus paused flag keeps the account off', () => {
+  assert.equal(rotationAccountPaused({ accountStatus: { legacy: { paused: true } } }, 'legacy'), true);
+  assert.equal(rotationAccountPaused({ accountStatus: { legacy: { paused: false } } }, 'legacy'), false);
+});
+
 test('off cancels any in-flight voice operation for the account, not only rotation operations', () => {
   const account = 'pause-any-operation-account';
   const operation = beginAccountOperation(account, 'pause-guild', 'state');
