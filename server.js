@@ -627,9 +627,9 @@ function schedulePendingVoiceLeaveRetry(pending) {
   }, delayMs);
   pending.timer.unref?.();
 }
-function queuePendingVoiceLeave(name, guildId, channelId) {
+function queuePendingVoiceLeave(name, guildId, channelId, voiceState = {}) {
   clearPendingVoiceLeave(name, guildId);
-  const pending = { name: String(name), guildId: String(guildId), channelId: String(channelId), retryCount: 0, running: false, timer: null, queuedAt: Date.now() };
+  const pending = { name: String(name), guildId: String(guildId), channelId: String(channelId), voiceState: normalizeVoiceState(voiceState), retryCount: 0, running: false, timer: null, queuedAt: Date.now() };
   pendingVoiceLeaves.set(sessionKey(name, guildId), pending);
   schedulePendingVoiceLeaveRetry(pending);
   return pending;
@@ -1612,32 +1612,98 @@ async function handlePlayingDiscordCommand(client, message) {
     } else if (isRotationCommand) {
       const rotationTasks = rotationTasksForAccount(rotationAccount);
       const cycleTasks = [...stateCycles.values()].filter((task) => task.active !== false && (task.accounts || []).includes(rotationAccount));
+      const automationTasks = [...rotationTasks, ...cycleTasks];
       if (!rotationTasks.length && !cycleTasks.length) {
         accepted = false;
         console.log(`[playing-command] ${command} rejected account=${rotationAccount} rotations=${rotationTasks.length} stateCycles=${cycleTasks.length}`);
       } else if (command === 'off') {
-        accepted = [...rotationTasks, ...cycleTasks].every((task) => setRotationAccountPaused(task, rotationAccount, true).ok);
+        const pauseResults = automationTasks.map((task) => setRotationAccountPaused(task, rotationAccount, true));
+        accepted = pauseResults.every((result) => result.ok);
+        if (accepted) {
+          const guildIds = new Set(automationTasks.map((task) => String(task.guildId || '')).filter(Boolean));
+          for (const guild of client?.guilds?.cache?.values?.() || []) {
+            const guildId = String(guild?.id || '');
+            if (guildId && readGatewayVoiceState(client, guildId)?.channelId) guildIds.add(guildId);
+          }
+          const leaveResults = await Promise.all([...guildIds].map(async (guildId) => ({
+            guildId,
+            result: await requestVoiceLeave(rotationAccount, guildId),
+          })));
+          for (const { guildId, result } of leaveResults) {
+            if (!result.channelId) continue;
+            for (const task of cycleTasks) {
+              if (String(task.guildId) !== guildId) continue;
+              task.resumeVoiceByAccount ||= {};
+              task.resumeVoiceByAccount[rotationAccount] = {
+                guildId,
+                channelId: result.channelId,
+                voiceState: result.voiceState || {},
+              };
+            }
+          }
+          persistAutomationTasks();
+          accepted = leaveResults.every(({ result }) => result.ok && !result.deferred);
+          if (!accepted) console.log(`[playing-command] off paused automation but voice leave was not confirmed account=${rotationAccount}`);
+        }
       } else if (rotationTasks.length > 1) {
         accepted = false;
         console.log(`[playing-command] on rejected account=${rotationAccount} ambiguous rotations=${rotationTasks.length} stateCycles=${cycleTasks.length}`);
+      } else if (rotationTasks.length === 1 && cycleTasks.some((task) => String(task.guildId || '') !== String(rotationTasks[0].guildId || ''))) {
+        accepted = false;
+        console.log(`[playing-command] on rejected account=${rotationAccount} automation guilds do not match`);
+      } else if (!rotationTasks.length) {
+        const cycleGuildIds = [...new Set(cycleTasks.map((task) => String(task.guildId || '')).filter(Boolean))];
+        const resumeTargets = cycleTasks
+          .map((task) => task.resumeVoiceByAccount?.[rotationAccount])
+          .filter((target) => target?.channelId);
+        const targetKeys = [...new Set(resumeTargets.map((target) => `${target.guildId}:${target.channelId}`))];
+        if (cycleGuildIds.length !== 1 || targetKeys.length > 1) {
+          accepted = false;
+          console.log(`[playing-command] on rejected account=${rotationAccount} ambiguous state-cycle resume guilds=${cycleGuildIds.length} targets=${targetKeys.length}`);
+        } else {
+          const guildId = cycleGuildIds[0];
+          const current = readGatewayVoiceState(client, guildId);
+          const target = resumeTargets[0] || (current?.channelId ? { guildId, channelId: current.channelId, voiceState: current } : null);
+          if (!target?.channelId) {
+            accepted = false;
+            console.log(`[playing-command] on rejected account=${rotationAccount} no voice room saved for state-cycle resume`);
+          } else {
+            const moved = await moveAccount(rotationAccount, guildId, target.channelId, {
+              ...normalizeVoiceState(target.voiceState || current || {}),
+              operationType: 'cycle',
+            });
+            accepted = moved.ok;
+            if (accepted) {
+              for (const task of cycleTasks) {
+                if (stateCycles.get(task.id) === task) {
+                  if (rotationAccountPaused(task, rotationAccount)) setRotationAccountPaused(task, rotationAccount, false);
+                  if (task.resumeVoiceByAccount) delete task.resumeVoiceByAccount[rotationAccount];
+                }
+              }
+              persistAutomationTasks();
+            }
+          }
+        }
       } else {
-      let result = { ok: true };
-      const rotationTask = rotationTasks[0];
-      const wasRotationPaused = rotationTask && rotationAccountPaused(rotationTask, rotationAccount);
-      if (wasRotationPaused) result = await resumeRotationAccount(rotationTask, rotationAccount);
-      const rotationStillCurrent = !rotationTask || rotations.get(rotationTask.id) === rotationTask;
-      const rotationRemainsResumed = !rotationTask || !rotationAccountPaused(rotationTask, rotationAccount);
-      accepted = rotationStillCurrent && rotationRemainsResumed && result.ok && (!result.move || result.move.ok === true);
-      if (!accepted && wasRotationPaused && rotationStillCurrent && !rotationAccountPaused(rotationTask, rotationAccount)) {
-        // Do not leave the room task half-resumed when its immediate move fails.
-        setRotationAccountPaused(rotationTask, rotationAccount, true);
-      }
+        let result = { ok: true };
+        const rotationTask = rotationTasks[0];
+        const wasRotationPaused = rotationTask && rotationAccountPaused(rotationTask, rotationAccount);
+        if (wasRotationPaused) result = await resumeRotationAccount(rotationTask, rotationAccount);
+        const rotationStillCurrent = !rotationTask || rotations.get(rotationTask.id) === rotationTask;
+        const rotationRemainsResumed = !rotationTask || !rotationAccountPaused(rotationTask, rotationAccount);
+        accepted = rotationStillCurrent && rotationRemainsResumed && result.ok && (!result.move || result.move.ok === true);
+        if (!accepted && wasRotationPaused && rotationStillCurrent && !rotationAccountPaused(rotationTask, rotationAccount)) {
+          // Do not leave the room task half-resumed when its immediate move fails.
+          setRotationAccountPaused(rotationTask, rotationAccount, true);
+        }
         if (accepted) {
           for (const task of cycleTasks) {
             if (stateCycles.get(task.id) === task && rotationAccountPaused(task, rotationAccount)) {
               setRotationAccountPaused(task, rotationAccount, false);
             }
+            if (accepted && task.resumeVoiceByAccount) delete task.resumeVoiceByAccount[rotationAccount];
           }
+          persistAutomationTasks();
         }
       }
     } else if (command === 'start') startAllPlayingSessions();
@@ -4806,37 +4872,38 @@ async function requestVoiceLeave(name, guildId) {
     // A manual leave only removes the current room session. Keep the account
     // in its active rotation so the next tick can join it again.
     if (!current?.channelId) {
-      if (pending && !gatewayReady) return { name, ok: true, deferred: true, pendingGateway: true, channelId: pending.channelId };
+      if (pending && !gatewayReady) return { name, ok: true, deferred: true, pendingGateway: true, channelId: pending.channelId, voiceState: pending.voiceState };
       clearPendingVoiceLeave(name, guildId);
       removeSessionsForAccount(name, guildId);
       return { name, ok: true, alreadyLeft: true };
     }
     const channelId = String(current.channelId);
+    const voiceState = normalizeVoiceState(current);
     // Stop only local media resources here. `leaveVoice: true` used to invoke
     // Streamer.leaveVoice() as a second Gateway operation, which failed when
     // the Gateway was disconnected and could race the explicit OP4 below.
     stopSyntheticStream(name, { silent: true });
     if (!gatewayReady) {
       disconnectPrimaryVoiceLocally(client);
-      queuePendingVoiceLeave(name, guildId, channelId);
+      queuePendingVoiceLeave(name, guildId, channelId, voiceState);
       removeSessionsForAccount(name, guildId);
       logMediaEvent('info', 'voice.leave_queued_gateway_not_ready', { account: name, guildId, channelId, gatewayStatus: shard?.status ?? null });
-      return { name, ok: true, deferred: true, pendingGateway: true, channelId };
+      return { name, ok: true, deferred: true, pendingGateway: true, channelId, voiceState };
     }
     clearPendingVoiceLeave(name, guildId);
     const result = await sendVoiceOpConfirmed(client, guildId, null, {}, 2500);
     if (result.ok) {
       removeSessionsForAccount(name, guildId);
-      return { name, ok: true };
+      return { name, ok: true, channelId, voiceState };
     }
     if (/Gateway not ready|No active gateway shard/i.test(String(result.error || ''))) {
       disconnectPrimaryVoiceLocally(client);
-      queuePendingVoiceLeave(name, guildId, channelId);
+      queuePendingVoiceLeave(name, guildId, channelId, voiceState);
       removeSessionsForAccount(name, guildId);
       logMediaEvent('info', 'voice.leave_queued_gateway_race', { account: name, guildId, channelId, error: result.error });
-      return { name, ok: true, deferred: true, pendingGateway: true, channelId };
+      return { name, ok: true, deferred: true, pendingGateway: true, channelId, voiceState };
     }
-    return { name, ok: false, error: result.error || 'Discord did not confirm leaving the voice room' };
+    return { name, ok: false, channelId, voiceState, error: result.error || 'Discord did not confirm leaving the voice room' };
   });
 }
 app.post('/api/voice/leave', async (req, res) => {

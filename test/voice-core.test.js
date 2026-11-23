@@ -1427,6 +1427,74 @@ test('Discord on/off commands control only the rotation of the connected account
   }
 });
 
+test('Discord off pauses and disconnects a state-only task, while on rejoins its saved room', async () => {
+  const { voiceSessions, pendingVoiceLeaves, clearPendingVoiceLeave } = require('../server');
+  const previousChannel = process.env.DISCORD_COMMAND_CHANNEL_ID;
+  const previousPrefix = process.env.DISCORD_COMMAND_PREFIX;
+  const savedClients = [...clients.entries()];
+  const account = `off-leave-resume-${Date.now()}`;
+  const guildId = `off-leave-guild-${Date.now()}`;
+  const userId = `off-leave-user-${Date.now()}`;
+  const roomId = `off-leave-room-${Date.now()}`;
+  const cycleId = `off-leave-cycle-${Date.now()}`;
+  const ws = new EventEmitter();
+  const guild = {
+    id: guildId,
+    channels: { cache: new Map([[roomId, { id: roomId, type: 2, userLimit: 0, members: { size: 0 }, permissionsFor: () => ({ has: () => true }) }]]) },
+    voiceStates: { cache: new Map() },
+    members: { me: {} },
+  };
+  let client;
+  const sent = [];
+  const shard = {
+    status: 0,
+    send(payload) {
+      sent.push(payload.d);
+      const update = { user_id: userId, guild_id: guildId, channel_id: payload.d.channel_id, self_mute: payload.d.self_mute, self_deaf: payload.d.self_deaf, self_video: payload.d.self_video, self_stream: payload.d.self_stream };
+      guild.voiceStates.cache.set(userId, { id: userId, guildId, channelId: payload.d.channel_id, selfMute: payload.d.self_mute, selfDeaf: payload.d.self_deaf, selfVideo: payload.d.self_video, selfStream: payload.d.self_stream });
+      client.voice.connection = payload.d.channel_id ? { channel: { id: payload.d.channel_id, guild }, status: 0 } : null;
+      ws.emit('VOICE_STATE_UPDATE', { d: update });
+    },
+  };
+  ws.shards = { first: () => shard };
+  client = new EventEmitter();
+  client.user = { id: userId };
+  client.ws = ws;
+  client.guilds = { cache: new Map([[guildId, guild]]) };
+  client.voice = { connection: { channel: { id: roomId, guild }, status: 0 } };
+  guild.voiceStates.cache.set(userId, { id: userId, guildId, channelId: roomId, selfMute: true, selfDeaf: false, selfVideo: false, selfStream: false });
+  const cycle = { id: cycleId, type: 'cycle', active: true, running: false, guildId, accounts: [account], pausedAccounts: [], accountPauseState: { [account]: false }, states: [{ selfMute: false }, { selfMute: true }], stateHistory: { [account]: [0] } };
+  process.env.DISCORD_COMMAND_CHANNEL_ID = '';
+  process.env.DISCORD_COMMAND_PREFIX = '!';
+  clients.set(account, { client });
+  stateCycles.set(cycleId, cycle);
+  voiceSessions.set(`${account}__${guildId}`, { name: account, guildId, channelId: roomId, selfMute: true, selfDeaf: false, selfVideo: false, selfStream: false });
+  const reacted = [];
+  const invoke = (id, content) => handlePlayingDiscordCommand(client, { id, content, author: { id: userId }, channel: {}, react: async (emoji) => reacted.push(emoji) });
+  try {
+    assert.equal(await invoke('off-leave-command', '!off'), true);
+    assert.deepEqual(cycle.pausedAccounts, [account]);
+    assert.equal(guild.voiceStates.cache.get(userId).channelId, null);
+    assert.equal(client.voice.connection, null);
+    assert.equal(voiceSessions.has(`${account}__${guildId}`), false);
+    assert.equal(cycle.resumeVoiceByAccount[account].channelId, roomId);
+    assert.equal(await invoke('on-rejoin-command', '!on'), true);
+    assert.deepEqual(cycle.pausedAccounts, []);
+    assert.equal(guild.voiceStates.cache.get(userId).channelId, roomId);
+    assert.equal(client.voice.connection.channel.id, roomId);
+    assert.deepEqual(sent.map((payload) => payload.channel_id), [null, roomId]);
+    assert.deepEqual(reacted, ['⏳', '✅', '⏳', '✅']);
+  } finally {
+    stateCycles.delete(cycleId);
+    clients.delete(account);
+    voiceSessions.delete(`${account}__${guildId}`);
+    clearPendingVoiceLeave(account, guildId);
+    for (const [name, entry] of savedClients) clients.set(name, entry);
+    if (previousChannel === undefined) delete process.env.DISCORD_COMMAND_CHANNEL_ID; else process.env.DISCORD_COMMAND_CHANNEL_ID = previousChannel;
+    if (previousPrefix === undefined) delete process.env.DISCORD_COMMAND_PREFIX; else process.env.DISCORD_COMMAND_PREFIX = previousPrefix;
+  }
+});
+
 test('Discord off pauses every task even with ambiguous room rotations, while on rejects ambiguous rotations', async () => {
   const previousOwners = process.env.DISCORD_COMMAND_OWNERS;
   const previousChannel = process.env.DISCORD_COMMAND_CHANNEL_ID;
