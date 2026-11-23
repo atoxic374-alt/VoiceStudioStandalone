@@ -1324,21 +1324,48 @@ test('Discord start and stop commands control every Playing session with one rea
       reacted.push(emoji);
     } }), true);
     assert.deepEqual(sessions.map((session) => session.active), [true, true]);
-    assert.deepEqual(reacted, ['✅']);
-    assert.equal(reactionAttempts, 2);
+    assert.deepEqual(reacted, ['⏳', '✅']);
+    assert.equal(reactionAttempts, 3);
     assert.equal(await handlePlayingDiscordCommand(client, { id: 'command-stop', content: 'stop', author: { id: 'owner-1' }, channel, react: async (emoji) => reacted.push(emoji) }), true);
     assert.deepEqual(sessions.map((session) => session.active), [false, false]);
-    assert.deepEqual(reacted, ['✅', '✅']);
+    assert.deepEqual(reacted, ['⏳', '✅', '⏳', '✅']);
     assert.equal(await handlePlayingDiscordCommand(client, { id: 'command-stop', content: 'stop', author: { id: 'owner-1' }, channel, react: async (emoji) => reacted.push(emoji) }), false);
-    assert.deepEqual(reacted, ['✅', '✅']);
+    assert.deepEqual(reacted, ['⏳', '✅', '⏳', '✅']);
     assert.equal(await handlePlayingDiscordCommand(client, { id: 'command-unauthorized', content: 'start', author: { id: 'not-an-owner' }, channel, react: async (emoji) => reacted.push(emoji) }), false);
-    assert.deepEqual(reacted, ['✅', '✅']);
+    assert.deepEqual(reacted, ['⏳', '✅', '⏳', '✅']);
     sessions.forEach((session) => clearTimeout(session.timer));
   } finally {
     sessions.forEach((session) => playingSessions.delete(session.account));
     for (const [account, session] of saved) playingSessions.set(account, session);
     if (previousOwners === undefined) delete process.env.DISCORD_COMMAND_OWNERS;
     else process.env.DISCORD_COMMAND_OWNERS = previousOwners;
+  }
+});
+
+test('Discord command replaces its temporary processing reaction with the final result', async () => {
+  const previousChannel = process.env.DISCORD_COMMAND_CHANNEL_ID;
+  const previousPrefix = process.env.DISCORD_COMMAND_PREFIX;
+  const savedClients = [...clients.entries()];
+  const account = 'command-ack-test';
+  const client = { user: { id: 'command-ack-user' } };
+  process.env.DISCORD_COMMAND_CHANNEL_ID = '';
+  process.env.DISCORD_COMMAND_PREFIX = '!';
+  clients.set(account, { client });
+  const sequence = [];
+  try {
+    assert.equal(await handlePlayingDiscordCommand(client, {
+      id: 'command-ack-replace', content: '!off', author: { id: client.user.id }, channel: {},
+      react: async (emoji) => {
+        sequence.push(`add:${emoji}`);
+        if (emoji === '⏳') return { users: { remove: async (user) => sequence.push(`remove:${user.id}`) } };
+      },
+    }), true);
+    assert.deepEqual(sequence, ['add:⏳', 'remove:command-ack-user', 'add:❌']);
+  } finally {
+    clients.delete(account);
+    for (const [name, entry] of savedClients) clients.set(name, entry);
+    if (previousChannel === undefined) delete process.env.DISCORD_COMMAND_CHANNEL_ID; else process.env.DISCORD_COMMAND_CHANNEL_ID = previousChannel;
+    if (previousPrefix === undefined) delete process.env.DISCORD_COMMAND_PREFIX; else process.env.DISCORD_COMMAND_PREFIX = previousPrefix;
   }
 });
 
@@ -1371,7 +1398,8 @@ test('Discord on/off commands control only the rotation of the connected account
     assert.equal(await invoke(clientA, 'rotation-off', '!off', 'discord-account-a'), true);
     assert.deepEqual(task.pausedAccounts, [accountA]);
     assert.deepEqual(cycle.pausedAccounts, [accountA]);
-    assert.equal(await invoke(clientA, 'rotation-off-again', '!off', 'discord-account-a'), true);
+    // The prefix is optional by design; both prefixed and bare forms work.
+    assert.equal(await invoke(clientA, 'rotation-off-again', 'off', 'discord-account-a'), true);
     assert.deepEqual(task.pausedAccounts, [accountA]);
     assert.deepEqual(cycle.pausedAccounts, [accountA]);
     assert.equal(isAccountManagedByActiveStateCycle(accountA, 'guild-x'), false);
@@ -1387,7 +1415,7 @@ test('Discord on/off commands control only the rotation of the connected account
     assert.deepEqual(cycle.accountStateIdx, { [accountA]: 1 });
     assert.deepEqual(cycle.stateHistory, { [accountA]: [0, 1] });
     assert.deepEqual(task.accounts, [accountA, accountB]);
-    assert.deepEqual(reacted, ['✅', '✅', '✅', '✅']);
+    assert.deepEqual(reacted, ['⏳', '✅', '⏳', '✅', '⏳', '✅', '⏳', '✅']);
   } finally {
     rotations.delete(taskId);
     stateCycles.delete(cycleId);
@@ -1399,7 +1427,7 @@ test('Discord on/off commands control only the rotation of the connected account
   }
 });
 
-test('Discord rotation on/off rejects accounts without exactly one active rotation and honors channel restriction', async () => {
+test('Discord off pauses every task even with ambiguous room rotations, while on rejects ambiguous rotations', async () => {
   const previousOwners = process.env.DISCORD_COMMAND_OWNERS;
   const previousChannel = process.env.DISCORD_COMMAND_CHANNEL_ID;
   const previousPrefix = process.env.DISCORD_COMMAND_PREFIX;
@@ -1410,6 +1438,10 @@ test('Discord rotation on/off rejects accounts without exactly one active rotati
   const secondId = 'discord-rotation-task-b';
   const first = { id: firstId, active: true, guildId: 'guild-x', accounts: [account], pausedAccounts: [] };
   const second = { id: secondId, active: true, guildId: 'guild-y', accounts: [account], pausedAccounts: [] };
+  const firstCycleId = 'discord-cycle-task-a';
+  const secondCycleId = 'discord-cycle-task-b';
+  const firstCycle = { id: firstCycleId, type: 'cycle', active: true, guildId: 'guild-x', accounts: [account], pausedAccounts: [], states: [{ selfMute: false }, { selfMute: true }] };
+  const secondCycle = { id: secondCycleId, type: 'cycle', active: true, guildId: 'guild-y', accounts: [account], pausedAccounts: [], states: [{ selfMute: false }, { selfMute: true }] };
   process.env.DISCORD_COMMAND_OWNERS = '';
   process.env.DISCORD_COMMAND_CHANNEL_ID = 'commands';
   process.env.DISCORD_COMMAND_PREFIX = '!';
@@ -1418,16 +1450,25 @@ test('Discord rotation on/off rejects accounts without exactly one active rotati
   const invoke = (id, content, channelId = 'commands') => handlePlayingDiscordCommand(accountClient, { id, content, channel: { id: channelId }, author: { id: 'rotation-self-id' }, react: async (emoji) => reacted.push(emoji) });
   try {
     assert.equal(await invoke('discord-rotation-no-task', '!off'), true);
-    assert.deepEqual(reacted, ['❌']);
+    assert.deepEqual(reacted, ['⏳', '❌']);
     rotations.set(firstId, first);
     rotations.set(secondId, second);
-    assert.equal(await invoke('discord-rotation-ambiguous', '!off'), true);
+    stateCycles.set(firstCycleId, firstCycle);
+    stateCycles.set(secondCycleId, secondCycle);
+    assert.equal(await invoke('discord-rotation-all-off', '!off'), true);
     assert.equal(await invoke('discord-rotation-wrong-channel', '!off', 'other-channel'), false);
-    assert.deepEqual(first.pausedAccounts, []);
-    assert.deepEqual(second.pausedAccounts, []);
-    assert.deepEqual(reacted, ['❌', '❌']);
+    assert.deepEqual(first.pausedAccounts, [account]);
+    assert.deepEqual(second.pausedAccounts, [account]);
+    assert.deepEqual(firstCycle.pausedAccounts, [account]);
+    assert.deepEqual(secondCycle.pausedAccounts, [account]);
+    assert.deepEqual(reacted, ['⏳', '❌', '⏳', '✅']);
+    assert.equal(await invoke('discord-rotation-on-ambiguous', '!on'), true);
+    assert.deepEqual(first.pausedAccounts, [account]);
+    assert.deepEqual(second.pausedAccounts, [account]);
+    assert.deepEqual(reacted, ['⏳', '❌', '⏳', '✅', '⏳', '❌']);
   } finally {
     rotations.delete(firstId); rotations.delete(secondId);
+    stateCycles.delete(firstCycleId); stateCycles.delete(secondCycleId);
     clients.delete(account);
     for (const [name, entry] of savedClients) clients.set(name, entry);
     if (previousOwners === undefined) delete process.env.DISCORD_COMMAND_OWNERS; else process.env.DISCORD_COMMAND_OWNERS = previousOwners;
@@ -1458,7 +1499,7 @@ test('Discord on is idempotent for an already-running rotation and state cycle',
     assert.equal(await handlePlayingDiscordCommand(client, { id: 'rotation-already-on-command', content: '!on', author: { id: client.user.id }, channel: {}, react: async (emoji) => reacted.push(emoji) }), true);
     assert.deepEqual(rotation.pausedAccounts, []);
     assert.deepEqual(cycle.pausedAccounts, []);
-    assert.deepEqual(reacted, ['✅']);
+    assert.deepEqual(reacted, ['⏳', '✅']);
   } finally {
     rotations.delete(rotationId);
     stateCycles.delete(cycleId);
@@ -1492,7 +1533,7 @@ test('Discord on keeps both task types paused and reacts with failure if room re
     assert.equal(await handlePlayingDiscordCommand(client, { id: 'rotation-resume-failure-command', content: '!on', author: { id: client.user.id }, channel: {}, react: async (emoji) => reacted.push(emoji) }), true);
     assert.deepEqual(rotation.pausedAccounts, [account]);
     assert.deepEqual(cycle.pausedAccounts, [account]);
-    assert.deepEqual(reacted, ['❌']);
+    assert.deepEqual(reacted, ['⏳', '❌']);
   } finally {
     rotations.delete(rotationId);
     stateCycles.delete(cycleId);
@@ -1714,8 +1755,8 @@ test('Discord rot is self-authenticated and validates the current server voice r
   try {
     assert.equal(await invoke('rot-validation-not-self', 'someone-else', guild), false);
     assert.equal(await invoke('rot-validation-text-room', client.user.id, guild), true);
-    assert.equal(await invoke('rot-validation-no-guild', client.user.id, null, '!rot 123456789012345678 345678901234567890'), true);
-    assert.deepEqual(reacted, ['❌', '❌']);
+    assert.equal(await invoke('rot-validation-no-guild', client.user.id, null, 'rot 123456789012345678 345678901234567890'), true);
+    assert.deepEqual(reacted, ['⏳', '❌', '⏳', '❌']);
     assert.equal([...rotations.values()].some((task) => (task.accounts || []).includes(account)), false);
     assert.equal([...stateCycles.values()].some((task) => (task.accounts || []).includes(account)), false);
   } finally {

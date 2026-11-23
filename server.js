@@ -1217,8 +1217,8 @@ function stopAllPlayingSessions(reason = 'discord-stop') {
 function playingCommandText(message) {
   const prefix = String(process.env.DISCORD_COMMAND_PREFIX || '').trim();
   const content = String(message?.content || '').trim();
-  if (prefix && !content.toLocaleLowerCase().startsWith(prefix.toLocaleLowerCase())) return '';
-  return (prefix ? content.slice(prefix.length) : content).trim().toLocaleLowerCase();
+  const hasPrefix = !!prefix && content.toLocaleLowerCase().startsWith(prefix.toLocaleLowerCase());
+  return (hasPrefix ? content.slice(prefix.length) : content).trim().toLocaleLowerCase();
 }
 async function reactToPlayingCommand(message, emoji, command, messageKey) {
   if (typeof message?.react !== 'function') {
@@ -1228,8 +1228,8 @@ async function reactToPlayingCommand(message, emoji, command, messageKey) {
   const transientCodes = new Set(['ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN', 'ECONNREFUSED', 'UND_ERR_SOCKET']);
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
-      await message.react(emoji);
-      return true;
+      const reaction = await message.react(emoji);
+      return reaction || true;
     } catch (error) {
       const code = String(error?.code || error?.cause?.code || '');
       const status = Number(error?.status || error?.statusCode || error?.httpStatus || 0);
@@ -1601,6 +1601,8 @@ async function handlePlayingDiscordCommand(client, message) {
     if (handledPlayingCommands.size > 1000) handledPlayingCommands.delete(handledPlayingCommands.values().next().value);
   }
   console.log(`[playing-command] accepted command=${command} author=${authorId} listener=${String(client?.user?.id || 'unknown')} sessions=${playingSessions.size}`);
+  // Show receipt before slow room moves or cycle initialization finish.
+  const processingReaction = await reactToPlayingCommand(message, '⏳', command, messageKey);
   let accepted = true;
   try {
     if (isRotationSetupCommand) {
@@ -1610,11 +1612,14 @@ async function handlePlayingDiscordCommand(client, message) {
     } else if (isRotationCommand) {
       const rotationTasks = rotationTasksForAccount(rotationAccount);
       const cycleTasks = [...stateCycles.values()].filter((task) => task.active !== false && (task.accounts || []).includes(rotationAccount));
-      if (rotationTasks.length > 1 || cycleTasks.length > 1 || (!rotationTasks.length && !cycleTasks.length)) {
+      if (!rotationTasks.length && !cycleTasks.length) {
         accepted = false;
         console.log(`[playing-command] ${command} rejected account=${rotationAccount} rotations=${rotationTasks.length} stateCycles=${cycleTasks.length}`);
       } else if (command === 'off') {
         accepted = [...rotationTasks, ...cycleTasks].every((task) => setRotationAccountPaused(task, rotationAccount, true).ok);
+      } else if (rotationTasks.length > 1) {
+        accepted = false;
+        console.log(`[playing-command] on rejected account=${rotationAccount} ambiguous rotations=${rotationTasks.length} stateCycles=${cycleTasks.length}`);
       } else {
       let result = { ok: true };
       const rotationTask = rotationTasks[0];
@@ -1640,6 +1645,10 @@ async function handlePlayingDiscordCommand(client, message) {
   } catch (error) {
     accepted = false;
     console.warn(`[playing-command] execution failed command=${command} account=${rotationAccount || 'n/a'}:`, redact(error?.message || error));
+  }
+  if (processingReaction && typeof processingReaction === 'object' && processingReaction.users?.remove) {
+    try { await processingReaction.users.remove(client.user); }
+    catch (error) { console.warn(`[playing-command] unable to remove processing reaction command=${command}:`, redact(error?.message || error)); }
   }
   await reactToPlayingCommand(message, accepted ? '✅' : '❌', command, messageKey);
   return true;
