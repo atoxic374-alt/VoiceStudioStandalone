@@ -458,6 +458,7 @@ let savedAccountRecords = new Map();
 const failedAccountRecords = new Map();
 const connectingTokens = new Set();
 const voiceSessions = new Map();
+const pendingVoiceLeaves = new Map();
 const rotations = new Map();
 const stateCycles = new Map();
 const voiceStateOperations = new Map();
@@ -610,6 +611,80 @@ function accountHealth(name, entry) {
   return { name, state, gatewayStatus: status ?? null, username: client?.user?.tag || client?.user?.username || name, lastError: entry?.lastError || null, connectedAt: entry?.connectedAt || null, lastSeenAt: entry?.lastSeenAt || null };
 }
 function sessionKey(name, guildId) { return `${name}__${guildId}`; }
+function clearPendingVoiceLeave(name, guildId) {
+  const key = sessionKey(name, guildId);
+  const pending = pendingVoiceLeaves.get(key);
+  if (pending?.timer) clearTimeout(pending.timer);
+  return pendingVoiceLeaves.delete(key);
+}
+function schedulePendingVoiceLeaveRetry(pending) {
+  if (!pending || pending.timer || pending.running) return;
+  const delayMs = Math.min(60_000, 1000 * (2 ** Math.min(Number(pending.retryCount) || 0, 6)));
+  pending.retryCount = (Number(pending.retryCount) || 0) + 1;
+  pending.timer = setTimeout(() => {
+    pending.timer = null;
+    flushPendingVoiceLeavesForAccount(pending.name).catch((error) => logMediaEvent('warn', 'voice.leave_retry_failed', { account: pending.name, guildId: pending.guildId, error: error?.message || String(error) }));
+  }, delayMs);
+  pending.timer.unref?.();
+}
+function queuePendingVoiceLeave(name, guildId, channelId) {
+  clearPendingVoiceLeave(name, guildId);
+  const pending = { name: String(name), guildId: String(guildId), channelId: String(channelId), retryCount: 0, running: false, timer: null, queuedAt: Date.now() };
+  pendingVoiceLeaves.set(sessionKey(name, guildId), pending);
+  schedulePendingVoiceLeaveRetry(pending);
+  return pending;
+}
+function disconnectPrimaryVoiceLocally(client) {
+  const connection = client?.voice?.connection;
+  if (!connection) return false;
+  try { connection._disconnect?.(); } catch {}
+  try { if (client.voice.connection === connection) client.voice.connection = null; } catch {}
+  return true;
+}
+async function flushPendingVoiceLeavesForAccount(name) {
+  const client = getClient(name);
+  const pending = [...pendingVoiceLeaves.values()].filter((item) => item.name === String(name));
+  if (!pending.length) return [];
+  const results = [];
+  for (const item of pending) {
+    const result = await withAccountLock(item.name, async () => {
+      if (item.running || pendingVoiceLeaves.get(sessionKey(item.name, item.guildId)) !== item) return null;
+      if (item.timer) { clearTimeout(item.timer); item.timer = null; }
+      const currentClient = getClient(item.name);
+      const shard = getGatewayShard(currentClient);
+      if (!currentClient || !shard || shard.status !== 0) {
+        schedulePendingVoiceLeaveRetry(item);
+        return { name: item.name, ok: false, pendingGateway: true };
+      }
+      const current = readGatewayVoiceState(currentClient, item.guildId);
+      if (current?.channelId && String(current.channelId) !== item.channelId) {
+        clearPendingVoiceLeave(item.name, item.guildId);
+        logMediaEvent('info', 'voice.leave_cancelled_target_changed', { account: item.name, guildId: item.guildId, requestedChannelId: item.channelId, currentChannelId: current.channelId });
+        return { name: item.name, ok: true, cancelled: true, reason: 'Account moved to another room before the queued leave ran' };
+      }
+      if (!current?.channelId) {
+        clearPendingVoiceLeave(item.name, item.guildId);
+        removeSessionsForAccount(item.name, item.guildId);
+        return { name: item.name, ok: true, alreadyLeft: true };
+      }
+      item.running = true;
+      let sent;
+      try { sent = await sendVoiceOpConfirmed(currentClient, item.guildId, null, {}, 3000); }
+      finally { item.running = false; }
+      if (sent.ok) {
+        clearPendingVoiceLeave(item.name, item.guildId);
+        removeSessionsForAccount(item.name, item.guildId);
+        logMediaEvent('info', 'voice.leave_completed_after_gateway_reconnect', { account: item.name, guildId: item.guildId, channelId: item.channelId, elapsedMs: Date.now() - item.queuedAt });
+        return { name: item.name, ok: true };
+      }
+      schedulePendingVoiceLeaveRetry(item);
+      logMediaEvent('warn', 'voice.leave_confirmation_pending', { account: item.name, guildId: item.guildId, channelId: item.channelId, error: sent.error });
+      return { name: item.name, ok: false, pendingGateway: true, error: sent.error };
+    });
+    if (result) results.push(result);
+  }
+  return results;
+}
 function cleanAccounts(accounts) {
   const values = Array.isArray(accounts) ? accounts : [accounts];
   return [...new Set(values.map((value) => String(value || '').trim()).filter(Boolean))].slice(0, 500);
@@ -1595,11 +1670,12 @@ async function mapWithConcurrency(items, limit, worker) {
   return results;
 }
 function summary(results) {
-  const okCount = results.filter((item) => item?.ok === true && !item?.skipped).length;
+  const okCount = results.filter((item) => item?.ok === true && !item?.skipped && !item?.pendingGateway).length;
   const skipped = results.filter((item) => item?.skipped === true).length;
-  const failed = results.filter((item) => item?.ok !== true && !item?.skipped).length;
+  const failed = results.filter((item) => item?.ok !== true && !item?.skipped && !item?.pendingGateway).length;
+  const pendingGateway = results.filter((item) => item?.pendingGateway === true).length;
   const retries = results.reduce((total, item) => total + Number(item?.retries || 0), 0);
-  return { total: results.length, ok: okCount, skipped, failed, retries };
+  return { total: results.length, ok: okCount, skipped, failed, pendingGateway, retries };
 }
 function retryableError(error) {
   const text = String(error?.error || error?.message || '').toLowerCase();
@@ -2369,6 +2445,54 @@ function waitForWebRtcReady(streamer, timeoutMs = 6000) {
     check();
   }), timeoutMs, 'Camera WebRTC media transport was not ready');
 }
+function primaryVoiceTransportReady(connection) {
+  const udp = connection?.sockets?.udp;
+  return connection?.status === 0
+    && !!udp?.socket
+    && !!udp?.discordAddress
+    && Number(udp?.discordPort) > 0
+    && !!udp?.localAddress
+    && Number(udp?.localPort) > 0;
+}
+async function ensurePrimaryVoiceConnectionReady(client, guildId, channelId, session = {}) {
+  let connection = client?.voice?.connection;
+  const targetChannelId = String(channelId);
+  if (String(voiceConnectionChannelId(connection) || '') === targetChannelId && primaryVoiceTransportReady(connection)) {
+    return { ok: true, connection, recovered: false };
+  }
+  const shard = getGatewayShard(client);
+  if (!shard || shard.status !== 0) return { ok: false, error: `Discord Gateway is not ready (status=${shard?.status ?? 'unavailable'}); reconnect the account before starting camera` };
+  const cached = readCachedGatewayVoiceState(client, guildId);
+  if (cached && String(cached.channelId || '') !== targetChannelId) return { ok: false, error: 'The account is no longer in the selected voice room' };
+  if (!cached && String(voiceConnectionChannelId(connection) || '') !== targetChannelId) return { ok: false, error: 'The account has no confirmed voice state for the selected room' };
+  if (connection?.streamConnection) return { ok: false, error: 'A screen-share transport is still active; stop it before rebuilding the camera voice connection' };
+  const channel = client?.guilds?.cache?.get?.(guildId)?.channels?.cache?.get?.(channelId);
+  if (!channel || typeof client?.voice?.joinChannel !== 'function') return { ok: false, error: 'VoiceManager or the selected voice room is unavailable for camera recovery' };
+  try {
+    if (connection) {
+      try { connection._disconnect?.(); } catch {}
+      try { if (client.voice.connection === connection) client.voice.connection = null; } catch {}
+    }
+    const reconnected = await withTimeout(client.voice.joinChannel(channel, {
+      selfMute: !!session.selfMute,
+      selfDeaf: false,
+      selfVideo: false,
+    }), MEDIA_JOIN_TIMEOUT_MS, 'Primary voice connection did not become ready for camera');
+    connection = client.voice.connection || reconnected;
+    if (String(voiceConnectionChannelId(connection) || '') !== targetChannelId || !primaryVoiceTransportReady(connection)) {
+      try { connection?._disconnect?.(); } catch {}
+      try { if (client.voice.connection === connection) client.voice.connection = null; } catch {}
+      return { ok: false, error: 'Primary voice connection rejoined, but its UDP media transport is still not ready' };
+    }
+    logMediaEvent('info', 'media.camera_primary_voice_recovered', { account: client.user?.username || client.user?.id || 'account', guildId, channelId: targetChannelId });
+    return { ok: true, connection, recovered: true };
+  } catch (error) {
+    const failedConnection = client?.voice?.connection;
+    try { failedConnection?._disconnect?.(); } catch {}
+    try { if (client?.voice?.connection === failedConnection) client.voice.connection = null; } catch {}
+    return { ok: false, error: `Primary voice connection could not be recovered for camera: ${error?.message || String(error)}` };
+  }
+}
 function waitForPrimaryVideoReady(connection, dispatcher, timeoutMs = 8000) {
   if (connection?.videoStatus === true) return Promise.resolve();
   return new Promise((resolve, reject) => {
@@ -2475,10 +2599,16 @@ async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live',
   const client = getClient(name);
   const target = validateMediaTarget(client, guildId, session.channelId);
   if (!target.ok) return { ok: false, error: target.error };
-  const connection = client?.voice?.connection;
-  if (!connection || voiceConnectionChannelId(connection) !== String(session.channelId)) return { ok: false, error: 'The account has no active voice connection' };
+  let connection = client?.voice?.connection;
+  if (mediaKind !== 'camera' && (!connection || voiceConnectionChannelId(connection) !== String(session.channelId))) return { ok: false, error: 'The account has no active voice connection' };
+  if (mediaKind === 'camera' && connection && voiceConnectionChannelId(connection) && voiceConnectionChannelId(connection) !== String(session.channelId)) return { ok: false, error: 'The account has moved to another voice room' };
   const cooldownError = primaryMediaRetryError(name, guildId, session.channelId, mediaKind);
   if (cooldownError) return { ok: false, error: cooldownError, cooldown: true, retryAfterMs: primaryMediaRetryAfterMs(name, guildId, session.channelId, mediaKind) };
+  if (mediaKind === 'camera') {
+    const primary = await ensurePrimaryVoiceConnectionReady(client, guildId, session.channelId, session);
+    if (!primary.ok) return primary;
+    connection = primary.connection;
+  }
   compactPrimaryVoiceClosingListeners(connection);
   // playVideo() starts FFmpeg internally. Feed it the reusable one-hour file
   // instead of starting a second FFmpeg producer for every account.
@@ -3369,7 +3499,7 @@ function sendVoiceOpConfirmed(client, guildId, channelId, opts = {}, timeoutMs =
     };
     const cachedStateMatches = () => {
       const state = readGatewayVoiceState(client, guildId);
-      if (!state || (channelId != null && String(state.channelId) !== String(channelId))) return false;
+      if (!state || (channelId == null ? state.channelId != null : String(state.channelId) !== String(channelId))) return false;
       return Object.entries(opts).every(([key, value]) => !['selfMute', 'selfDeaf', 'selfVideo', 'selfStream'].includes(key)
         || (state[key] === undefined ? value === false && optionalFalseFlags.has(key) : !!state[key] === !!value));
     };
@@ -3535,9 +3665,16 @@ function buildClientSnapshots() {
   const sessionByName = new Map([...voiceSessions.values()].map((session) => [session.name, session]));
   return [...clients.entries()].map(([name, entry]) => {
     const user = entry.client?.user;
-    const savedVoice = sessionByName.get(name) || null;
+    const savedVoiceCandidate = sessionByName.get(name) || null;
     const guilds = [...(entry.client?.guilds?.cache?.values?.() || [])];
-    const actualVoice = guilds.map((guild) => readGatewayVoiceState(entry.client, guild.id)).find((voice) => voice?.channelId) || null;
+    const actualVoiceCandidate = guilds.map((guild) => readGatewayVoiceState(entry.client, guild.id)).find((voice) => voice?.channelId) || null;
+    const pendingLeave = [...pendingVoiceLeaves.values()].find((item) => item.name === name);
+    const pendingLeaveStillTargetsRoom = !!pendingLeave && (
+      (actualVoiceCandidate && String(actualVoiceCandidate.guildId) === pendingLeave.guildId && String(actualVoiceCandidate.channelId) === pendingLeave.channelId)
+      || (!actualVoiceCandidate && savedVoiceCandidate && String(savedVoiceCandidate.guildId) === pendingLeave.guildId && String(savedVoiceCandidate.channelId) === pendingLeave.channelId)
+    );
+    const savedVoice = pendingLeaveStillTargetsRoom ? null : savedVoiceCandidate;
+    const actualVoice = pendingLeaveStillTargetsRoom ? null : actualVoiceCandidate;
     const savedGuildVoice = savedVoice && entry.client ? readGatewayVoiceState(entry.client, savedVoice.guildId) : null;
     // A cached VoiceState with channelId=null is authoritative: do not display
     // the last persisted room as though the account were still connected.
@@ -3829,6 +3966,11 @@ async function moveAccountLocked(name, guildId, channelId, opts = {}) {
     }
     const target = validateTarget(client, guildId, channelId);
     if (!target.ok) { endAccountOperation(operation); return { name, ok: false, error: target.error }; }
+    const queuedLeave = pendingVoiceLeaves.get(sessionKey(name, guildId));
+    if (queuedLeave) {
+      clearPendingVoiceLeave(name, guildId);
+      logMediaEvent('info', 'voice.leave_cancelled_by_room_move', { account: name, guildId, queuedChannelId: queuedLeave.channelId, targetChannelId: String(channelId) });
+    }
     const saved = voiceSessions.get(sessionKey(name, guildId));
     const observed = readGatewayVoiceState(client, guildId);
     const current = { ...(saved || {}), ...(observed || {}) };
@@ -4037,7 +4179,13 @@ async function connectOne(token, name) {
     refreshCachedVoiceRoomCounts(finalName, client, oldState, newState);
   });
   const reportGatewayHealth = () => { entry.lastSeenAt = Date.now(); emitLive('account.health.changed', { account: accountHealth(finalName, entry) }); };
-  for (const event of ['shardReady', 'shardResume', 'shardReconnecting', 'shardDisconnect', 'shardError']) client.on?.(event, reportGatewayHealth);
+  const onGatewayReady = () => {
+    reportGatewayHealth();
+    flushPendingVoiceLeavesForAccount(finalName).catch((error) => logMediaEvent('warn', 'voice.leave_retry_failed', { account: finalName, error: error?.message || String(error) }));
+  };
+  client.on?.('shardReady', onGatewayReady);
+  client.on?.('shardResume', onGatewayReady);
+  for (const event of ['shardReconnecting', 'shardDisconnect', 'shardError']) client.on?.(event, reportGatewayHealth);
   watchGuildCatalogEvents(finalName, entry);
   queueMicrotask(() => syncInitialGatewayVoiceState(finalName, entry));
   if (!client.__voiceStudioHandlersInstalled) {
@@ -4637,25 +4785,58 @@ app.post('/api/voice/join', async (req, res) => {
   emitLive('operation.completed', { operation: 'join', results, summary: summary(results) });
   return ok(res, { results, summary: summary(results) });
 });
+async function requestVoiceLeave(name, guildId) {
+  return withAccountLock(name, async () => {
+    const client = getClient(name);
+    if (!client) return { name, ok: false, error: 'Account is not connected' };
+    const key = sessionKey(name, guildId);
+    const pending = pendingVoiceLeaves.get(key);
+    const shard = getGatewayShard(client);
+    const gatewayReady = !!shard && shard.status === 0;
+    const current = readGatewayVoiceState(client, guildId) || voiceSessions.get(key);
+    // A manual leave only removes the current room session. Keep the account
+    // in its active rotation so the next tick can join it again.
+    if (!current?.channelId) {
+      if (pending && !gatewayReady) return { name, ok: true, deferred: true, pendingGateway: true, channelId: pending.channelId };
+      clearPendingVoiceLeave(name, guildId);
+      removeSessionsForAccount(name, guildId);
+      return { name, ok: true, alreadyLeft: true };
+    }
+    const channelId = String(current.channelId);
+    // Stop only local media resources here. `leaveVoice: true` used to invoke
+    // Streamer.leaveVoice() as a second Gateway operation, which failed when
+    // the Gateway was disconnected and could race the explicit OP4 below.
+    stopSyntheticStream(name, { silent: true });
+    if (!gatewayReady) {
+      disconnectPrimaryVoiceLocally(client);
+      queuePendingVoiceLeave(name, guildId, channelId);
+      removeSessionsForAccount(name, guildId);
+      logMediaEvent('info', 'voice.leave_queued_gateway_not_ready', { account: name, guildId, channelId, gatewayStatus: shard?.status ?? null });
+      return { name, ok: true, deferred: true, pendingGateway: true, channelId };
+    }
+    clearPendingVoiceLeave(name, guildId);
+    const result = await sendVoiceOpConfirmed(client, guildId, null, {}, 2500);
+    if (result.ok) {
+      removeSessionsForAccount(name, guildId);
+      return { name, ok: true };
+    }
+    if (/Gateway not ready|No active gateway shard/i.test(String(result.error || ''))) {
+      disconnectPrimaryVoiceLocally(client);
+      queuePendingVoiceLeave(name, guildId, channelId);
+      removeSessionsForAccount(name, guildId);
+      logMediaEvent('info', 'voice.leave_queued_gateway_race', { account: name, guildId, channelId, error: result.error });
+      return { name, ok: true, deferred: true, pendingGateway: true, channelId };
+    }
+    return { name, ok: false, error: result.error || 'Discord did not confirm leaving the voice room' };
+  });
+}
 app.post('/api/voice/leave', async (req, res) => {
   const accounts = cleanAccounts(req.body?.accounts);
   const guildId = String(req.body?.guildId || '');
   if (!accounts.length || !guildId) return fail(res, new Error('accounts and guildId are required'), 400);
-  // Leaving is intentionally fast and idempotent. Wrapping it in the normal
-  // three-attempt retry helper multiplied a 5s gateway confirmation into a
-  // request long enough for Railway/browser fetch to time out.
-  const results = await mapWithConcurrency(accounts, 12, (name) => withAccountLock(name, async () => {
-    const client = getClient(name);
-    if (!client) return { name, ok: false, error: 'Account is not connected' };
-    const current = readGatewayVoiceState(client, guildId) || voiceSessions.get(sessionKey(name, guildId));
-    // A manual leave only removes the current room session. Keep the account
-    // in its active rotation so the next tick can join it again.
-    if (!current?.channelId) { removeSessionsForAccount(name, guildId); return { name, ok: true, alreadyLeft: true }; }
-    stopSyntheticStream(name, { leaveVoice: true });
-    const result = await sendVoiceOpConfirmed(client, guildId, null, {}, 2500);
-    if (result.ok) removeSessionsForAccount(name, guildId);
-    return { name, ok: result.ok, error: result.ok ? null : result.error };
-  }));
+  // Leaving stays idempotent and fast; if Discord is disconnected, return a
+  // queued status immediately and retry with bounded backoff after reconnect.
+  const results = await mapWithConcurrency(accounts, 12, (name) => requestVoiceLeave(name, guildId));
   emitLive('operation.completed', { operation: 'leave', results, summary: summary(results) });
   return ok(res, { results, summary: summary(results) });
 });
@@ -5133,4 +5314,4 @@ if (require.main === module) {
 }
 
 module.exports = { app, clients, accountLimit: limit, parseAccountLimit, voiceSessions, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, compactStateHistory, recordSuccessfulCycleState, getRateLimitBucket, pruneRateLimitBuckets, reserveAccountConnectSlots, releaseAccountConnectSlots, playingSessions, stopPlayingSession, schedulePlaying, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, parseRotationChannelIds, startDiscordAccountRotation, removeAccountFromAutomationTasks, rotationTasksForAccount, rotationAccountPaused, rotationAccountDeadline, dueRotationAccounts, scheduleRotationTask, setRotationAccountPaused, resumeRotationAccount, rotationControlledAccounts, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, hardenVoiceConnection, cleanupPrimaryStreamAttempt, guardVoiceWebSocketTeardown, safeErrorSummary, buildAccountSnapshot, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, registerAccountStreamer, mediaStreamers, mediaQueueSnapshot, enqueueGlobalMediaStart, ensureSyntheticVideo, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, isCaptchaChallengeError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, mediaTransportReadyForTarget, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanAccountRecords, saveReadableAccountJson, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, projectGatewayVoiceState, buildClientSnapshots, buildVoiceGuildCatalog, buildPlayingChannelCatalog, invalidateVoiceGuildCatalog, scheduleCatalogEvent, liveEvents, isRecoverableDiscordInteractionError };
-Object.assign(module.exports, { clearPrimaryMediaFailure, discordRetryAfterMs, failureResultFromError, isHardMediaFailure, isRateLimitFailure, resetFailedCameraState, retryDelayWithJitter });
+Object.assign(module.exports, { clearPrimaryMediaFailure, discordRetryAfterMs, failureResultFromError, isHardMediaFailure, isRateLimitFailure, resetFailedCameraState, retryDelayWithJitter, pendingVoiceLeaves, queuePendingVoiceLeave, clearPendingVoiceLeave, flushPendingVoiceLeavesForAccount, requestVoiceLeave, primaryVoiceTransportReady, ensurePrimaryVoiceConnectionReady });

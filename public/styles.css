@@ -1191,3 +1191,6 @@ body:has(.side-nav-item[data-section="playing"].is-active) .playing-card {
 .resource-platform-note { display: grid; gap: 6px; margin-top: 20px; padding: 16px 18px; border-inline-start: 3px solid var(--accent, #d4b77b); border-radius: 10px; background: rgba(255,255,255,.03); }
 .resource-platform-note span { color: var(--muted, #a9a39a); line-height: 1.55; }
 @media (max-width: 760px) { .resource-metrics { grid-template-columns: 1fr; } .resource-metric { padding: 16px; } }
+
+.operation-account.is-pending { border-color: rgba(255, 196, 99, .45); background: rgba(255, 196, 99, .06); }
+.operation-loader.is-pending { border-color: rgba(255, 196, 99, .55); border-top-color: #ffc463; animation: none; }

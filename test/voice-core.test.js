@@ -714,6 +714,157 @@ test('does not hang when a client has no active shard', async () => {
   assert.deepEqual(result, { ok: false, error: 'No active gateway shard' });
 });
 
+test('does not treat a stale cached room as confirmation that a null-channel leave succeeded', async () => {
+  const { client } = fakeClient({ confirms: false });
+  client.guilds = { cache: new Map([['guild-1', {
+    id: 'guild-1', voiceStates: { cache: new Map([['user-1', { id: 'user-1', guildId: 'guild-1', channelId: 'channel-1' }]]) },
+  }]]) };
+  const result = await sendVoiceOpConfirmed(client, 'guild-1', null, {}, 100);
+  assert.equal(result.ok, false);
+  assert.match(result.error, /did not confirm/);
+});
+
+test('queues a leave locally when Gateway is disconnected instead of surfacing status 5 as an error', async () => {
+  const { pendingVoiceLeaves, requestVoiceLeave, voiceSessions } = require('../server');
+  const suffix = `${Date.now()}-${Math.random()}`;
+  const name = `deferred-leave-${suffix}`;
+  const guildId = `guild-${suffix}`;
+  const userId = `user-${suffix}`;
+  const ws = new EventEmitter();
+  let sent = 0;
+  const shard = { status: 5, send() { sent += 1; } };
+  ws.shards = { first: () => shard };
+  const client = new EventEmitter();
+  client.user = { id: userId, username: name };
+  client.ws = ws;
+  client.guilds = { cache: new Map([[guildId, { id: guildId, voiceStates: { cache: new Map([[userId, { id: userId, guildId, channelId: 'room-1' }]]) } }]]) };
+  let localDisconnects = 0;
+  client.voice = { connection: { channel: { id: 'room-1' }, _disconnect() { localDisconnects += 1; } } };
+  const key = `${name}__${guildId}`;
+  clients.set(name, { client });
+  voiceSessions.set(key, { name, guildId, channelId: 'room-1' });
+  try {
+    const result = await requestVoiceLeave(name, guildId);
+    assert.equal(result.ok, true);
+    assert.equal(result.deferred, true);
+    assert.equal(result.pendingGateway, true);
+    assert.equal(result.channelId, 'room-1');
+    assert.equal(sent, 0, 'must not send OP4 while disconnected');
+    assert.equal(localDisconnects, 1, 'local media/voice resources should be detached');
+    assert.equal(client.voice.connection, null);
+    assert.equal(pendingVoiceLeaves.get(key)?.channelId, 'room-1');
+    assert.equal(voiceSessions.has(key), false);
+  } finally {
+    require('../server').clearPendingVoiceLeave(name, guildId);
+    clients.delete(name);
+    voiceSessions.delete(key);
+  }
+});
+
+test('sends the queued leave after Gateway becomes ready and clears its pending record', async () => {
+  const { pendingVoiceLeaves, queuePendingVoiceLeave, flushPendingVoiceLeavesForAccount, voiceSessions, clearPendingVoiceLeave } = require('../server');
+  const suffix = `${Date.now()}-${Math.random()}`;
+  const name = `flush-leave-${suffix}`;
+  const guildId = `guild-${suffix}`;
+  const userId = `user-${suffix}`;
+  const ws = new EventEmitter();
+  const shard = { status: 5, send(payload) {
+    setImmediate(() => ws.emit('VOICE_STATE_UPDATE', {
+      user_id: userId, guild_id: guildId, channel_id: payload.d.channel_id,
+      self_mute: false, self_deaf: false, self_video: false, self_stream: false,
+    }));
+  } };
+  ws.shards = { first: () => shard };
+  const client = new EventEmitter();
+  client.user = { id: userId, username: name };
+  client.ws = ws;
+  client.guilds = { cache: new Map([[guildId, { id: guildId, voiceStates: { cache: new Map([[userId, { id: userId, guildId, channelId: 'room-1' }]]) } }]]) };
+  clients.set(name, { client });
+  const key = `${name}__${guildId}`;
+  voiceSessions.set(key, { name, guildId, channelId: 'room-1' });
+  queuePendingVoiceLeave(name, guildId, 'room-1');
+  try {
+    shard.status = 0;
+    const results = await flushPendingVoiceLeavesForAccount(name);
+    assert.deepEqual(results, [{ name, ok: true }]);
+    assert.equal(pendingVoiceLeaves.has(key), false);
+    assert.equal(voiceSessions.has(key), false);
+  } finally {
+    clearPendingVoiceLeave(name, guildId);
+    clients.delete(name);
+    voiceSessions.delete(key);
+  }
+});
+
+test('cancels a queued leave when the account has moved to another room before retry', async () => {
+  const { pendingVoiceLeaves, queuePendingVoiceLeave, flushPendingVoiceLeavesForAccount, clearPendingVoiceLeave } = require('../server');
+  const suffix = `${Date.now()}-${Math.random()}`;
+  const name = `moved-before-leave-${suffix}`;
+  const guildId = `guild-${suffix}`;
+  const userId = `user-${suffix}`;
+  const ws = new EventEmitter();
+  let sent = 0;
+  const shard = { status: 0, send() { sent += 1; } };
+  ws.shards = { first: () => shard };
+  const client = new EventEmitter();
+  client.user = { id: userId, username: name };
+  client.ws = ws;
+  client.guilds = { cache: new Map([[guildId, { id: guildId, voiceStates: { cache: new Map([[userId, { id: userId, guildId, channelId: 'room-2' }]]) } }]]) };
+  clients.set(name, { client });
+  const key = `${name}__${guildId}`;
+  queuePendingVoiceLeave(name, guildId, 'room-1');
+  try {
+    const results = await flushPendingVoiceLeavesForAccount(name);
+    assert.deepEqual(results, [{ name, ok: true, cancelled: true, reason: 'Account moved to another room before the queued leave ran' }]);
+    assert.equal(sent, 0, 'must not send OP4 after the account moved');
+    assert.equal(pendingVoiceLeaves.has(key), false);
+  } finally {
+    clearPendingVoiceLeave(name, guildId);
+    clients.delete(name);
+  }
+});
+
+test('requires a connected primary voice and initialized UDP socket before video transmission', () => {
+  const { primaryVoiceTransportReady } = require('../server');
+  const ready = { status: 0, sockets: { udp: { socket: {}, discordAddress: '127.0.0.1', discordPort: 5000, localAddress: '127.0.0.1', localPort: 5001 } } };
+  assert.equal(primaryVoiceTransportReady(ready), true);
+  assert.equal(primaryVoiceTransportReady({ ...ready, status: 1 }), false);
+  assert.equal(primaryVoiceTransportReady({ ...ready, sockets: { udp: { discordAddress: '127.0.0.1', discordPort: 5000, localAddress: '127.0.0.1', localPort: 5001 } } }), false);
+});
+
+test('rebuilds a broken camera voice connection through VoiceManager without a competing transport', async () => {
+  const { ensurePrimaryVoiceConnectionReady } = require('../server');
+  const guildId = 'camera-recovery-guild';
+  const channelId = 'camera-recovery-room';
+  const userId = 'camera-recovery-user';
+  const channel = { id: channelId };
+  let oldDisconnects = 0;
+  const oldConnection = { status: 1, channel, _disconnect() { oldDisconnects += 1; } };
+  const freshConnection = { status: 0, channel, sockets: { udp: { socket: {}, discordAddress: '127.0.0.1', discordPort: 5000, localAddress: '127.0.0.1', localPort: 5001 } } };
+  const shard = { status: 0, send() {} };
+  const client = {
+    user: { id: userId },
+    ws: { shards: { first: () => shard } },
+    guilds: { cache: new Map([[guildId, {
+      id: guildId,
+      channels: { cache: new Map([[channelId, channel]]) },
+      voiceStates: { cache: new Map([[userId, { id: userId, guildId, channelId }]]) },
+    }]]) },
+    voice: { connection: oldConnection, async joinChannel(joinedChannel, options) {
+      assert.equal(joinedChannel, channel);
+      assert.deepEqual(options, { selfMute: true, selfDeaf: false, selfVideo: false });
+      this.connection = freshConnection;
+      return freshConnection;
+    } },
+  };
+  const result = await ensurePrimaryVoiceConnectionReady(client, guildId, channelId, { selfMute: true });
+  assert.equal(result.ok, true);
+  assert.equal(result.recovered, true);
+  assert.equal(result.connection, freshConnection);
+  assert.equal(oldDisconnects, 1);
+  assert.equal(client.voice.connection, freshConnection);
+});
+
 test('does not accept a voice event that omits requested state flags', async () => {
   const { client } = fakeClient({ confirms: false });
   const pending = sendVoiceOpConfirmed(client, 'guild-1', 'channel-1', { selfMute: true }, 80);
