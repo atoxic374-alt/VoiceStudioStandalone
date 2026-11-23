@@ -2305,15 +2305,17 @@ async function joinMediaVoiceWithDiagnostics(client, streamer, guildId, channelI
     if (!['VOICE_STATE_UPDATE', 'VOICE_SERVER_UPDATE'].includes(packet?.t)) return;
     const data = packet.d || {};
     const isState = packet.t === 'VOICE_STATE_UPDATE';
-    const isOwn = !isState || String(data.user_id) === String(client.user?.id);
+    const isOwn = isState && String(data.user_id) === String(client.user?.id);
     const guildMatches = !data.guild_id || String(data.guild_id) === String(guildId);
     const channelMatches = !isState || data.channel_id == null || String(data.channel_id) === String(channelId);
-    if (!guildMatches) events.voiceEventGuildMismatch += 1;
-    if (!channelMatches) events.voiceEventChannelMismatch += 1;
-    if (isOwn && guildMatches && channelMatches) {
-      if (isState) events.rawVoiceState += 1; else events.rawVoiceServer += 1;
+    if (isState && isOwn) {
+      if (!guildMatches) events.voiceEventGuildMismatch += 1;
+      if (!channelMatches) events.voiceEventChannelMismatch += 1;
+      if (guildMatches && channelMatches) events.rawVoiceState += 1;
+    } else if (!isState && guildMatches) {
+      events.rawVoiceServer += 1;
     }
-    if (events.samples.length < 12) events.samples.push({ type: packet.t, guildId: data.guild_id ?? null, channelId: data.channel_id ?? null, endpoint: data.endpoint ?? null, hasToken: Boolean(data.token), hasSessionId: Boolean(data.session_id), isOwn });
+    if (events.samples.length < 12 && (isOwn || (!isState && guildMatches))) events.samples.push({ type: packet.t, guildId: data.guild_id ?? null, channelId: data.channel_id ?? null, endpoint: data.endpoint ?? null, hasToken: Boolean(data.token), hasSessionId: Boolean(data.session_id), isOwn });
   };
   const onVoiceState = (data) => { events.voiceState += 1; if (events.samples.length < 12) events.samples.push({ type: 'streamer:VOICE_STATE_UPDATE', guildId: data?.guild_id ?? null, channelId: data?.channel_id ?? null, hasSessionId: Boolean(data?.session_id) }); };
   const onVoiceServer = (data) => { events.voiceServer += 1; if (events.samples.length < 12) events.samples.push({ type: 'streamer:VOICE_SERVER_UPDATE', guildId: data?.guild_id ?? null, endpoint: data?.endpoint ?? null, hasToken: Boolean(data?.token) }); };
