@@ -1163,12 +1163,18 @@ test('Discord start and stop commands control every Playing session with one rea
   const sessions = ['discord-command-1', 'discord-command-2'].map((account) => ({ account, channelId: 'text', steps: [{ button: 'Join' }], intervalMs: 60000, active: false, status: 'saved', timer: null }));
   sessions.forEach((session) => playingSessions.set(session.account, session));
   const reacted = [];
+  let reactionAttempts = 0;
   const channel = {};
   const client = { user: { id: 'owner-1' } };
   try {
-    assert.equal(await handlePlayingDiscordCommand(client, { id: 'command-start', content: 'start', author: { id: 'owner-1' }, channel, react: async (emoji) => reacted.push(emoji) }), true);
+    assert.equal(await handlePlayingDiscordCommand(client, { id: 'command-start', content: 'start', author: { id: 'owner-1' }, channel, react: async (emoji) => {
+      reactionAttempts += 1;
+      if (reactionAttempts === 1) { const error = new Error('temporary network reset'); error.code = 'ECONNRESET'; throw error; }
+      reacted.push(emoji);
+    } }), true);
     assert.deepEqual(sessions.map((session) => session.active), [true, true]);
     assert.deepEqual(reacted, ['✅']);
+    assert.equal(reactionAttempts, 2);
     assert.equal(await handlePlayingDiscordCommand(client, { id: 'command-stop', content: 'stop', author: { id: 'owner-1' }, channel, react: async (emoji) => reacted.push(emoji) }), true);
     assert.deepEqual(sessions.map((session) => session.active), [false, false]);
     assert.deepEqual(reacted, ['✅', '✅']);
@@ -1261,14 +1267,14 @@ test('Discord rotation on/off rejects accounts without exactly one active rotati
   const invoke = (id, content, channelId = 'commands') => handlePlayingDiscordCommand(accountClient, { id, content, channel: { id: channelId }, author: { id: 'rotation-self-id' }, react: async (emoji) => reacted.push(emoji) });
   try {
     assert.equal(await invoke('discord-rotation-no-task', '!off'), true);
-    assert.deepEqual(reacted, []);
+    assert.deepEqual(reacted, ['❌']);
     rotations.set(firstId, first);
     rotations.set(secondId, second);
     assert.equal(await invoke('discord-rotation-ambiguous', '!off'), true);
     assert.equal(await invoke('discord-rotation-wrong-channel', '!off', 'other-channel'), false);
     assert.deepEqual(first.pausedAccounts, []);
     assert.deepEqual(second.pausedAccounts, []);
-    assert.deepEqual(reacted, []);
+    assert.deepEqual(reacted, ['❌', '❌']);
   } finally {
     rotations.delete(firstId); rotations.delete(secondId);
     clients.delete(account);
@@ -1313,7 +1319,7 @@ test('Discord on is idempotent for an already-running rotation and state cycle',
   }
 });
 
-test('Discord on keeps both task types paused and emits no reaction if room resumption fails', async () => {
+test('Discord on keeps both task types paused and reacts with failure if room resumption fails', async () => {
   const previousOwners = process.env.DISCORD_COMMAND_OWNERS;
   const previousChannel = process.env.DISCORD_COMMAND_CHANNEL_ID;
   const previousPrefix = process.env.DISCORD_COMMAND_PREFIX;
@@ -1335,7 +1341,7 @@ test('Discord on keeps both task types paused and emits no reaction if room resu
     assert.equal(await handlePlayingDiscordCommand(client, { id: 'rotation-resume-failure-command', content: '!on', author: { id: client.user.id }, channel: {}, react: async (emoji) => reacted.push(emoji) }), true);
     assert.deepEqual(rotation.pausedAccounts, [account]);
     assert.deepEqual(cycle.pausedAccounts, [account]);
-    assert.deepEqual(reacted, []);
+    assert.deepEqual(reacted, ['❌']);
   } finally {
     rotations.delete(rotationId);
     stateCycles.delete(cycleId);
@@ -1558,7 +1564,7 @@ test('Discord rot is self-authenticated and validates the current server voice r
     assert.equal(await invoke('rot-validation-not-self', 'someone-else', guild), false);
     assert.equal(await invoke('rot-validation-text-room', client.user.id, guild), true);
     assert.equal(await invoke('rot-validation-no-guild', client.user.id, null, '!rot 123456789012345678 345678901234567890'), true);
-    assert.deepEqual(reacted, []);
+    assert.deepEqual(reacted, ['❌', '❌']);
     assert.equal([...rotations.values()].some((task) => (task.accounts || []).includes(account)), false);
     assert.equal([...stateCycles.values()].some((task) => (task.accounts || []).includes(account)), false);
   } finally {

@@ -1145,6 +1145,31 @@ function playingCommandText(message) {
   if (prefix && !content.toLocaleLowerCase().startsWith(prefix.toLocaleLowerCase())) return '';
   return (prefix ? content.slice(prefix.length) : content).trim().toLocaleLowerCase();
 }
+async function reactToPlayingCommand(message, emoji, command, messageKey) {
+  if (typeof message?.react !== 'function') {
+    console.warn(`[playing-command] cannot add ${emoji}: Discord message has no react() method command=${command} message=${messageKey || 'unknown'}`);
+    return false;
+  }
+  const transientCodes = new Set(['ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN', 'ECONNREFUSED', 'UND_ERR_SOCKET']);
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      await message.react(emoji);
+      return true;
+    } catch (error) {
+      const code = String(error?.code || error?.cause?.code || '');
+      const status = Number(error?.status || error?.statusCode || error?.httpStatus || 0);
+      const retryable = transientCodes.has(code) || status === 429 || status >= 500;
+      if (!retryable || attempt === 3) {
+        console.warn(`[playing-command] unable to add ${emoji} command=${command} message=${messageKey || 'unknown'} attempts=${attempt}:`, redact(error?.message || error));
+        return false;
+      }
+      const delay = attempt * 300;
+      console.warn(`[playing-command] transient reaction error; retry ${attempt + 1}/3 command=${command}:`, redact(error?.message || error));
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+  return false;
+}
 const handledPlayingCommands = new Set();
 const channelMismatchLogs = new Map();
 const ownerMismatchLogs = new Map();
@@ -1502,19 +1527,20 @@ async function handlePlayingDiscordCommand(client, message) {
   }
   console.log(`[playing-command] accepted command=${command} author=${authorId} listener=${String(client?.user?.id || 'unknown')} sessions=${playingSessions.size}`);
   let accepted = true;
-  if (isRotationSetupCommand) {
-    const result = await startDiscordAccountRotation(client, message, rotationAccount, command.replace(/^rot\s*/, ''));
-    accepted = result.ok;
-    if (!result.ok) console.log(`[playing-command] rot rejected account=${rotationAccount} error=${result.error}`);
-  } else if (isRotationCommand) {
-    const rotationTasks = rotationTasksForAccount(rotationAccount);
-    const cycleTasks = [...stateCycles.values()].filter((task) => task.active !== false && (task.accounts || []).includes(rotationAccount));
-    if (rotationTasks.length > 1 || cycleTasks.length > 1 || (!rotationTasks.length && !cycleTasks.length)) {
-      accepted = false;
-      console.log(`[playing-command] ${command} rejected account=${rotationAccount} rotations=${rotationTasks.length} stateCycles=${cycleTasks.length}`);
-    } else if (command === 'off') {
-      accepted = [...rotationTasks, ...cycleTasks].every((task) => setRotationAccountPaused(task, rotationAccount, true).ok);
-    } else {
+  try {
+    if (isRotationSetupCommand) {
+      const result = await startDiscordAccountRotation(client, message, rotationAccount, command.replace(/^rot\s*/, ''));
+      accepted = result.ok;
+      if (!result.ok) console.log(`[playing-command] rot rejected account=${rotationAccount} error=${result.error}`);
+    } else if (isRotationCommand) {
+      const rotationTasks = rotationTasksForAccount(rotationAccount);
+      const cycleTasks = [...stateCycles.values()].filter((task) => task.active !== false && (task.accounts || []).includes(rotationAccount));
+      if (rotationTasks.length > 1 || cycleTasks.length > 1 || (!rotationTasks.length && !cycleTasks.length)) {
+        accepted = false;
+        console.log(`[playing-command] ${command} rejected account=${rotationAccount} rotations=${rotationTasks.length} stateCycles=${cycleTasks.length}`);
+      } else if (command === 'off') {
+        accepted = [...rotationTasks, ...cycleTasks].every((task) => setRotationAccountPaused(task, rotationAccount, true).ok);
+      } else {
       let result = { ok: true };
       const rotationTask = rotationTasks[0];
       const wasRotationPaused = rotationTask && rotationAccountPaused(rotationTask, rotationAccount);
@@ -1526,27 +1552,21 @@ async function handlePlayingDiscordCommand(client, message) {
         // Do not leave the room task half-resumed when its immediate move fails.
         setRotationAccountPaused(rotationTask, rotationAccount, true);
       }
-      if (accepted) {
-        for (const task of cycleTasks) {
-          if (stateCycles.get(task.id) === task && rotationAccountPaused(task, rotationAccount)) {
-            setRotationAccountPaused(task, rotationAccount, false);
+        if (accepted) {
+          for (const task of cycleTasks) {
+            if (stateCycles.get(task.id) === task && rotationAccountPaused(task, rotationAccount)) {
+              setRotationAccountPaused(task, rotationAccount, false);
+            }
           }
         }
       }
-    }
-  } else {
-    if (command === 'start') startAllPlayingSessions();
+    } else if (command === 'start') startAllPlayingSessions();
     else stopAllPlayingSessions();
-  }
-  try {
-    if (accepted) await message.react?.('✅');
   } catch (error) {
-    // Reactions are optional confirmation and may be forbidden in the source
-    // channel. Never turn a successful command into a noisy process error.
-    if (!/Missing Permissions|Missing Access|Unknown Message/i.test(String(error?.message || error))) {
-      console.warn('[playing-command] unable to add confirmation reaction:', error.message);
-    }
+    accepted = false;
+    console.warn(`[playing-command] execution failed command=${command} account=${rotationAccount || 'n/a'}:`, redact(error?.message || error));
   }
+  await reactToPlayingCommand(message, accepted ? '✅' : '❌', command, messageKey);
   return true;
 }
 function cleanChannelIds(channelIds) {
