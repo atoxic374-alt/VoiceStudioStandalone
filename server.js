@@ -3052,6 +3052,20 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
   const channel = client.guilds?.cache?.get?.(guildId)?.channels?.cache?.get?.(session.channelId);
   if (!channel) return { ok: false, error: 'Voice channel is not available for streaming' };
   let primaryConnection = client.voice?.connection;
+  const gatewayVoiceState = readGatewayVoiceState(client, guildId);
+  if (MEDIA_TRANSPORT_MODE === 'primary' && !primaryConnection
+      && String(gatewayVoiceState?.channelId || '') === String(session.channelId)) {
+    logMediaEvent('warn', 'media.primary_voice_session_refresh', { account: name, guildId, channelId: session.channelId, mediaKind, reason: 'gateway-in-room-without-live-connection' });
+    const left = await sendVoiceOpConfirmed(client, guildId, null, {
+      selfMute: !!session.selfMute, selfDeaf: !!session.selfDeaf, selfVideo: false, selfStream: false,
+      confirmOmittedFalseFlags: ['selfVideo', 'selfStream'],
+    }, 5000);
+    if (!left.ok) {
+      logMediaEvent('warn', 'media.primary_voice_session_refresh_failed', { account: name, guildId, channelId: session.channelId, mediaKind, error: left.error });
+      return { ok: false, error: `Could not reset the stale Discord voice session: ${left.error}` };
+    }
+    await new Promise((resolve) => setTimeout(resolve, 300));
+  }
   if (MEDIA_TRANSPORT_MODE === 'primary'
       && (!primaryConnection || String(voiceConnectionChannelId(primaryConnection)) !== String(session.channelId))
       && typeof client.voice?.joinChannel === 'function') {
