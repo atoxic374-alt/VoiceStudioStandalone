@@ -899,6 +899,17 @@ test('allows a dedicated media fallback only after the primary VoiceManager conn
   assert.equal(dedicatedMediaFallbackAllowed({}), true);
 });
 
+test('releases the VoiceManager connection before Streamer owns the media handshake', () => {
+  const { releasePrimaryVoiceForStreamer } = require('../server');
+  let disconnected = 0;
+  const connection = { _disconnect() { disconnected += 1; } };
+  const client = { voice: { connection } };
+  assert.equal(releasePrimaryVoiceForStreamer(client, { account: 'streamer-switch-test' }), true);
+  assert.equal(disconnected, 1);
+  assert.equal(client.voice.connection, null);
+  assert.equal(releasePrimaryVoiceForStreamer(client), false);
+});
+
 test('rebuilds a broken camera voice connection through VoiceManager without a competing transport', async () => {
   const { ensurePrimaryVoiceConnectionReady } = require('../server');
   const guildId = 'camera-recovery-guild';

@@ -23,10 +23,10 @@ const AUTH_ENABLED = process.env.NODE_ENV === 'production' || process.env.VOICE_
 const app = express();
 const PORT = Number(process.env.PORT || 5050);
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data'));
-// Prefer the authenticated primary voice connection for media. Use a separate
-// Streamer handshake only after the primary connection is gone; never run both
-// voice owners concurrently. Ignore the legacy environment override.
-const MEDIA_TRANSPORT_MODE = 'primary';
+// Camera and Go Live use one dedicated Streamer voice owner. Any VoiceManager
+// connection is released before the Streamer handshake to prevent competing
+// VOICE_STATE_UPDATE / VOICE_SERVER_UPDATE negotiations.
+const MEDIA_TRANSPORT_MODE = 'streamer';
 function isEmptyPersistedJson(file) {
   try {
     const value = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '').trim());
@@ -2749,6 +2749,18 @@ function primaryMediaTransportCheck(connection, mediaKind, channelId) {
 function dedicatedMediaFallbackAllowed(client) {
   return !client?.voice?.connection;
 }
+function releasePrimaryVoiceForStreamer(client, context = {}) {
+  const connection = client?.voice?.connection;
+  if (!connection) return false;
+  attachVoiceTransportErrorHandler(connection, { ...context, transport: 'voice' });
+  guardVoiceWebSocketTeardown(connection, { ...context, transport: 'voice' });
+  try {
+    if (typeof connection._disconnect === 'function') connection._disconnect();
+    else connection.disconnect?.();
+  } catch {}
+  try { if (client.voice.connection === connection) client.voice.connection = null; } catch {}
+  return true;
+}
 async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live', isCurrent = () => true) {
   const client = getClient(name);
   const target = validateMediaTarget(client, guildId, session.channelId);
@@ -3118,7 +3130,13 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
     logMediaEvent('warn', 'media.dedicated_fallback_blocked', { account: name, guildId, channelId: session.channelId, mediaKind, reason: primaryCheck.reason });
     return { ok: false, error };
   }
-  logMediaEvent('info', 'media.dedicated_transport_selected', { account: name, guildId, channelId: session.channelId, mediaKind, mode: MEDIA_TRANSPORT_MODE, primaryConnectionPresent: !!client.voice?.connection, fallback: MEDIA_TRANSPORT_MODE === 'primary' ? 'primary-unavailable' : 'configured' });
+  const releasedPrimary = releasePrimaryVoiceForStreamer(client, { account: name, guildId, channelId: session.channelId });
+  if (releasedPrimary) {
+    logMediaEvent('info', 'media.primary_voice_released_for_streamer', { account: name, guildId, channelId: session.channelId, mediaKind });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    if (!isCurrentRun()) return { ok: false, cancelled: true, error: 'Media start cancelled by a newer account operation' };
+  }
+  logMediaEvent('info', 'media.dedicated_transport_selected', { account: name, guildId, channelId: session.channelId, mediaKind, mode: MEDIA_TRANSPORT_MODE, primaryConnectionPresent: !!client.voice?.connection, fallback: 'streamer-only' });
   let lastError;
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     let streamer;
@@ -4147,7 +4165,12 @@ async function moveAccountLocked(name, guildId, channelId, opts = {}) {
     const hasCanonicalConnection = client.voice?.connection
       && String(voiceConnectionChannelId(client.voice.connection)) === String(channelId)
       && (client.voice.connection.status == null || client.voice.connection.status === 0);
-    if (current?.channelId === channelId && hasCanonicalConnection) {
+    const activeStreamer = syntheticStreams.get(name);
+    const hasActiveStreamerConnection = activeStreamer?.streamer
+      && String(activeStreamer.guildId) === String(guildId)
+      && String(activeStreamer.channelId) === String(channelId)
+      && mediaTransportReadyForTarget(name, guildId, channelId, activeStreamer.mediaKind, activeStreamer, client);
+    if (current?.channelId === channelId && (hasCanonicalConnection || hasActiveStreamerConnection)) {
       endAccountOperation(operation);
       return { name, ok: true, alreadyIn: true, channelId };
     }
@@ -5515,3 +5538,4 @@ module.exports = { app, clients, accountLimit: limit, parseAccountLimit, voiceSe
 Object.assign(module.exports, { clearPrimaryMediaFailure, discordRetryAfterMs, failureResultFromError, isHardMediaFailure, isRateLimitFailure, resetFailedCameraState, retryDelayWithJitter, pendingVoiceLeaves, queuePendingVoiceLeave, clearPendingVoiceLeave, flushPendingVoiceLeavesForAccount, requestVoiceLeave, primaryVoiceTransportReady, cleanupTimedOutPrimaryVoice, ensurePrimaryVoiceConnectionReady });
 Object.assign(module.exports, { primaryMediaTransportCheck });
 Object.assign(module.exports, { dedicatedMediaFallbackAllowed });
+Object.assign(module.exports, { releasePrimaryVoiceForStreamer });

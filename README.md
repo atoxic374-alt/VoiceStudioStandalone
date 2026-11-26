@@ -64,7 +64,7 @@ The same connected account can create or replace its own automatic rotation with
 
 The camera preview is a generated blank canvas; it does not access the device camera or request camera permission. The backend still attempts to apply Discord's camera voice state. The screen-share preview uses its own local capture flow.
 
-The backend prefers the authenticated primary voice connection for camera and Go Live. If that connection cannot be established and VoiceManager no longer owns a live connection, it falls back to one isolated `Streamer` transport and makes at most one delayed retry; it never starts both transports concurrently. The media source is a short synthetic H.264 stream produced with `ffmpeg-static`. This is an experimental, unofficial client path and may fail when Discord changes Go Live/WebRTC or DAVE/E2EE requirements. Failures are logged in `data/media-events.log`.
+Camera and Go Live both use one dedicated `Streamer` transport. Before it starts, any existing VoiceManager connection is released so the account does not run competing voice handshakes; retries also create an isolated Streamer transport. The media source is a short synthetic H.264 stream produced with `ffmpeg-static`. This is an experimental, unofficial client path and may fail when Discord changes Go Live/WebRTC or DAVE/E2EE requirements. Failures are logged in `data/media-events.log`.
 
 ## Project layout
 
