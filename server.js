@@ -2353,6 +2353,16 @@ loadPrimaryMediaFailures();
 function withTimeout(promise, timeoutMs, message, options = {}) {
   let timer;
   let timedOut = false;
+  let timeoutCleanupSettled = false;
+  const runSettledAfterTimeout = () => {
+    if (!timedOut || timeoutCleanupSettled) return;
+    timeoutCleanupSettled = true;
+    try { options.onSettledAfterTimeout?.(); } catch (error) { logMediaEvent('warn', 'timeout.late_cleanup_failed', { error: error?.message || String(error) }); }
+  };
+  const original = Promise.resolve(promise);
+  // Keep observing the original operation after the race rejects. This absorbs
+  // late rejections and lets callers clean a transport that appears late.
+  original.then(runSettledAfterTimeout, runSettledAfterTimeout).catch(() => {});
   const timeout = new Promise((_, reject) => {
     timer = setTimeout(() => {
       timedOut = true;
@@ -2360,11 +2370,9 @@ function withTimeout(promise, timeoutMs, message, options = {}) {
       reject(new Error(message));
     }, Math.max(1, Number(timeoutMs) || 1));
   });
-  return Promise.race([Promise.resolve(promise), timeout]).finally(() => {
+  return Promise.race([original, timeout]).finally(() => {
     clearTimeout(timer);
-    if (timedOut) {
-      try { options.onSettledAfterTimeout?.(); } catch {}
-    }
+    runSettledAfterTimeout();
   });
 }
 async function playPrimaryMediaAndWait(streamConnection, sourceStream, signaling, isCurrent = () => true) {
@@ -2567,6 +2575,17 @@ function primaryVoiceTransportReady(connection) {
     && !!udp?.localAddress
     && Number(udp?.localPort) > 0;
 }
+function cleanupTimedOutPrimaryVoice(client, channelId, expectedConnection = null) {
+  const connection = client?.voice?.connection;
+  if (!connection) return false;
+  if (expectedConnection && connection !== expectedConnection) return false;
+  const currentChannelId = voiceConnectionChannelId(connection);
+  if (currentChannelId && String(currentChannelId) !== String(channelId)) return false;
+  try { connection._disconnect?.(); } catch {}
+  try { connection.stop?.(); } catch {}
+  try { if (client.voice.connection === connection) client.voice.connection = null; } catch {}
+  return true;
+}
 async function ensurePrimaryVoiceConnectionReady(client, guildId, channelId, session = {}) {
   let connection = client?.voice?.connection;
   const targetChannelId = String(channelId);
@@ -2590,7 +2609,10 @@ async function ensurePrimaryVoiceConnectionReady(client, guildId, channelId, ses
       selfMute: !!session.selfMute,
       selfDeaf: false,
       selfVideo: false,
-    }), MEDIA_JOIN_TIMEOUT_MS, 'Primary voice connection did not become ready for camera');
+    }), MEDIA_JOIN_TIMEOUT_MS, 'Primary voice connection did not become ready for camera', {
+      onTimeout: () => cleanupTimedOutPrimaryVoice(client, targetChannelId),
+      onSettledAfterTimeout: () => cleanupTimedOutPrimaryVoice(client, targetChannelId),
+    });
     connection = client.voice.connection || reconnected;
     if (String(voiceConnectionChannelId(connection) || '') !== targetChannelId || !primaryVoiceTransportReady(connection)) {
       try { connection?._disconnect?.(); } catch {}
@@ -2744,7 +2766,10 @@ async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live',
         const connecting = connection.createStreamConnection();
         pendingStreamConnection = connection.streamConnection;
         attachVoiceTransportErrorHandler(pendingStreamConnection, { account: name, transport: 'primary-stream', guildId, channelId: session.channelId });
-        streamConnection = await withTimeout(connecting, MEDIA_STREAM_TIMEOUT_MS, `Discord media connection timed out after ${Math.round(MEDIA_STREAM_TIMEOUT_MS / 1000)} seconds`);
+        streamConnection = await withTimeout(connecting, MEDIA_STREAM_TIMEOUT_MS, `Discord media connection timed out after ${Math.round(MEDIA_STREAM_TIMEOUT_MS / 1000)} seconds`, {
+          onTimeout: () => cleanupPrimaryStreamAttempt(connection, pendingStreamConnection || connection.streamConnection),
+          onSettledAfterTimeout: () => cleanupPrimaryStreamAttempt(connection, pendingStreamConnection || connection.streamConnection),
+        });
         pendingStreamConnection = streamConnection;
         dispatcher = await playPrimaryMediaAndWait(streamConnection, source, Promise.resolve(), isCurrent);
       }
@@ -3017,7 +3042,10 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
         selfMute: !!session.selfMute,
         selfDeaf: false,
         selfVideo: false,
-      }), MEDIA_JOIN_TIMEOUT_MS, 'Primary voice connection did not become ready');
+      }), MEDIA_JOIN_TIMEOUT_MS, 'Primary voice connection did not become ready', {
+        onTimeout: () => cleanupTimedOutPrimaryVoice(client, session.channelId),
+        onSettledAfterTimeout: () => cleanupTimedOutPrimaryVoice(client, session.channelId),
+      });
       logMediaEvent('info', 'media.primary_voice_ready', { account: name, guildId, channelId: session.channelId, mediaKind, source: 'voice.joinChannel' });
       // Some discord.js-selfbot versions update the manager's connection
       // property after the promise resolves instead of returning the exact
@@ -4111,9 +4139,12 @@ async function moveAccountLocked(name, guildId, channelId, opts = {}) {
       try {
         const connection = await withTimeout(client.voice.joinChannel(voiceChannel, {
           selfMute: !!desired.selfMute,
-          selfDeaf: !!desired.selfDeaf,
+          selfDeaf: false,
           selfVideo: false,
-        }), MEDIA_JOIN_TIMEOUT_MS, 'Primary voice connection did not become ready');
+        }), MEDIA_JOIN_TIMEOUT_MS, 'Primary voice connection did not become ready', {
+          onTimeout: () => cleanupTimedOutPrimaryVoice(client, channelId),
+          onSettledAfterTimeout: () => cleanupTimedOutPrimaryVoice(client, channelId),
+        });
         hardenVoiceConnection(client.voice?.connection || connection);
         result = { ok: true, connection };
       } catch (error) {
@@ -5442,4 +5473,4 @@ if (require.main === module) {
 }
 
 module.exports = { app, clients, accountLimit: limit, parseAccountLimit, voiceSessions, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, compactStateHistory, recordSuccessfulCycleState, getRateLimitBucket, pruneRateLimitBuckets, reserveAccountConnectSlots, releaseAccountConnectSlots, playingSessions, stopPlayingSession, schedulePlaying, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, parseRotationChannelIds, startDiscordAccountRotation, removeAccountFromAutomationTasks, rotationTasksForAccount, rotationAccountPaused, rotationAccountDeadline, dueRotationAccounts, scheduleRotationTask, setRotationAccountPaused, resumeRotationAccount, rotationControlledAccounts, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, hardenVoiceConnection, cleanupPrimaryStreamAttempt, guardVoiceWebSocketTeardown, safeErrorSummary, buildAccountSnapshot, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, registerAccountStreamer, mediaStreamers, mediaQueueSnapshot, enqueueGlobalMediaStart, ensureSyntheticVideo, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, isCaptchaChallengeError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, mediaTransportReadyForTarget, syntheticStreams, waitForPrimaryVideoReady, waitForWebRtcReady, waitForMediaReadiness, withTimeout, clearVoiceFlags, cleanAccountRecords, saveReadableAccountJson, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, projectGatewayVoiceState, buildClientSnapshots, buildVoiceGuildCatalog, buildPlayingChannelCatalog, invalidateVoiceGuildCatalog, scheduleCatalogEvent, liveEvents, isRecoverableDiscordInteractionError };
-Object.assign(module.exports, { clearPrimaryMediaFailure, discordRetryAfterMs, failureResultFromError, isHardMediaFailure, isRateLimitFailure, resetFailedCameraState, retryDelayWithJitter, pendingVoiceLeaves, queuePendingVoiceLeave, clearPendingVoiceLeave, flushPendingVoiceLeavesForAccount, requestVoiceLeave, primaryVoiceTransportReady, ensurePrimaryVoiceConnectionReady });
+Object.assign(module.exports, { clearPrimaryMediaFailure, discordRetryAfterMs, failureResultFromError, isHardMediaFailure, isRateLimitFailure, resetFailedCameraState, retryDelayWithJitter, pendingVoiceLeaves, queuePendingVoiceLeave, clearPendingVoiceLeave, flushPendingVoiceLeavesForAccount, requestVoiceLeave, primaryVoiceTransportReady, cleanupTimedOutPrimaryVoice, ensurePrimaryVoiceConnectionReady });

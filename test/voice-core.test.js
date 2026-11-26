@@ -4,7 +4,7 @@ const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, recordSuccessfulCycleState, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, registerAccountStreamer, mediaStreamers, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, schedulePlaying, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, clearPrimaryMediaFailure, cleanAccountRecords, buildAccountSnapshot, safeErrorSummary, guardVoiceWebSocketTeardown, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, isCaptchaChallengeError, isHardMediaFailure, isRateLimitFailure, discordRetryAfterMs, retryDelayWithJitter, retryMediaTransportImmediately, resetFailedCameraState, primaryMediaTransportIsActive, mediaWatchdogReadiness, mediaTransportReadyForTarget, syntheticStreams, waitForPrimaryVideoReady, waitForWebRtcReady, waitForMediaReadiness, withTimeout, clearVoiceFlags, cleanupPrimaryStreamAttempt, isRecoverableDiscordInteractionError, parseRotationChannelIds, removeAccountFromAutomationTasks } = require('../server');
+const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, recordSuccessfulCycleState, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, registerAccountStreamer, mediaStreamers, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, schedulePlaying, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, clearPrimaryMediaFailure, cleanAccountRecords, buildAccountSnapshot, safeErrorSummary, guardVoiceWebSocketTeardown, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, isCaptchaChallengeError, isHardMediaFailure, isRateLimitFailure, discordRetryAfterMs, retryDelayWithJitter, retryMediaTransportImmediately, resetFailedCameraState, primaryMediaTransportIsActive, mediaWatchdogReadiness, mediaTransportReadyForTarget, syntheticStreams, waitForPrimaryVideoReady, waitForWebRtcReady, waitForMediaReadiness, withTimeout, cleanupTimedOutPrimaryVoice, clearVoiceFlags, cleanupPrimaryStreamAttempt, isRecoverableDiscordInteractionError, parseRotationChannelIds, removeAccountFromAutomationTasks } = require('../server');
 const { dueRotationAccounts, scheduleRotationTask, setRotationAccountPaused, rotationAccountPaused } = require('../server');
 const { failureResultFromError } = require('../server');
 const VoiceWebSocket = require('discord.js-selfbot-v13/src/client/voice/networking/VoiceWebSocket');
@@ -309,6 +309,24 @@ test('runs timeout cleanup exactly once when a media operation exceeds its deadl
     /operation timed out/,
   );
   assert.equal(cleanupCalls, 1);
+});
+
+test('runs late timeout cleanup when the underlying operation settles after the public timeout', async () => {
+  let lateCleanupCalls = 0;
+  let resolveOperation;
+  const operation = new Promise((resolve) => { resolveOperation = resolve; });
+  const pending = withTimeout(operation, 10, 'late operation timed out', { onSettledAfterTimeout: () => { lateCleanupCalls += 1; } });
+  await assert.rejects(pending, /late operation timed out/);
+  resolveOperation('late result');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(lateCleanupCalls, 1);
+});
+
+test('does not disconnect a newer primary voice connection during timeout cleanup', () => {
+  const newer = { channel: { id: 'room-new' }, _disconnect() { throw new Error('must not disconnect newer connection'); } };
+  const client = { voice: { connection: newer } };
+  assert.equal(cleanupTimedOutPrimaryVoice(client, 'room-old'), false);
+  assert.equal(client.voice.connection, newer);
 });
 
 test('rejects a stale WebRTC waiter without waiting for the full timeout', async () => {
