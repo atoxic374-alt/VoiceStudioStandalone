@@ -62,9 +62,9 @@ The same connected account can create or replace its own automatic rotation with
 
 ## Camera and screen-share behavior
 
-The camera and screen-share buttons are functional local capture controls. They request permission, show the selected source in the preview, expose a live status and timer, and clean up when the user stops the source or the browser ends the track. In a headless environment with no camera, the app shows the browser's explicit `Requested device not found` error instead of pretending the camera is live.
+The camera preview is a generated blank canvas; it does not access the device camera or request camera permission. The backend still attempts to apply Discord's camera voice state. The screen-share preview uses its own local capture flow.
 
-The backend uses the experimental media path from `@dank074/discord-video-stream@7` with its compatible `@lng2004/discord.js-selfbot-v13` peer. It prepares a short synthetic H.264 source with `ffmpeg-static` and uses a dedicated Streamer WebRTC transport for camera and Go Live by default. This avoids rebuilding the primary voice connection during media startup, which is unreliable on some hosted runtimes. Set `VOICE_STUDIO_MEDIA_TRANSPORT=primary` only for diagnostics or a deployment where the primary transport is known to work. This is an actual media attempt rather than a state-only flag, but it is not an officially supported Discord client and may fail when Discord changes its Go Live/WebRTC or DAVE/E2EE requirements. Failures are logged in `data/media-events.log`.
+The backend uses the experimental media path from `@dank074/discord-video-stream@7` with its compatible `@lng2004/discord.js-selfbot-v13` peer. It prepares a short synthetic H.264 source with `ffmpeg-static` and reuses the authenticated primary voice connection by default, avoiding a second competing Gateway voice handshake. Set `VOICE_STUDIO_MEDIA_TRANSPORT=dedicated` only for a deployment where the separate Streamer handshake is known to work. This is an actual media attempt rather than a state-only flag, but it is not an officially supported Discord client and may fail when Discord changes its Go Live/WebRTC or DAVE/E2EE requirements. Failures are logged in `data/media-events.log`.
 
 ## Project layout
 

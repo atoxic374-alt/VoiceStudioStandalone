@@ -1117,7 +1117,7 @@ async function quickLeave(name, guildId) {
   catch (error) { toast(error.message, 'error'); }
 }
 
-async function syncMediaVoiceState(next, kind) {
+async function syncMediaVoiceState(next, kind, { notifyError = true } = {}) {
   const current = state.clients.find((client) => client.name === state.selectedAccount)?.voice;
   const target = currentVoiceTarget();
   if (!target || !state.selectedAccount) {
@@ -1132,7 +1132,7 @@ async function syncMediaVoiceState(next, kind) {
     return { synced: true };
   } catch (error) {
     if ($('#mediaNotice')) $('#mediaNotice').textContent = `Discord was not updated: ${error.message}`;
-    toast(`تعذر تحديث حالة Discord: ${error.message}`, 'error');
+    if (notifyError) toast(`تعذر تحديث حالة Discord: ${error.message}`, 'error');
     return { synced: false, error };
   }
 }
@@ -1168,24 +1168,27 @@ function showMediaStream(stream, kind) {
 async function toggleCamera() {
   if (state.mediaBusy) return;
   const current = state.clients.find((client) => client.name === state.selectedAccount)?.voice;
-  if (current?.selfVideo) {
-    const synced = await syncMediaVoiceState({ selfDeaf: false, selfVideo: false, selfStream: false }, 'Camera');
-    if (!synced.synced) throw synced.error || new Error('Discord did not confirm camera shutdown');
-    stopCurrentStream({ updateDiscord: false });
-    await refreshSessions();
-    return;
-  }
   if (state.mediaKind === 'camera') { stopCurrentStream(); return; }
   state.mediaBusy = true;
+  let pendingStream = null;
   try {
+    if (current?.selfVideo) {
+      const synced = await syncMediaVoiceState({ selfDeaf: false, selfVideo: false, selfStream: false }, 'Camera', { notifyError: false });
+      if (!synced.synced) throw synced.error || new Error('Discord did not confirm camera shutdown');
+      stopCurrentStream({ updateDiscord: false });
+      await refreshSessions();
+      return;
+    }
     const canvas = document.createElement('canvas'); canvas.width = 1280; canvas.height = 720;
     const ctx = canvas.getContext('2d'); ctx.fillStyle = '#080b18'; ctx.fillRect(0, 0, canvas.width, canvas.height);
     const stream = canvas.captureStream(15);
-    const synced = await syncMediaVoiceState({ selfDeaf: false, selfVideo: true, selfStream: false }, 'Camera');
+    pendingStream = stream;
+    const synced = await syncMediaVoiceState({ selfDeaf: false, selfVideo: true, selfStream: false }, 'Camera', { notifyError: false });
     if (!synced.synced) throw synced.error || new Error('Discord did not confirm camera state');
     showMediaStream(stream, 'camera');
+    pendingStream = null;
     if ($('#mediaNotice')) $('#mediaNotice').textContent = 'Safe camera preview: a blank frame is used; no camera permission is requested.';
-  } catch (error) { toast(`تعذر تشغيل المعاينة: ${error.message}`, 'error'); addActivity('فشل تشغيل الكاميرا', error.message, 'error'); } finally { state.mediaBusy = false; updateQuickStateButtons(); }
+  } catch (error) { pendingStream?.getTracks().forEach((track) => track.stop()); toast(`تعذر تشغيل المعاينة: ${error.message}`, 'error'); addActivity('فشل تشغيل الكاميرا', error.message, 'error'); } finally { state.mediaBusy = false; updateQuickStateButtons(); }
 }
 async function toggleScreen() {
   if (state.mediaBusy) return;

@@ -23,11 +23,11 @@ const AUTH_ENABLED = process.env.NODE_ENV === 'production' || process.env.VOICE_
 const app = express();
 const PORT = Number(process.env.PORT || 5050);
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data'));
-// Media capture uses the Streamer WebRTC transport by default. Rebuilding the
-// discord.js VoiceConnection for every camera attempt is fragile on hosted
-// runtimes and can fail before the media handshake even starts. The primary
-// transport remains available as an explicit diagnostic fallback.
-const MEDIA_TRANSPORT_MODE = String(process.env.VOICE_STUDIO_MEDIA_TRANSPORT || 'dedicated').trim().toLowerCase();
+// Reuse the authenticated primary voice connection for media by default.
+// A second Streamer handshake on the same Gateway can compete for voice-state
+// events and leave the dedicated connection without its session or token.
+// Dedicated mode remains available explicitly for deployments that need it.
+const MEDIA_TRANSPORT_MODE = String(process.env.VOICE_STUDIO_MEDIA_TRANSPORT || 'primary').trim().toLowerCase();
 function isEmptyPersistedJson(file) {
   try {
     const value = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '').trim());
