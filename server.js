@@ -23,11 +23,11 @@ const AUTH_ENABLED = process.env.NODE_ENV === 'production' || process.env.VOICE_
 const app = express();
 const PORT = Number(process.env.PORT || 5050);
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data'));
-// Reuse the authenticated primary voice connection for media by default.
-// A second Streamer handshake on the same Gateway can compete for voice-state
-// events and leave the dedicated connection without its session or token.
-// Dedicated mode remains available explicitly for deployments that need it.
-const MEDIA_TRANSPORT_MODE = String(process.env.VOICE_STUDIO_MEDIA_TRANSPORT || 'primary').trim().toLowerCase();
+// Always reuse the authenticated primary voice connection for media. A second
+// Streamer handshake on the same Gateway can compete for voice-state events
+// and leave the dedicated connection without its session or token. Ignore the
+// legacy environment override so deployments cannot silently re-enable it.
+const MEDIA_TRANSPORT_MODE = 'primary';
 function isEmptyPersistedJson(file) {
   try {
     const value = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '').trim());
@@ -2735,6 +2735,18 @@ function mediaTransportReadyForTarget(name, guildId, channelId, mediaKind, activ
   const readiness = mediaWatchdogReadiness(session, client, active);
   return readiness.targetMatches && readiness.voiceReady && readiness.mediaReady && readiness.sourceReady;
 }
+function primaryMediaTransportCheck(connection, mediaKind, channelId) {
+  if (!connection) return { ok: false, reason: 'primary-voice-connection-missing' };
+  const connectionChannelId = voiceConnectionChannelId(connection);
+  if (connectionChannelId && String(connectionChannelId) !== String(channelId)) {
+    return { ok: false, reason: 'primary-voice-connection-in-another-room' };
+  }
+  const method = mediaKind === 'camera' ? 'playVideo' : 'createStreamConnection';
+  if (typeof connection[method] !== 'function') {
+    return { ok: false, reason: `primary-voice-connection-missing-${method}` };
+  }
+  return { ok: true, method };
+}
 async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live', isCurrent = () => true) {
   const client = getClient(name);
   const target = validateMediaTarget(client, guildId, session.channelId);
@@ -3067,11 +3079,11 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
   // second Streamer voice connection on the same gateway is what produces the
   // observed state=184/token=missing timeout: Discord can deliver the state
   // event while omitting VOICE_SERVER_UPDATE for the competing transport.
-    if (MEDIA_TRANSPORT_MODE === 'primary'
-        && primaryConnection && typeof primaryConnection.createStreamConnection === 'function'
-        && (!voiceConnectionChannelId(primaryConnection) || String(voiceConnectionChannelId(primaryConnection)) === String(session.channelId))) {
-      logMediaEvent('info', 'media.primary_transport_selected', { account: name, guildId, channelId: session.channelId, mediaKind });
-      const primaryResult = await startBuiltInGoLive(name, guildId, session, mediaKind, isCurrentRun);
+  const primaryCheck = primaryMediaTransportCheck(primaryConnection, mediaKind, session.channelId);
+  const canEstablishCameraVoice = mediaKind === 'camera' && !primaryConnection;
+  if (MEDIA_TRANSPORT_MODE === 'primary' && (primaryCheck.ok || canEstablishCameraVoice)) {
+    logMediaEvent('info', 'media.primary_transport_selected', { account: name, guildId, channelId: session.channelId, mediaKind, method: primaryCheck.method || 'ensure-primary-voice' });
+    const primaryResult = await startBuiltInGoLive(name, guildId, session, mediaKind, isCurrentRun);
     if (primaryResult.ok) {
       mediaDesired.set(name, { guildId, channelId: session.channelId, mediaKind });
       mediaRestartAttempts.delete(name);
@@ -3091,6 +3103,12 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
     // is the source of the missing voice-token failures.
     logMediaEvent('warn', 'media.dedicated_fallback_blocked', { account: name, guildId, channelId: session.channelId, mediaKind, reason: 'primary-voice-connection-exists' });
     return primaryResult;
+  }
+  if (MEDIA_TRANSPORT_MODE === 'primary') {
+    const error = `Primary media transport unavailable (${primaryCheck.reason}); refusing a competing dedicated voice handshake`;
+    logMediaEvent('error', 'media.primary_transport_unavailable', { account: name, guildId, channelId: session.channelId, mediaKind, reason: primaryCheck.reason, primaryConnectionPresent: !!primaryConnection });
+    logMediaEvent('warn', 'media.dedicated_fallback_blocked', { account: name, guildId, channelId: session.channelId, mediaKind, reason: primaryCheck.reason });
+    return { ok: false, error };
   }
   logMediaEvent('info', 'media.dedicated_transport_selected', { account: name, guildId, channelId: session.channelId, mediaKind, mode: MEDIA_TRANSPORT_MODE, primaryConnectionPresent: !!primaryConnection });
   let lastError;
@@ -5486,3 +5504,4 @@ if (require.main === module) {
 
 module.exports = { app, clients, accountLimit: limit, parseAccountLimit, voiceSessions, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, compactStateHistory, recordSuccessfulCycleState, getRateLimitBucket, pruneRateLimitBuckets, reserveAccountConnectSlots, releaseAccountConnectSlots, playingSessions, stopPlayingSession, schedulePlaying, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, parseRotationChannelIds, startDiscordAccountRotation, removeAccountFromAutomationTasks, rotationTasksForAccount, rotationAccountPaused, rotationAccountDeadline, dueRotationAccounts, scheduleRotationTask, setRotationAccountPaused, resumeRotationAccount, rotationControlledAccounts, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, hardenVoiceConnection, cleanupPrimaryStreamAttempt, guardVoiceWebSocketTeardown, safeErrorSummary, buildAccountSnapshot, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, registerAccountStreamer, mediaStreamers, mediaQueueSnapshot, enqueueGlobalMediaStart, ensureSyntheticVideo, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, isCaptchaChallengeError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, mediaTransportReadyForTarget, syntheticStreams, waitForPrimaryVideoReady, waitForWebRtcReady, waitForMediaReadiness, withTimeout, clearVoiceFlags, cleanAccountRecords, saveReadableAccountJson, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, projectGatewayVoiceState, buildClientSnapshots, buildVoiceGuildCatalog, buildPlayingChannelCatalog, invalidateVoiceGuildCatalog, scheduleCatalogEvent, liveEvents, isRecoverableDiscordInteractionError };
 Object.assign(module.exports, { clearPrimaryMediaFailure, discordRetryAfterMs, failureResultFromError, isHardMediaFailure, isRateLimitFailure, resetFailedCameraState, retryDelayWithJitter, pendingVoiceLeaves, queuePendingVoiceLeave, clearPendingVoiceLeave, flushPendingVoiceLeavesForAccount, requestVoiceLeave, primaryVoiceTransportReady, cleanupTimedOutPrimaryVoice, ensurePrimaryVoiceConnectionReady });
+Object.assign(module.exports, { primaryMediaTransportCheck });

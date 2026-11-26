@@ -881,6 +881,17 @@ test('requires a connected primary voice and initialized UDP socket before video
   assert.equal(primaryVoiceTransportReady({ ...ready, sockets: { udp: { discordAddress: '127.0.0.1', discordPort: 5000, localAddress: '127.0.0.1', localPort: 5001 } } }), false);
 });
 
+test('selects primary media only when its media method and requested channel are available', () => {
+  const { primaryMediaTransportCheck } = require('../server');
+  const camera = { channel: { id: 'room-1' }, playVideo() {} };
+  const live = { channel: { id: 'room-1' }, createStreamConnection() {} };
+  assert.deepEqual(primaryMediaTransportCheck(camera, 'camera', 'room-1'), { ok: true, method: 'playVideo' });
+  assert.equal(primaryMediaTransportCheck(camera, 'go-live', 'room-1').ok, false);
+  assert.deepEqual(primaryMediaTransportCheck(live, 'go-live', 'room-1'), { ok: true, method: 'createStreamConnection' });
+  assert.equal(primaryMediaTransportCheck(live, 'camera', 'room-2').reason, 'primary-voice-connection-in-another-room');
+  assert.equal(primaryMediaTransportCheck(null, 'camera', 'room-1').reason, 'primary-voice-connection-missing');
+});
+
 test('rebuilds a broken camera voice connection through VoiceManager without a competing transport', async () => {
   const { ensurePrimaryVoiceConnectionReady } = require('../server');
   const guildId = 'camera-recovery-guild';
