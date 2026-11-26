@@ -7,7 +7,7 @@ const { execFileSync, spawn } = require('child_process');
 const FFMPEG_PATH = require('ffmpeg-static');
 const { EventEmitter } = require('events');
 const { monitorEventLoopDelay } = require('perf_hooks');
-const { Client, Constants, SnowflakeUtil, Util, Options } = require('discord.js-selfbot-v13');
+const { Client, Constants, SnowflakeUtil, Util, Options } = require('@lng2004/discord.js-selfbot-v13');
 const helmet = require('helmet');
 
 const AUTH_COOKIE = 'voice_studio_auth';
@@ -23,6 +23,11 @@ const AUTH_ENABLED = process.env.NODE_ENV === 'production' || process.env.VOICE_
 const app = express();
 const PORT = Number(process.env.PORT || 5050);
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data'));
+// Media capture uses the Streamer WebRTC transport by default. Rebuilding the
+// discord.js VoiceConnection for every camera attempt is fragile on hosted
+// runtimes and can fail before the media handshake even starts. The primary
+// transport remains available as an explicit diagnostic fallback.
+const MEDIA_TRANSPORT_MODE = String(process.env.VOICE_STUDIO_MEDIA_TRANSPORT || 'dedicated').trim().toLowerCase();
 function isEmptyPersistedJson(file) {
   try {
     const value = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '').trim());
@@ -2197,7 +2202,7 @@ function guardVoiceWebSocketTeardown(connection, details = {}) {
 }
 function installVoiceWebSocketTeardownGuard() {
   try {
-    const VoiceWebSocket = require('discord.js-selfbot-v13/src/client/voice/networking/VoiceWebSocket');
+    const VoiceWebSocket = require('@lng2004/discord.js-selfbot-v13/src/client/voice/networking/VoiceWebSocket');
     const prototype = VoiceWebSocket?.prototype;
     if (!prototype || typeof prototype.onError !== 'function' || prototype.__voiceStudioTeardownGuard) return false;
     const originalOnError = prototype.onError;
@@ -3035,7 +3040,8 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
   const channel = client.guilds?.cache?.get?.(guildId)?.channels?.cache?.get?.(session.channelId);
   if (!channel) return { ok: false, error: 'Voice channel is not available for streaming' };
   let primaryConnection = client.voice?.connection;
-  if ((!primaryConnection || String(voiceConnectionChannelId(primaryConnection)) !== String(session.channelId))
+  if (MEDIA_TRANSPORT_MODE === 'primary'
+      && (!primaryConnection || String(voiceConnectionChannelId(primaryConnection)) !== String(session.channelId))
       && typeof client.voice?.joinChannel === 'function') {
     try {
       primaryConnection = await withTimeout(client.voice.joinChannel(channel, {
@@ -3061,7 +3067,8 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
   // second Streamer voice connection on the same gateway is what produces the
   // observed state=184/token=missing timeout: Discord can deliver the state
   // event while omitting VOICE_SERVER_UPDATE for the competing transport.
-    if (primaryConnection && typeof primaryConnection.createStreamConnection === 'function'
+    if (MEDIA_TRANSPORT_MODE === 'primary'
+        && primaryConnection && typeof primaryConnection.createStreamConnection === 'function'
         && (!voiceConnectionChannelId(primaryConnection) || String(voiceConnectionChannelId(primaryConnection)) === String(session.channelId))) {
       logMediaEvent('info', 'media.primary_transport_selected', { account: name, guildId, channelId: session.channelId, mediaKind });
       const primaryResult = await startBuiltInGoLive(name, guildId, session, mediaKind, isCurrentRun);
@@ -3085,7 +3092,7 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
     logMediaEvent('warn', 'media.dedicated_fallback_blocked', { account: name, guildId, channelId: session.channelId, mediaKind, reason: 'primary-voice-connection-exists' });
     return primaryResult;
   }
-  logMediaEvent('warn', 'media.primary_transport_unavailable', { account: name, guildId, channelId: session.channelId, mediaKind, hasConnection: !!primaryConnection, connectionChannelId: voiceConnectionChannelId(primaryConnection), hasCreateStreamConnection: typeof primaryConnection?.createStreamConnection === 'function' });
+  logMediaEvent('info', 'media.dedicated_transport_selected', { account: name, guildId, channelId: session.channelId, mediaKind, mode: MEDIA_TRANSPORT_MODE, primaryConnectionPresent: !!primaryConnection });
   let lastError;
   for (let attempt = 1; attempt <= 1; attempt += 1) {
     let streamer;
