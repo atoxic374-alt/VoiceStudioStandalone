@@ -2350,9 +2350,22 @@ function recordPrimaryMediaFailure(name, guildId, channelId, mediaKind, error) {
   return state;
 }
 loadPrimaryMediaFailures();
-function withTimeout(promise, timeoutMs, message) {
+function withTimeout(promise, timeoutMs, message, options = {}) {
   let timer;
-  return Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), timeoutMs); })]).finally(() => clearTimeout(timer));
+  let timedOut = false;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      timedOut = true;
+      try { options.onTimeout?.(); } catch (error) { logMediaEvent('warn', 'timeout.cleanup_failed', { error: error?.message || String(error) }); }
+      reject(new Error(message));
+    }, Math.max(1, Number(timeoutMs) || 1));
+  });
+  return Promise.race([Promise.resolve(promise), timeout]).finally(() => {
+    clearTimeout(timer);
+    if (timedOut) {
+      try { options.onSettledAfterTimeout?.(); } catch {}
+    }
+  });
 }
 async function playPrimaryMediaAndWait(streamConnection, sourceStream, signaling, isCurrent = () => true) {
   const dispatcher = streamConnection.playVideo(sourceStream, { fps: 15, presetH26x: 'superfast', bitrate: 300, inputFFmpegArgs: ['-stream_loop', '-1', '-re'], outputFFmpegArgs: ['-g', '30'] });
@@ -2475,7 +2488,9 @@ async function joinMediaVoiceWithDiagnostics(client, streamer, guildId, channelI
   streamer?._gatewayEmitter?.on?.('VOICE_SERVER_UPDATE', onVoiceServer);
   logMediaEvent('info', 'media.join.diagnostics_start', { ...context, diagnostics: mediaJoinDiagnostics(client, streamer, guildId, channelId, events) });
   try {
-    return await withTimeout(streamer.joinVoice(guildId, channelId), timeoutMs, 'Dedicated media voice connection timed out');
+    return await withTimeout(streamer.joinVoice(guildId, channelId), timeoutMs, 'Dedicated media voice connection timed out', {
+      onTimeout: () => { try { streamer.stopStream?.(); } catch {} try { streamer.voiceConnection?.stop?.(); } catch {} },
+    });
   } catch (error) {
     const diagnostics = mediaJoinDiagnostics(client, streamer, guildId, channelId, events);
     logMediaEvent('error', 'media.join.diagnostics_failed', { ...context, error: error?.message || String(error), diagnostics });
@@ -2510,15 +2525,38 @@ async function resyncPrimaryVoiceForMedia(client, guildId, channelId, session) {
   await new Promise((resolve) => setTimeout(resolve, 350));
   return primary;
 }
-function waitForWebRtcReady(streamer, timeoutMs = 6000) {
-  return withTimeout(new Promise((resolve) => {
+function waitForWebRtcReady(streamer, timeoutMs = 6000, isCurrent = () => true) {
+  return new Promise((resolve, reject) => {
+    let timer = null;
     const startedAt = Date.now();
+    const cleanup = () => { if (timer) clearTimeout(timer); timer = null; };
     const check = () => {
-      if (streamer.voiceConnection?.webRtcConn?.ready === true) return resolve();
-      if (Date.now() - startedAt < timeoutMs) return setTimeout(check, 150);
+      if (!isCurrent()) { cleanup(); reject(new Error('WebRTC wait cancelled by a newer operation')); return; }
+      if (streamer.voiceConnection?.webRtcConn?.ready === true) { cleanup(); resolve(); return; }
+      if (Date.now() - startedAt >= timeoutMs) { cleanup(); reject(new Error('Camera WebRTC media transport was not ready')); return; }
+      timer = setTimeout(check, 150);
     };
     check();
-  }), timeoutMs, 'Camera WebRTC media transport was not ready');
+  });
+}
+function waitForMediaReadiness(streamer, mediaKind, timeoutMs, isCurrent = () => true) {
+  return new Promise((resolve, reject) => {
+    let timer = null;
+    const startedAt = Date.now();
+    const cleanup = () => { if (timer) clearTimeout(timer); timer = null; };
+    const check = () => {
+      if (!isCurrent()) { cleanup(); reject(new Error('Media readiness wait cancelled by a newer operation')); return; }
+      const voiceReady = streamer.voiceConnection?.webRtcConn?.ready === true;
+      const mediaReady = mediaKind === 'camera' || streamer.voiceConnection?.streamConnection?.webRtcConn?.ready === true;
+      if (voiceReady && mediaReady) { cleanup(); resolve(); return; }
+      if (Date.now() - startedAt >= timeoutMs) {
+        cleanup(); reject(new Error(`WebRTC media transport was not ready after ${Math.round(timeoutMs / 1000)} seconds`));
+        return;
+      }
+      timer = setTimeout(check, 150);
+    };
+    check();
+  });
 }
 function primaryVoiceTransportReady(connection) {
   const udp = connection?.sockets?.udp;
@@ -3091,15 +3129,7 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
           scheduleMediaRestart(name, active, error?.message || 'media task failed', error);
         }
       });
-      await withTimeout(new Promise((resolve) => {
-        const check = () => {
-          const voiceReady = streamer.voiceConnection?.webRtcConn?.ready === true;
-          const mediaReady = mediaKind === 'camera' || streamer.voiceConnection?.streamConnection?.webRtcConn?.ready === true;
-          if (voiceReady && mediaReady) return resolve();
-          setTimeout(check, 150);
-        };
-        check();
-      }), MEDIA_WEBRTC_TIMEOUT_MS, `WebRTC media transport was not ready after ${Math.round(MEDIA_WEBRTC_TIMEOUT_MS / 1000)} seconds`);
+      await waitForMediaReadiness(streamer, mediaKind, MEDIA_WEBRTC_TIMEOUT_MS, isCurrentRun);
       logMediaEvent('info', 'media.webrtc_ready', { account: name, guildId, channelId: session.channelId, mediaKind, attempt });
       if (active.completedAt || syntheticStreams.get(name) !== active) throw new Error('Media transport stopped before activation');
       const mediaState = mediaKind === 'camera'
@@ -3174,6 +3204,8 @@ function rotationPreferredChannel(name, task, index = 0, randomTarget = null) {
 }
 async function moveRotationAccount(name, task, preferredChannelId, opts = {}) {
   const ids = [...(task.channels || [])];
+  const runToken = opts.runToken == null ? Number(task.runToken || 0) : Number(opts.runToken);
+  const isCurrentRotation = () => task.active !== false && task.runToken === runToken && (task.accounts || []).includes(name);
   if (!ids.length) return { name, ok: false, error: 'No rotation rooms configured' };
   // Room rotation owns membership only. Media flags are intentionally omitted
   // here because the state cycle owns Stream/Camera and restarting a media
@@ -3185,16 +3217,16 @@ async function moveRotationAccount(name, task, preferredChannelId, opts = {}) {
   const wasOutsideRoom = !voiceSessions.has(sessionKey(name, task.guildId));
   const mediaVariants = [roomState];
   for (const channelId of ordered) {
-    if (rotationAccountPaused(task, name)) return { name, ok: true, skipped: true, paused: true, channelId: task.accountTargets?.[name] || null };
+    if (!isCurrentRotation() || rotationAccountPaused(task, name)) return { name, ok: true, skipped: true, stale: !isCurrentRotation(), paused: rotationAccountPaused(task, name), channelId: task.accountTargets?.[name] || null };
     for (let mediaIndex = 0; mediaIndex < mediaVariants.length; mediaIndex += 1) {
-      if (rotationAccountPaused(task, name)) return { name, ok: true, skipped: true, paused: true, channelId: task.accountTargets?.[name] || null };
+      if (!isCurrentRotation() || rotationAccountPaused(task, name)) return { name, ok: true, skipped: true, stale: !isCurrentRotation(), paused: rotationAccountPaused(task, name), channelId: task.accountTargets?.[name] || null };
       const variant = mediaVariants[mediaIndex];
       const result = await withResultRetry(() => moveAccount(name, task.guildId, channelId, {
         ...variant,
         operationType: 'rotation',
-        isCurrent: () => task.active !== false && !rotationAccountPaused(task, name),
+        isCurrent: () => isCurrentRotation() && !rotationAccountPaused(task, name),
       }));
-      if (rotationAccountPaused(task, name)) return { name, ok: true, skipped: true, paused: true, channelId: task.accountTargets?.[name] || null };
+      if (!isCurrentRotation() || rotationAccountPaused(task, name)) return { name, ok: true, skipped: true, stale: !isCurrentRotation(), paused: rotationAccountPaused(task, name), channelId: task.accountTargets?.[name] || null };
       if (result.ok) {
         task.accountTargets = { ...(task.accountTargets || {}), [name]: channelId };
         return { ...result, attemptedChannels: [...last.attemptedChannels, channelId], mediaFallback: mediaIndex > 0 ? (variant.selfVideo ? 'camera' : 'live') : null, resumedAfterRemoval: wasOutsideRoom };
@@ -4995,7 +5027,7 @@ app.post('/api/voice/rotation/start', async (req, res) => {
     : null;
   const id = crypto.randomUUID();
   const startedAt = Date.now();
-  const task = { id, accounts, guildId, guildName: guildName || guildId, channels: channelIds, intervalMs: delay, randomOrder: !!randomOrder, currentIdx: 0, startedAt, nextAt: startedAt + delay, accountNextAt: Object.fromEntries(accounts.map((name) => [name, startedAt + delay])), pausedRemainingMs: {}, accountStatus: {}, accountTargets: {}, pausedAccounts: [], accountPauseState: Object.fromEntries(accounts.map((name) => [name, false])), running: true, active: true, initializing: true, lastResults: [] };
+  const task = { id, accounts, guildId, guildName: guildName || guildId, channels: channelIds, intervalMs: delay, randomOrder: !!randomOrder, currentIdx: 0, startedAt, nextAt: startedAt + delay, accountNextAt: Object.fromEntries(accounts.map((name) => [name, startedAt + delay])), pausedRemainingMs: {}, accountStatus: {}, accountTargets: {}, pausedAccounts: [], accountPauseState: Object.fromEntries(accounts.map((name) => [name, false])), running: true, active: true, initializing: true, runToken: 0, lastResults: [] };
   // Register and persist the task before moving any account. Joining a voice
   // room can take several seconds per account; keeping this request open made
   // the browser report "Failed to fetch" and left no automation visible.
@@ -5004,21 +5036,26 @@ app.post('/api/voice/rotation/start', async (req, res) => {
   emitLive('task.started', { id: task.id, taskType: 'rotation', initializing: true, accounts: task.accounts });
   const runInitial = async () => {
     let initial = [];
+    const runToken = Number(task.runToken || 0);
     try {
+      if (!task.active || task.runToken !== runToken) return;
       initial = await mapWithConcurrency(accounts, AUTOMATION_CONCURRENCY, (name, index) => {
+        if (!task.active || task.runToken !== runToken) return { name, ok: false, stale: true, error: 'Rotation was superseded before initialization' };
         if (rotationAccountPaused(task, name)) return { name, ok: true, skipped: true, paused: true };
         const current = voiceSessions.get(sessionKey(name, guildId));
         const target = initialTargets?.get(name);
         const currentIndex = channelIds.indexOf(current?.channelId);
         const preferred = target || channelIds[currentIndex >= 0 ? (currentIndex + 1) % channelIds.length : index % channelIds.length];
-        return moveRotationAccount(name, task, preferred, normalizeVoiceState(current || {}));
+        return moveRotationAccount(name, task, preferred, normalizeVoiceState(current || {}), { runToken });
       });
+      if (!task.active || task.runToken !== runToken) return;
       initial.forEach((result) => recordTaskResult(task, result));
       task.lastResults = initial;
       for (const result of initial) if (!rotationAccountPaused(task, result.name)) task.accountNextAt[result.name] = Date.now() + task.intervalMs;
       syncRotationTaskNextAt(task);
       emitLive('task.completed', { id: task.id, taskType: 'rotation', initializing: false, nextAt: task.nextAt, currentIdx: task.currentIdx, results: task.lastResults });
     } catch (error) {
+      if (!task.active || task.runToken !== runToken) return;
       const result = { name: 'rotation', ok: false, error: error?.message || String(error) };
       task.lastResults = [result];
       recordTaskResult(task, result);
@@ -5026,15 +5063,18 @@ app.post('/api/voice/rotation/start', async (req, res) => {
     } finally {
       task.initializing = false;
       task.running = false;
-      for (const name of task.accounts) if (!rotationAccountPaused(task, name)) task.accountNextAt[name] = Date.now() + task.intervalMs;
-      syncRotationTaskNextAt(task);
-      persistAutomationTasks();
-      task.scheduleNext?.();
+      if (task.active && task.runToken === runToken) {
+        for (const name of task.accounts) if (!rotationAccountPaused(task, name)) task.accountNextAt[name] = Date.now() + task.intervalMs;
+        syncRotationTaskNextAt(task);
+        persistAutomationTasks();
+        task.scheduleNext?.();
+      }
     }
   };
   runInitial().catch((error) => logMediaEvent('error', 'automation.rotation_background_failed', { id: task.id, guildId, error: error?.message || String(error) }));
   task.runTick = async () => {
     if (!task.active || task.running) return;
+    const runToken = Number(task.runToken || 0);
     const dueAccounts = dueRotationAccounts(task);
     if (!dueAccounts.length) { scheduleRotationTask(task); return; }
     task.running = true;
@@ -5048,13 +5088,18 @@ app.post('/api/voice/rotation/start', async (req, res) => {
         const current = voiceSessions.get(sessionKey(name, task.guildId));
         const randomTarget = randomTargets?.get(name);
         const preferred = rotationPreferredChannel(name, task, index, randomTarget);
-        const result = await moveRotationAccount(name, task, preferred, normalizeVoiceState(current || {}));
-        if (!rotationAccountPaused(task, name)) task.accountNextAt[name] = Date.now() + task.intervalMs;
-        return recordTaskResult(task, result);
+        const result = await moveRotationAccount(name, task, preferred, normalizeVoiceState(current || {}), { runToken });
+        if (task.active && task.runToken === runToken && !rotationAccountPaused(task, name)) {
+          task.accountNextAt[name] = Date.now() + task.intervalMs;
+          return recordTaskResult(task, result);
+        }
+        return result;
       });
-      syncRotationTaskNextAt(task);
-      persistAutomationTasks();
-      emitLive('task.completed', { id: task.id, taskType: 'rotation', nextAt: task.nextAt, currentIdx: task.currentIdx, results: task.lastResults });
+      if (task.active && task.runToken === runToken) {
+        syncRotationTaskNextAt(task);
+        persistAutomationTasks();
+        emitLive('task.completed', { id: task.id, taskType: 'rotation', nextAt: task.nextAt, currentIdx: task.currentIdx, results: task.lastResults });
+      }
     } catch (error) {
       const result = { name: 'rotation', ok: false, error: error?.message || String(error) };
       task.lastResults = [result];
@@ -5076,7 +5121,7 @@ app.post('/api/voice/rotation/stop', (req, res) => {
   const id = String(req.body?.id || '');
   const task = rotations.get(id);
   if (!task) return fail(res, new Error('Rotation not found'), 404);
-  task.active = false; clearTimeout(task.timer); rotations.delete(id); persistAutomationTasks(); return ok(res);
+  task.active = false; task.runToken = Number(task.runToken || 0) + 1; clearTimeout(task.timer); clearInterval(task.timer); rotations.delete(id); persistAutomationTasks(); return ok(res);
 });
 function findAutomationTask(type, id) {
   const collection = type === 'rotation' ? rotations : stateCycles;
@@ -5280,6 +5325,7 @@ async function restoreAutomationTasks() {
       ...item, type: 'rotation', accounts,
       accountPauseState,
       pausedAccounts: accounts.filter((name) => accountPauseState[name]),
+      runToken: Number(item.runToken || 0),
       accountTargets: { ...(item.accountTargets || {}) }, accountNextAt: { ...(item.accountNextAt || {}) },
       pausedRemainingMs: { ...(item.pausedRemainingMs || {}) }, initializing: false, running: false, active: true,
       intervalMs, nextAt: fallbackDeadline,
@@ -5289,6 +5335,7 @@ async function restoreAutomationTasks() {
     }
     task.runTick = async () => {
       if (!task.active || task.running) return;
+      const runToken = Number(task.runToken || 0);
       const dueAccounts = dueRotationAccounts(task);
       if (!dueAccounts.length) { scheduleRotationTask(task); return; }
       task.running = true;
@@ -5302,15 +5349,20 @@ async function restoreAutomationTasks() {
           const current = voiceSessions.get(sessionKey(name, task.guildId));
           const randomTarget = randomTargets?.get(name);
           const preferred = rotationPreferredChannel(name, task, index, randomTarget);
-          const result = await moveRotationAccount(name, task, preferred, normalizeVoiceState(current || {}));
-          if (!rotationAccountPaused(task, name)) task.accountNextAt[name] = Date.now() + task.intervalMs;
-          return recordTaskResult(task, result);
+          const result = await moveRotationAccount(name, task, preferred, normalizeVoiceState(current || {}), { runToken });
+          if (task.active && task.runToken === runToken && !rotationAccountPaused(task, name)) {
+            task.accountNextAt[name] = Date.now() + task.intervalMs;
+            return recordTaskResult(task, result);
+          }
+          return result;
         });
       } finally {
         task.running = false;
-        syncRotationTaskNextAt(task);
-        persistAutomationTasks();
-        scheduleRotationTask(task);
+        if (task.active && task.runToken === runToken) {
+          syncRotationTaskNextAt(task);
+          persistAutomationTasks();
+          scheduleRotationTask(task);
+        }
       }
     };
     task.scheduleNext = () => scheduleRotationTask(task);
@@ -5389,5 +5441,5 @@ if (require.main === module) {
   process.once('SIGINT', () => { persistBeforeExit(); process.exit(0); });
 }
 
-module.exports = { app, clients, accountLimit: limit, parseAccountLimit, voiceSessions, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, compactStateHistory, recordSuccessfulCycleState, getRateLimitBucket, pruneRateLimitBuckets, reserveAccountConnectSlots, releaseAccountConnectSlots, playingSessions, stopPlayingSession, schedulePlaying, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, parseRotationChannelIds, startDiscordAccountRotation, removeAccountFromAutomationTasks, rotationTasksForAccount, rotationAccountPaused, rotationAccountDeadline, dueRotationAccounts, scheduleRotationTask, setRotationAccountPaused, resumeRotationAccount, rotationControlledAccounts, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, hardenVoiceConnection, cleanupPrimaryStreamAttempt, guardVoiceWebSocketTeardown, safeErrorSummary, buildAccountSnapshot, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, registerAccountStreamer, mediaStreamers, mediaQueueSnapshot, enqueueGlobalMediaStart, ensureSyntheticVideo, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, isCaptchaChallengeError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, mediaTransportReadyForTarget, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanAccountRecords, saveReadableAccountJson, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, projectGatewayVoiceState, buildClientSnapshots, buildVoiceGuildCatalog, buildPlayingChannelCatalog, invalidateVoiceGuildCatalog, scheduleCatalogEvent, liveEvents, isRecoverableDiscordInteractionError };
+module.exports = { app, clients, accountLimit: limit, parseAccountLimit, voiceSessions, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, compactStateHistory, recordSuccessfulCycleState, getRateLimitBucket, pruneRateLimitBuckets, reserveAccountConnectSlots, releaseAccountConnectSlots, playingSessions, stopPlayingSession, schedulePlaying, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, parseRotationChannelIds, startDiscordAccountRotation, removeAccountFromAutomationTasks, rotationTasksForAccount, rotationAccountPaused, rotationAccountDeadline, dueRotationAccounts, scheduleRotationTask, setRotationAccountPaused, resumeRotationAccount, rotationControlledAccounts, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, hardenVoiceConnection, cleanupPrimaryStreamAttempt, guardVoiceWebSocketTeardown, safeErrorSummary, buildAccountSnapshot, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, registerAccountStreamer, mediaStreamers, mediaQueueSnapshot, enqueueGlobalMediaStart, ensureSyntheticVideo, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, isCaptchaChallengeError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, mediaTransportReadyForTarget, syntheticStreams, waitForPrimaryVideoReady, waitForWebRtcReady, waitForMediaReadiness, withTimeout, clearVoiceFlags, cleanAccountRecords, saveReadableAccountJson, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, projectGatewayVoiceState, buildClientSnapshots, buildVoiceGuildCatalog, buildPlayingChannelCatalog, invalidateVoiceGuildCatalog, scheduleCatalogEvent, liveEvents, isRecoverableDiscordInteractionError };
 Object.assign(module.exports, { clearPrimaryMediaFailure, discordRetryAfterMs, failureResultFromError, isHardMediaFailure, isRateLimitFailure, resetFailedCameraState, retryDelayWithJitter, pendingVoiceLeaves, queuePendingVoiceLeave, clearPendingVoiceLeave, flushPendingVoiceLeavesForAccount, requestVoiceLeave, primaryVoiceTransportReady, ensurePrimaryVoiceConnectionReady });

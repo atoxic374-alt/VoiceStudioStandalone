@@ -25,6 +25,7 @@ const state = {
   membershipCheckBusy: false,
   membershipOperation: '',
   guildsRequestId: 0, automationCatalogRequestId: 0, targetAccountsRequestId: 0,
+  quickOperationId: 0,
   rotationSelectionGuildId: '', targetAccountsContext: '', playingChannelsRequestId: 0,
 };
 
@@ -926,16 +927,20 @@ async function applyState(kind) {
   const target = currentVoiceTarget();
   if (!target) { toast('ادخل غرفة أولًا لتغيير الحالة', 'error'); return; }
   state.selectedTarget = target;
-  const buttons = [...document.querySelectorAll('.state-button')]; buttons.forEach((button) => { button.disabled = true; button.classList.add('is-pending'); });
+  const operationId = ++state.quickOperationId;
+  const buttons = [...document.querySelectorAll('.state-button')];
+  buttons.forEach((button) => { button.disabled = true; button.classList.add('is-pending'); button.setAttribute('aria-busy', 'true'); });
+  feedback('#stateFeedback', `جارٍ تأكيد ${next.label}…`, 'pending');
   try {
     const result = await post('/api/voice/state', { accounts, guildId: target.guildId, ...next });
+    if (operationId !== state.quickOperationId) return;
     if (!result.summary?.ok) throw new Error(result.results?.find((item) => item.skipped)?.reason || result.results?.find((item) => !item.ok)?.error || 'تعذر تحديث الحالة');
     updateQuickStateButtons();
     const failed = result.summary.failed || 0;
     const skipped = result.summary.skipped || 0;
     const message = failed ? `${next.label}: ${result.summary.ok} succeeded, ${failed} failed` : skipped ? `${next.label}: ${skipped} skipped because of Room Rotation` : next.label;
     feedback('#stateFeedback', message, failed ? 'error' : 'success'); addActivity('تحديث حالة صوتية', `${state.clients.find((client) => client.name === state.selectedAccount)?.nickname || state.selectedAccount} · ${message}`, failed ? 'error' : 'success', state.selectedAccount); toast(message, failed ? 'error' : 'success'); await refreshSessions();
-  } catch (error) { feedback('#stateFeedback', error.message, 'error'); toast(error.message, 'error'); } finally { buttons.forEach((button) => { button.disabled = false; button.classList.remove('is-pending'); }); updateQuickStateButtons(); }
+  } catch (error) { if (operationId === state.quickOperationId) { feedback('#stateFeedback', `فشل التأكيد: ${error.message}`, 'error'); toast(error.message, 'error'); } } finally { buttons.forEach((button) => { button.disabled = false; button.classList.remove('is-pending'); button.removeAttribute('aria-busy'); }); if (operationId === state.quickOperationId) updateQuickStateButtons(); }
 }
 
 function formatDuration(seconds) { return `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`; }
@@ -1155,10 +1160,10 @@ function showMediaStream(stream, kind) {
   state.mediaStream = stream; state.mediaKind = kind; state.mediaStartedAt = Date.now();
   const video = $('#cameraPreview'); if (video) { video.srcObject = stream; video.style.transform = kind === 'camera' ? 'scaleX(-1)' : 'none'; video.classList.add('is-visible'); video.play().catch(() => {}); }
   if ($('#stagePlaceholder')) $('#stagePlaceholder').style.display = 'none'; $('#stageOverlay')?.classList.add('is-visible'); if ($('#stageSource')) $('#stageSource').textContent = kind === 'camera' ? 'Camera' : 'Screen share'; if ($('#stopMediaButton')) $('#stopMediaButton').disabled = false;
-  $('#cameraButton')?.classList.toggle('is-active', kind === 'camera'); $('#screenButton')?.classList.toggle('is-active', kind === 'screen'); if ($('#cameraState')) $('#cameraState').textContent = kind === 'camera' ? 'Live' : 'Off'; if ($('#screenState')) $('#screenState').textContent = kind === 'screen' ? 'Live' : 'Off'; $('#mediaStatus')?.classList.add('is-live'); if ($('#mediaStatus')) $('#mediaStatus').innerHTML = '<span></span> Live';
+  $('#cameraButton')?.classList.toggle('is-active', kind === 'camera'); $('#screenButton')?.classList.toggle('is-active', kind === 'screen'); if ($('#cameraState')) $('#cameraState').textContent = kind === 'camera' ? 'Live' : 'Off'; if ($('#screenState')) $('#screenState').textContent = kind === 'screen' ? 'Live' : 'Off'; $('#mediaStatus')?.classList.add('is-live'); if ($('#mediaStatus')) $('#mediaStatus').innerHTML = '<span></span> Confirmed';
   state.mediaTimer = setInterval(() => { if ($('#stageTimer')) $('#stageTimer').textContent = formatDuration(Math.floor((Date.now() - state.mediaStartedAt) / 1000)); }, 1000);
   bindMediaEnded(stream);
-  addActivity(kind === 'camera' ? 'الكاميرا تعمل' : 'مشاركة الشاشة تعمل', 'المعاينة المحلية جاهزة', 'success'); toast(kind === 'camera' ? 'تم تشغيل الكاميرا' : 'تم تشغيل مشاركة الشاشة', 'success');
+  addActivity(kind === 'camera' ? 'الكاميرا مؤكدة' : 'مشاركة الشاشة مؤكدة', 'المعاينة المحلية جاهزة · تم تأكيد الحالة من Discord', 'success'); toast(kind === 'camera' ? 'تم تأكيد الكاميرا' : 'تم تأكيد مشاركة الشاشة', 'success');
 }
 async function toggleCamera() {
   if (state.mediaBusy) return;

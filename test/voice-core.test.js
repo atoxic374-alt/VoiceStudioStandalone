@@ -4,7 +4,7 @@ const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, recordSuccessfulCycleState, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, registerAccountStreamer, mediaStreamers, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, schedulePlaying, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, clearPrimaryMediaFailure, cleanAccountRecords, buildAccountSnapshot, safeErrorSummary, guardVoiceWebSocketTeardown, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, isCaptchaChallengeError, isHardMediaFailure, isRateLimitFailure, discordRetryAfterMs, retryDelayWithJitter, retryMediaTransportImmediately, resetFailedCameraState, primaryMediaTransportIsActive, mediaWatchdogReadiness, mediaTransportReadyForTarget, syntheticStreams, waitForPrimaryVideoReady, clearVoiceFlags, cleanupPrimaryStreamAttempt, isRecoverableDiscordInteractionError, parseRotationChannelIds, removeAccountFromAutomationTasks } = require('../server');
+const { sendVoiceOp, sendVoiceOpConfirmed, voiceFailureHints, installVoiceEventFilter, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, recordSuccessfulCycleState, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, registerAccountStreamer, mediaStreamers, rotationControlledAccounts, taskConflict, beginAccountOperation, operationIsCurrent, endAccountOperation, clients, sendPlayingPhrase, playingSessions, stopPlayingSession, schedulePlaying, startAllPlayingSessions, stopAllPlayingSessions, handlePlayingDiscordCommand, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, operationKey, addPlayingAccounts, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, clearPrimaryMediaFailure, cleanAccountRecords, buildAccountSnapshot, safeErrorSummary, guardVoiceWebSocketTeardown, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, isCaptchaChallengeError, isHardMediaFailure, isRateLimitFailure, discordRetryAfterMs, retryDelayWithJitter, retryMediaTransportImmediately, resetFailedCameraState, primaryMediaTransportIsActive, mediaWatchdogReadiness, mediaTransportReadyForTarget, syntheticStreams, waitForPrimaryVideoReady, waitForWebRtcReady, waitForMediaReadiness, withTimeout, clearVoiceFlags, cleanupPrimaryStreamAttempt, isRecoverableDiscordInteractionError, parseRotationChannelIds, removeAccountFromAutomationTasks } = require('../server');
 const { dueRotationAccounts, scheduleRotationTask, setRotationAccountPaused, rotationAccountPaused } = require('../server');
 const { failureResultFromError } = require('../server');
 const VoiceWebSocket = require('discord.js-selfbot-v13/src/client/voice/networking/VoiceWebSocket');
@@ -300,6 +300,37 @@ test('waits for camera video packets on the primary voice connection', async () 
   setTimeout(() => { connection.videoStatus = true; }, 20);
   await ready;
   assert.equal(connection.videoStatus, true);
+});
+
+test('runs timeout cleanup exactly once when a media operation exceeds its deadline', async () => {
+  let cleanupCalls = 0;
+  await assert.rejects(
+    withTimeout(new Promise(() => {}), 10, 'operation timed out', { onTimeout: () => { cleanupCalls += 1; } }),
+    /operation timed out/,
+  );
+  assert.equal(cleanupCalls, 1);
+});
+
+test('rejects a stale WebRTC waiter without waiting for the full timeout', async () => {
+  const startedAt = Date.now();
+  await assert.rejects(
+    waitForWebRtcReady({ voiceConnection: { webRtcConn: { ready: false } } }, 5000, () => false),
+    /cancelled by a newer operation/,
+  );
+  assert.ok(Date.now() - startedAt < 500, 'stale waiter should stop immediately');
+});
+
+test('requires both voice and stream transports for Go Live readiness', async () => {
+  const streamer = {
+    voiceConnection: {
+      webRtcConn: { ready: true },
+      streamConnection: { webRtcConn: { ready: false } },
+    },
+  };
+  const pending = waitForMediaReadiness(streamer, 'go-live', 500);
+  setTimeout(() => { streamer.voiceConnection.streamConnection.webRtcConn.ready = true; }, 20);
+  await pending;
+  assert.equal(streamer.voiceConnection.streamConnection.webRtcConn.ready, true);
 });
 
 test('recognizes an active camera transport before attempting to restart it', () => {
