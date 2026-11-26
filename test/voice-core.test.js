@@ -892,6 +892,13 @@ test('selects primary media only when its media method and requested channel are
   assert.equal(primaryMediaTransportCheck(null, 'camera', 'room-1').reason, 'primary-voice-connection-missing');
 });
 
+test('allows a dedicated media fallback only after the primary VoiceManager connection is released', () => {
+  const { dedicatedMediaFallbackAllowed } = require('../server');
+  assert.equal(dedicatedMediaFallbackAllowed({ voice: { connection: null } }), true);
+  assert.equal(dedicatedMediaFallbackAllowed({ voice: { connection: {} } }), false);
+  assert.equal(dedicatedMediaFallbackAllowed({}), true);
+});
+
 test('rebuilds a broken camera voice connection through VoiceManager without a competing transport', async () => {
   const { ensurePrimaryVoiceConnectionReady } = require('../server');
   const guildId = 'camera-recovery-guild';

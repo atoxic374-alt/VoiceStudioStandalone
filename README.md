@@ -64,7 +64,7 @@ The same connected account can create or replace its own automatic rotation with
 
 The camera preview is a generated blank canvas; it does not access the device camera or request camera permission. The backend still attempts to apply Discord's camera voice state. The screen-share preview uses its own local capture flow.
 
-The backend uses the experimental media path from `@dank074/discord-video-stream@7` with its compatible `@lng2004/discord.js-selfbot-v13` peer. It prepares a short synthetic H.264 source with `ffmpeg-static` and uses the authenticated primary voice connection for camera and Go Live media, avoiding a second competing Gateway voice handshake. The separate Streamer handshake is intentionally disabled; `VOICE_STUDIO_MEDIA_TRANSPORT` no longer enables it. This is an actual media attempt rather than a state-only flag, but it is not an officially supported Discord client and may fail when Discord changes its Go Live/WebRTC or DAVE/E2EE requirements. Failures are logged in `data/media-events.log`.
+The backend prefers the authenticated primary voice connection for camera and Go Live. If that connection cannot be established and VoiceManager no longer owns a live connection, it falls back to one isolated `Streamer` transport and makes at most one delayed retry; it never starts both transports concurrently. The media source is a short synthetic H.264 stream produced with `ffmpeg-static`. This is an experimental, unofficial client path and may fail when Discord changes Go Live/WebRTC or DAVE/E2EE requirements. Failures are logged in `data/media-events.log`.
 
 ## Project layout
 

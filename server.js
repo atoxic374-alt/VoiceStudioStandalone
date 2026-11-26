@@ -23,10 +23,9 @@ const AUTH_ENABLED = process.env.NODE_ENV === 'production' || process.env.VOICE_
 const app = express();
 const PORT = Number(process.env.PORT || 5050);
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data'));
-// Always reuse the authenticated primary voice connection for media. A second
-// Streamer handshake on the same Gateway can compete for voice-state events
-// and leave the dedicated connection without its session or token. Ignore the
-// legacy environment override so deployments cannot silently re-enable it.
+// Prefer the authenticated primary voice connection for media. Use a separate
+// Streamer handshake only after the primary connection is gone; never run both
+// voice owners concurrently. Ignore the legacy environment override.
 const MEDIA_TRANSPORT_MODE = 'primary';
 function isEmptyPersistedJson(file) {
   try {
@@ -2747,6 +2746,9 @@ function primaryMediaTransportCheck(connection, mediaKind, channelId) {
   }
   return { ok: true, method };
 }
+function dedicatedMediaFallbackAllowed(client) {
+  return !client?.voice?.connection;
+}
 async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live', isCurrent = () => true) {
   const client = getClient(name);
   const target = validateMediaTarget(client, guildId, session.channelId);
@@ -3104,29 +3106,21 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
       logMediaEvent('info', 'media.ready', { account: name, guildId, channelId: session.channelId, mediaKind, transport: 'primary-voice', durationMs: Date.now() - startedAt });
       return primaryResult;
     }
-    // A primary StreamConnection timeout is recoverable. Its handshake has
-    // been cleaned above, but do not start a second voice handshake on the
-    // same Gateway identity. The old fallback created a Dedicated Streamer
-    // while the primary VoiceConnection was still authoritative; that is the
-    // exact condition behind the missing VOICE_SERVER_UPDATE/token entries in
-    // the production log. Returning the primary error keeps one owner for the
-    // voice session and lets the caller's normal retry/watchdog retry safely.
-    logMediaEvent('warn', 'media.primary_transport_failed', { account: name, guildId, channelId: session.channelId, mediaKind, error: primaryResult.error, fallback: 'blocked' });
-    // This is intentional protection, not an application error: a second
-    // Streamer handshake would compete with the authoritative connection and
-    // is the source of the missing voice-token failures.
-    logMediaEvent('warn', 'media.dedicated_fallback_blocked', { account: name, guildId, channelId: session.channelId, mediaKind, reason: 'primary-voice-connection-exists' });
-    return primaryResult;
+    logMediaEvent('warn', 'media.primary_transport_failed', { account: name, guildId, channelId: session.channelId, mediaKind, error: primaryResult.error, fallback: dedicatedMediaFallbackAllowed(client) ? 'dedicated' : 'blocked' });
+    if (!dedicatedMediaFallbackAllowed(client)) {
+      logMediaEvent('warn', 'media.dedicated_fallback_blocked', { account: name, guildId, channelId: session.channelId, mediaKind, reason: 'primary-voice-connection-still-owned' });
+      return primaryResult;
+    }
   }
-  if (MEDIA_TRANSPORT_MODE === 'primary') {
-    const error = `Primary media transport unavailable (${primaryCheck.reason}); refusing a competing dedicated voice handshake`;
-    logMediaEvent('error', 'media.primary_transport_unavailable', { account: name, guildId, channelId: session.channelId, mediaKind, reason: primaryCheck.reason, primaryConnectionPresent: !!primaryConnection });
+  if (MEDIA_TRANSPORT_MODE === 'primary' && !dedicatedMediaFallbackAllowed(client)) {
+    const error = `Primary media transport unavailable (${primaryCheck.reason}); a primary voice connection is still active`;
+    logMediaEvent('error', 'media.primary_transport_unavailable', { account: name, guildId, channelId: session.channelId, mediaKind, reason: primaryCheck.reason, primaryConnectionPresent: true });
     logMediaEvent('warn', 'media.dedicated_fallback_blocked', { account: name, guildId, channelId: session.channelId, mediaKind, reason: primaryCheck.reason });
     return { ok: false, error };
   }
-  logMediaEvent('info', 'media.dedicated_transport_selected', { account: name, guildId, channelId: session.channelId, mediaKind, mode: MEDIA_TRANSPORT_MODE, primaryConnectionPresent: !!primaryConnection });
+  logMediaEvent('info', 'media.dedicated_transport_selected', { account: name, guildId, channelId: session.channelId, mediaKind, mode: MEDIA_TRANSPORT_MODE, primaryConnectionPresent: !!client.voice?.connection, fallback: MEDIA_TRANSPORT_MODE === 'primary' ? 'primary-unavailable' : 'configured' });
   let lastError;
-  for (let attempt = 1; attempt <= 1; attempt += 1) {
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
     let streamer;
     let controller;
     let source;
@@ -3233,6 +3227,7 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
         if (!reset?.ok) logMediaEvent('warn', 'media.camera_state_reset_unconfirmed', { account: name, guildId, channelId: session.channelId, error: reset?.error || 'Camera state reset was not confirmed' });
       }
       logMediaEvent('error', 'media.attempt_failed', { account: name, guildId, channelId: session.channelId, mediaKind, attempt, stage, error: error?.message || String(error) });
+      if (attempt < 2 && isCurrentRun()) await new Promise((resolve) => setTimeout(resolve, 1000));
     }
   }
   stopSyntheticStream(name);
@@ -5519,3 +5514,4 @@ if (require.main === module) {
 module.exports = { app, clients, accountLimit: limit, parseAccountLimit, voiceSessions, rotations, stateCycles, stateCycleStateForAccount, nextStateIndex, compactStateHistory, recordSuccessfulCycleState, getRateLimitBucket, pruneRateLimitBuckets, reserveAccountConnectSlots, releaseAccountConnectSlots, playingSessions, stopPlayingSession, schedulePlaying, startAllPlayingSessions, addPlayingAccounts, stopAllPlayingSessions, handlePlayingDiscordCommand, parseRotationChannelIds, startDiscordAccountRotation, removeAccountFromAutomationTasks, rotationTasksForAccount, rotationAccountPaused, rotationAccountDeadline, dueRotationAccounts, scheduleRotationTask, setRotationAccountPaused, resumeRotationAccount, rotationControlledAccounts, isAccountManagedByActiveStateCycle, expectedMediaStateIsPresent, taskConflict, operationKey, beginAccountOperation, operationIsCurrent, endAccountOperation, sendVoiceOp, sendVoiceOpConfirmed, validateTarget, validateMediaTarget, voiceFailureHints, mediaJoinDiagnostics, installVoiceEventFilter, confirmLiveMediaTarget, voiceConnectionChannelId, compactPrimaryVoiceClosingListeners, hardenVoiceConnection, cleanupPrimaryStreamAttempt, guardVoiceWebSocketTeardown, safeErrorSummary, buildAccountSnapshot, primaryMediaRetryError, recordPrimaryMediaFailure, primaryMediaFailures, startSyntheticStream, stopSyntheticStream, registerAccountStreamer, mediaStreamers, mediaQueueSnapshot, enqueueGlobalMediaStart, ensureSyntheticVideo, normalizeExclusiveVoiceState, voiceRecoveryState, retryableError, isCaptchaChallengeError, retryMediaTransportImmediately, primaryMediaTransportIsActive, mediaWatchdogReadiness, mediaTransportReadyForTarget, syntheticStreams, waitForPrimaryVideoReady, waitForWebRtcReady, waitForMediaReadiness, withTimeout, clearVoiceFlags, cleanAccountRecords, saveReadableAccountJson, saveAccounts, loadAccounts, cleanPlayingSteps, sendPlayingPhrase, randomRotationTargets, playPrimaryMediaAndWait, taskHasAccountElsewhere, automationAccountCheck, projectGatewayVoiceState, buildClientSnapshots, buildVoiceGuildCatalog, buildPlayingChannelCatalog, invalidateVoiceGuildCatalog, scheduleCatalogEvent, liveEvents, isRecoverableDiscordInteractionError };
 Object.assign(module.exports, { clearPrimaryMediaFailure, discordRetryAfterMs, failureResultFromError, isHardMediaFailure, isRateLimitFailure, resetFailedCameraState, retryDelayWithJitter, pendingVoiceLeaves, queuePendingVoiceLeave, clearPendingVoiceLeave, flushPendingVoiceLeavesForAccount, requestVoiceLeave, primaryVoiceTransportReady, cleanupTimedOutPrimaryVoice, ensurePrimaryVoiceConnectionReady });
 Object.assign(module.exports, { primaryMediaTransportCheck });
+Object.assign(module.exports, { dedicatedMediaFallbackAllowed });
