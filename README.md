@@ -64,7 +64,7 @@ The same connected account can create or replace its own automatic rotation with
 
 The camera preview is a generated blank canvas; it does not access the device camera or request camera permission. The backend still attempts to apply Discord's camera voice state. The screen-share preview uses its own local capture flow.
 
-Camera and Go Live both use one dedicated `Streamer` transport. Before it starts, any existing VoiceManager connection is released so the account does not run competing voice handshakes; retries also create an isolated Streamer transport. The media source is a short synthetic H.264 stream produced with `ffmpeg-static`. This is an experimental, unofficial client path and may fail when Discord changes Go Live/WebRTC or DAVE/E2EE requirements. Failures are logged in `data/media-events.log`.
+Camera and Go Live both use one dedicated `Streamer` transport. Before it starts, the server preflights the native WebRTC addon, then releases any existing VoiceManager connection so the account does not run competing voice handshakes. Railway's Railpack deployment installs the addon's `libzstd1` runtime dependency; a missing native addon now fails immediately without a slow repeated handshake. The media source is a short synthetic H.264 stream produced with `ffmpeg-static`. This is an experimental, unofficial client path and may fail when Discord changes Go Live/WebRTC or DAVE/E2EE requirements. Failures are logged in `data/media-events.log`.
 
 ## Project layout
 

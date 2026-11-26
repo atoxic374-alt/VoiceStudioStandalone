@@ -1795,6 +1795,21 @@ function isRateLimitFailure(error) {
   const text = String(error?.error || error?.message || error || '').toLowerCase();
   return error?.rateLimited === true || status === 429 || discordRetryAfterMs(error) > 0 || /rate.?limit|too many requests|http.?429|\b429\b/.test(text);
 }
+function loadNativeStreamerAddon(load = () => require('@lng2004/node-datachannel')) {
+  try { return load(); }
+  catch (cause) {
+    const error = new Error(`Streamer native WebRTC addon unavailable: ${cause?.message || String(cause)}`);
+    error.code = 'STREAMER_NATIVE_ADDON_UNAVAILABLE';
+    error.permanent = true;
+    error.cause = cause;
+    throw error;
+  }
+}
+function isNativeAddonFailure(error) {
+  const text = String(error?.error || error?.message || error || '').toLowerCase();
+  return error?.code === 'STREAMER_NATIVE_ADDON_UNAVAILABLE'
+    || /cannot load native addon|native addon unavailable|optionaldependencies|err_dlopen_failed|cannot open shared object file|libzstd\.so/.test(text);
+}
 function isHardMediaFailure(error) {
   const status = Number(error?.status || error?.statusCode || error?.httpStatus || error?.response?.status || 0);
   const code = Number(error?.code || error?.rawError?.code || 0);
@@ -1806,6 +1821,7 @@ function isHardMediaFailure(error) {
     || status === 403
     || code === 50001
     || code === 50013
+    || isNativeAddonFailure(error)
     || /missing (?:stream )?permission|permission denied|missing access|not authorized|forbidden|invalid channel|selected channel is not a voice channel/.test(text);
 }
 function failureResultFromError(error) {
@@ -2331,7 +2347,9 @@ function recordPrimaryMediaFailure(name, guildId, channelId, mediaKind, error) {
     ? now + MEDIA_CIRCUIT_OPEN_MS
     : Number(previous?.circuitOpenUntil) > now ? Number(previous.circuitOpenUntil) : 0;
   const blockedReason = permanent
-    ? isCaptchaChallengeError(error)
+    ? isNativeAddonFailure(error)
+      ? 'Streamer native WebRTC addon or libzstd runtime library is unavailable; redeploy with the runtime dependency installed'
+      : isCaptchaChallengeError(error)
       ? 'CAPTCHA or additional Discord verification is required'
       : isInvalidCredentialError(error)
         ? 'Discord rejected the account credential'
@@ -3130,6 +3148,12 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
     logMediaEvent('warn', 'media.dedicated_fallback_blocked', { account: name, guildId, channelId: session.channelId, mediaKind, reason: primaryCheck.reason });
     return { ok: false, error };
   }
+  try {
+    loadNativeStreamerAddon();
+  } catch (error) {
+    logMediaEvent('error', 'media.native_addon_unavailable', { account: name, guildId, channelId: session.channelId, mediaKind, error: error.message });
+    return failureResultFromError(error);
+  }
   const releasedPrimary = releasePrimaryVoiceForStreamer(client, { account: name, guildId, channelId: session.channelId });
   if (releasedPrimary) {
     logMediaEvent('info', 'media.primary_voice_released_for_streamer', { account: name, guildId, channelId: session.channelId, mediaKind });
@@ -3240,12 +3264,13 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
       try { if (streamer) streamer._voiceConnection = undefined; } catch {}
       if (syntheticStreams.get(name)?.streamer === streamer) syntheticStreams.delete(name);
       if (createdStreamer && mediaStreamers.get(name) === streamer) mediaStreamers.delete(name);
-      if (mediaKind === 'camera') {
+      if (mediaKind === 'camera' && !isNativeAddonFailure(error)) {
         const reset = await resetFailedCameraState(client, client?.voice?.connection, guildId, session.channelId, session);
         if (!reset?.ok) logMediaEvent('warn', 'media.camera_state_reset_unconfirmed', { account: name, guildId, channelId: session.channelId, error: reset?.error || 'Camera state reset was not confirmed' });
       }
       logMediaEvent('error', 'media.attempt_failed', { account: name, guildId, channelId: session.channelId, mediaKind, attempt, stage, error: error?.message || String(error) });
-      if (attempt < 2 && isCurrentRun()) await new Promise((resolve) => setTimeout(resolve, 1000));
+      if (attempt < 2 && isCurrentRun() && !isHardMediaFailure(error)) await new Promise((resolve) => setTimeout(resolve, 1000));
+      else if (isHardMediaFailure(error)) break;
     }
   }
   stopSyntheticStream(name);
@@ -5539,3 +5564,4 @@ Object.assign(module.exports, { clearPrimaryMediaFailure, discordRetryAfterMs, f
 Object.assign(module.exports, { primaryMediaTransportCheck });
 Object.assign(module.exports, { dedicatedMediaFallbackAllowed });
 Object.assign(module.exports, { releasePrimaryVoiceForStreamer });
+Object.assign(module.exports, { isNativeAddonFailure, loadNativeStreamerAddon });

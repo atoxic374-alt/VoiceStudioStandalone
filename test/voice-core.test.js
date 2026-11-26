@@ -249,6 +249,18 @@ test('classifies permission and CAPTCHA failures as non-retryable hard failures'
   assert.equal(retryableError({ status: 429, error: 'Too many requests' }), false);
 });
 
+test('classifies missing native WebRTC libraries as permanent instead of retrying handshakes', () => {
+  const { isNativeAddonFailure, loadNativeStreamerAddon } = require('../server');
+  let thrown;
+  try {
+    loadNativeStreamerAddon(() => { throw new Error('libzstd.so.1: cannot open shared object file: No such file or directory'); });
+  } catch (error) { thrown = error; }
+  assert.equal(isNativeAddonFailure(thrown), true);
+  assert.equal(isHardMediaFailure(thrown), true);
+  assert.equal(retryableError(thrown), false);
+  assert.match(thrown.message, /Streamer native WebRTC addon unavailable/);
+});
+
 test('uses bounded equal jitter for transient exponential retry delays', () => {
   assert.equal(retryDelayWithJitter(0, 1000, 10_000, () => 0), 500);
   assert.equal(retryDelayWithJitter(0, 1000, 10_000, () => 1), 1000);
