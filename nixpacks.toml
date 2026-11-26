@@ -1,0 +1,3 @@
+[phases.setup]
+# @lng2004/node-datachannel's Linux native addon dynamically links libzstd.so.1.
+nixLibs = ["...", "zstd"]
