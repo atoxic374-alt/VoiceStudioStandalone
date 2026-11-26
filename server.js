@@ -5281,10 +5281,11 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
         task.accountPendingStateIdx ||= {};
         task.accountPendingStateIdx[name] = stateIndex;
         const result = await executeStateForAccount(name, task, task.states[stateIndex], runToken);
-        if (!task.active || task.runToken !== runToken) return recordTaskResult(task, { name, ok: false, stale: true, error: 'State cycle stopped before completion' });
+        if (!task.active || task.runToken !== runToken) return { name, ok: false, stale: true, error: 'State cycle stopped before completion' };
         recordSuccessfulCycleState(task, name, stateIndex, result.ok);
         return recordTaskResult(task, result);
       })));
+      if (!task.active || task.runToken !== runToken) return;
       task.nextAt = Date.now() + task.intervalMs;
       persistAutomationTasks();
       emitLive('task.completed', { id: task.id, taskType: 'cycle', nextAt: task.nextAt, currentIdx: task.currentIdx, results: task.lastResults });
@@ -5296,18 +5297,22 @@ app.post('/api/voice/state-cycle/start', async (req, res) => {
   // Eight accounts can take minutes through the media queue and otherwise make
   // the browser report "Failed to fetch" even though the server is working.
   setImmediate(async () => {
+    const runToken = task.runToken;
     task.running = true;
     try {
+      if (!task.active || task.runToken !== runToken) return;
       const activeAccounts = task.accounts.filter((name) => !(task.pausedAccounts || []).includes(name));
       task.lastResults = await mapWithConcurrency(activeAccounts, AUTOMATION_CONCURRENCY, (name) => withResultRetry(() => withAccountLock(name, async () => {
         if ((task.pausedAccounts || []).includes(name)) return { name, ok: true, skipped: true, paused: true };
         const index = nextStateIndex(task.states, task.stateHistory[name] || []);
         task.accountPendingStateIdx ||= {};
         task.accountPendingStateIdx[name] = index;
-        const result = await executeStateForAccount(name, task, task.states[index], task.runToken);
+        const result = await executeStateForAccount(name, task, task.states[index], runToken);
+        if (!task.active || task.runToken !== runToken) return { name, ok: false, stale: true, error: 'State cycle stopped before completion' };
         recordSuccessfulCycleState(task, name, index, result.ok);
         return recordTaskResult(task, result);
       })));
+      if (!task.active || task.runToken !== runToken) return;
       task.nextAt = Date.now() + task.intervalMs;
       persistAutomationTasks();
       emitLive('task.initialized', { id: task.id, taskType: 'cycle', nextAt: task.nextAt, results: task.lastResults });
