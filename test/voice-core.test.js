@@ -250,15 +250,15 @@ test('classifies permission and CAPTCHA failures as non-retryable hard failures'
 });
 
 test('classifies missing native WebRTC libraries as permanent instead of retrying handshakes', () => {
-  const { isNativeAddonFailure, loadNativeStreamerAddon } = require('../server');
+  const { isNativeAddonFailure, loadNativeWebRtcAddon } = require('../server');
   let thrown;
   try {
-    loadNativeStreamerAddon(() => { throw new Error('libzstd.so.1: cannot open shared object file: No such file or directory'); });
+    loadNativeWebRtcAddon(() => { throw new Error('libzstd.so.1: cannot open shared object file: No such file or directory'); });
   } catch (error) { thrown = error; }
   assert.equal(isNativeAddonFailure(thrown), true);
   assert.equal(isHardMediaFailure(thrown), true);
   assert.equal(retryableError(thrown), false);
-  assert.match(thrown.message, /Streamer native WebRTC addon unavailable/);
+  assert.match(thrown.message, /Native WebRTC addon unavailable/);
 });
 
 test('uses bounded equal jitter for transient exponential retry delays', () => {

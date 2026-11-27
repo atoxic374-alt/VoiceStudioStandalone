@@ -1795,19 +1795,21 @@ function isRateLimitFailure(error) {
   const text = String(error?.error || error?.message || error || '').toLowerCase();
   return error?.rateLimited === true || status === 429 || discordRetryAfterMs(error) > 0 || /rate.?limit|too many requests|http.?429|\b429\b/.test(text);
 }
-function loadNativeStreamerAddon(load = () => require('@lng2004/node-datachannel')) {
+function loadNativeWebRtcAddon(load = () => require('@lng2004/node-datachannel')) {
   try { return load(); }
   catch (cause) {
-    const error = new Error(`Streamer native WebRTC addon unavailable: ${cause?.message || String(cause)}`);
-    error.code = 'STREAMER_NATIVE_ADDON_UNAVAILABLE';
+    const error = new Error(`Native WebRTC addon unavailable: ${cause?.message || String(cause)}`);
+    error.code = 'WEBRTC_NATIVE_ADDON_UNAVAILABLE';
     error.permanent = true;
     error.cause = cause;
     throw error;
   }
 }
+const loadNativeStreamerAddon = loadNativeWebRtcAddon;
 function isNativeAddonFailure(error) {
   const text = String(error?.error || error?.message || error || '').toLowerCase();
-  return error?.code === 'STREAMER_NATIVE_ADDON_UNAVAILABLE'
+  return error?.code === 'WEBRTC_NATIVE_ADDON_UNAVAILABLE'
+    || error?.code === 'STREAMER_NATIVE_ADDON_UNAVAILABLE'
     || /cannot load native addon|native addon unavailable|optionaldependencies|err_dlopen_failed|cannot open shared object file|libzstd\.so/.test(text);
 }
 function isHardMediaFailure(error) {
@@ -3127,6 +3129,14 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
   // event while omitting VOICE_SERVER_UPDATE for the competing transport.
   const primaryCheck = primaryMediaTransportCheck(primaryConnection, mediaKind, session.channelId);
   const canEstablishCameraVoice = mediaKind === 'camera' && !primaryConnection;
+  if (MEDIA_TRANSPORT_MODE === 'primary' && mediaKind === 'go-live' && primaryCheck.ok) {
+    try {
+      loadNativeWebRtcAddon();
+    } catch (error) {
+      logMediaEvent('error', 'media.native_addon_unavailable', { account: name, guildId, channelId: session.channelId, mediaKind, transport: 'primary-stream', error: error.message });
+      return failureResultFromError(error);
+    }
+  }
   if (MEDIA_TRANSPORT_MODE === 'primary' && (primaryCheck.ok || canEstablishCameraVoice)) {
     logMediaEvent('info', 'media.primary_transport_selected', { account: name, guildId, channelId: session.channelId, mediaKind, method: primaryCheck.method || 'ensure-primary-voice' });
     const primaryResult = await startBuiltInGoLive(name, guildId, session, mediaKind, isCurrentRun);
@@ -3150,7 +3160,7 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
   }
   if (MEDIA_TRANSPORT_MODE !== 'primary' || mediaKind === 'go-live') {
     try {
-      loadNativeStreamerAddon();
+      loadNativeWebRtcAddon();
     } catch (error) {
       logMediaEvent('error', 'media.native_addon_unavailable', { account: name, guildId, channelId: session.channelId, mediaKind, error: error.message });
       return failureResultFromError(error);
@@ -5566,5 +5576,5 @@ Object.assign(module.exports, { clearPrimaryMediaFailure, discordRetryAfterMs, f
 Object.assign(module.exports, { primaryMediaTransportCheck });
 Object.assign(module.exports, { dedicatedMediaFallbackAllowed });
 Object.assign(module.exports, { releasePrimaryVoiceForStreamer });
-Object.assign(module.exports, { isNativeAddonFailure, loadNativeStreamerAddon });
+Object.assign(module.exports, { isNativeAddonFailure, loadNativeWebRtcAddon, loadNativeStreamerAddon });
 Object.assign(module.exports, { mediaTransportMode: MEDIA_TRANSPORT_MODE });
