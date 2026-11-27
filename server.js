@@ -23,10 +23,10 @@ const AUTH_ENABLED = process.env.NODE_ENV === 'production' || process.env.VOICE_
 const app = express();
 const PORT = Number(process.env.PORT || 5050);
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data'));
-// Camera and Go Live use one dedicated Streamer voice owner. Any VoiceManager
-// connection is released before the Streamer handshake to prevent competing
-// VOICE_STATE_UPDATE / VOICE_SERVER_UPDATE negotiations.
-const MEDIA_TRANSPORT_MODE = 'streamer';
+// Restore the October 21 media path: prefer the authenticated VoiceManager
+// connection for camera and Go Live. Streamer remains a guarded fallback only
+// after the primary owner is no longer active.
+const MEDIA_TRANSPORT_MODE = 'primary';
 function isEmptyPersistedJson(file) {
   try {
     const value = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '').trim());
@@ -3148,11 +3148,13 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
     logMediaEvent('warn', 'media.dedicated_fallback_blocked', { account: name, guildId, channelId: session.channelId, mediaKind, reason: primaryCheck.reason });
     return { ok: false, error };
   }
-  try {
-    loadNativeStreamerAddon();
-  } catch (error) {
-    logMediaEvent('error', 'media.native_addon_unavailable', { account: name, guildId, channelId: session.channelId, mediaKind, error: error.message });
-    return failureResultFromError(error);
+  if (MEDIA_TRANSPORT_MODE !== 'primary' || mediaKind === 'go-live') {
+    try {
+      loadNativeStreamerAddon();
+    } catch (error) {
+      logMediaEvent('error', 'media.native_addon_unavailable', { account: name, guildId, channelId: session.channelId, mediaKind, error: error.message });
+      return failureResultFromError(error);
+    }
   }
   const releasedPrimary = releasePrimaryVoiceForStreamer(client, { account: name, guildId, channelId: session.channelId });
   if (releasedPrimary) {
@@ -5565,3 +5567,4 @@ Object.assign(module.exports, { primaryMediaTransportCheck });
 Object.assign(module.exports, { dedicatedMediaFallbackAllowed });
 Object.assign(module.exports, { releasePrimaryVoiceForStreamer });
 Object.assign(module.exports, { isNativeAddonFailure, loadNativeStreamerAddon });
+Object.assign(module.exports, { mediaTransportMode: MEDIA_TRANSPORT_MODE });
