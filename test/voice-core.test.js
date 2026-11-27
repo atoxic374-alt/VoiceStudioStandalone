@@ -531,6 +531,14 @@ test('verifies camera and Go Live state against the actual account voice state',
   assert.equal(expectedMediaStateIsPresent({ channelId: 'channel-1', selfVideo: true, selfStream: false, selfDeaf: true }, 'channel-1', 'camera'), false);
 });
 
+test('skips the media reset barrier only for non-media state changes with no active transport', () => {
+  const { mediaResetRequired } = require('../server');
+  assert.equal(mediaResetRequired({ selfMute: true }, { selfVideo: false, selfStream: false }, false), false);
+  assert.equal(mediaResetRequired({ selfVideo: true }, { selfVideo: false, selfStream: false }, false), true);
+  assert.equal(mediaResetRequired({ selfMute: true }, { selfVideo: false, selfStream: true }, false), true);
+  assert.equal(mediaResetRequired({ selfMute: true }, { selfVideo: false, selfStream: false }, true), true);
+});
+
 test('clears every previous voice flag before the next rotation state', async () => {
   const { client, getSent } = fakeClient();
   const result = await clearVoiceFlags(client, 'guild-1', 'channel-1', { selfMute: true, selfDeaf: true, selfStream: true });

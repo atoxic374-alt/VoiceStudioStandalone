@@ -107,8 +107,10 @@ async function waitForVoiceStateOperation(operationId) {
   const eventResult = new Promise((resolve) => { resolveFromEvent = resolve; pendingVoiceStateOperations.set(operationId, resolve); });
   const pollResult = (async () => {
     let transientFailures = 0;
+    let firstPoll = true;
     while (Date.now() < deadline && pendingVoiceStateOperations.has(operationId)) {
-      await new Promise((resolve) => setTimeout(resolve, 1200));
+      if (!firstPoll) await new Promise((resolve) => setTimeout(resolve, 600));
+      firstPoll = false;
       if (!pendingVoiceStateOperations.has(operationId)) return null;
       try {
         const response = await fetch(`/api/voice/state/operations/${encodeURIComponent(operationId)}`, {

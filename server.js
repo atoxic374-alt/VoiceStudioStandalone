@@ -491,7 +491,10 @@ const pendingCatalogEvents = new Map();
 const pendingVoiceStateChecks = new Map();
 let sessionPersistTimer = null;
 const accountLocks = new Map();
-const MEDIA_SETTLE_DELAY_MS = 4000;
+const MEDIA_SETTLE_DELAY_SETTING = process.env.MEDIA_SETTLE_DELAY_MS;
+const MEDIA_SETTLE_DELAY_MS = MEDIA_SETTLE_DELAY_SETTING === undefined
+  ? 800
+  : Math.max(0, Math.min(4000, Number.isFinite(Number(MEDIA_SETTLE_DELAY_SETTING)) ? Number(MEDIA_SETTLE_DELAY_SETTING) : 800));
 const MEDIA_JOIN_TIMEOUT_MS = Math.max(10000, Number(process.env.MEDIA_JOIN_TIMEOUT_MS || 20000));
 const MEDIA_WEBRTC_TIMEOUT_MS = Math.max(6000, Number(process.env.MEDIA_WEBRTC_TIMEOUT_MS || 10000));
 const MEDIA_STREAM_TIMEOUT_MS = Math.max(12000, Number(process.env.MEDIA_STREAM_TIMEOUT_MS || 20000));
@@ -832,8 +835,14 @@ async function executeQuickVoiceControlForAccount(name, guildId, requestedState,
     // Every new state request supersedes a pending media recovery, even if the
     // failed stream has already cleaned itself up and no active transport remains.
     stopSyntheticStream(name, { leaveVoice: false });
-    const cleared = await clearVoiceFlags(client, guildId, current.channelId, current);
-    if (!cleared.ok) return { name, ok: false, error: `Unable to clear previous voice state: ${cleared.error}` };
+    // A plain mute/deafen change does not need a zero-state reset when the
+    // authoritative/current state has no media. Send its requested OP4 once.
+    // Enabling media or replacing/stopping an active media transport still
+    // requires the complete confirmed reset barrier before the next mode.
+    if (mediaResetRequired(next, current, !!active)) {
+      const cleared = await clearVoiceFlags(client, guildId, current.channelId, current);
+      if (!cleared.ok) return { name, ok: false, error: `Unable to clear previous voice state: ${cleared.error}` };
+    }
     if (!isCurrent()) return { name, ok: false, stale: true, error: 'Voice operation was stopped or superseded' };
     await waitForMediaSettle(next, current);
     if (!isCurrent()) return { name, ok: false, stale: true, error: 'Voice operation was stopped or superseded' };
@@ -1865,6 +1874,11 @@ async function withResultRetry(worker, maxRetries = 2) {
     }
   }
   return { ...last, attempts: maxRetries + 1, retries: maxRetries };
+}
+function mediaResetRequired(next = {}, current = {}, activeTransport = false) {
+  return activeTransport === true
+    || current.selfVideo === true || current.selfStream === true
+    || next.selfVideo === true || next.selfStream === true;
 }
 async function waitForMediaSettle(next, current) {
   if ((next?.selfStream || next?.selfVideo) && current?.channelId) await new Promise((resolve) => setTimeout(resolve, MEDIA_SETTLE_DELAY_MS));
@@ -5578,3 +5592,4 @@ Object.assign(module.exports, { dedicatedMediaFallbackAllowed });
 Object.assign(module.exports, { releasePrimaryVoiceForStreamer });
 Object.assign(module.exports, { isNativeAddonFailure, loadNativeWebRtcAddon, loadNativeStreamerAddon });
 Object.assign(module.exports, { mediaTransportMode: MEDIA_TRANSPORT_MODE });
+Object.assign(module.exports, { mediaResetRequired });
