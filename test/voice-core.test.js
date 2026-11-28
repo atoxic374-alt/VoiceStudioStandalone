@@ -917,11 +917,11 @@ test('restores the historical primary VoiceManager media path as the default', (
   assert.equal(mediaTransportMode, 'primary');
 });
 
-test('allows a dedicated media fallback only after the primary VoiceManager connection is released', () => {
+test('blocks dedicated media fallback in primary mode even when no VoiceManager connection remains', () => {
   const { dedicatedMediaFallbackAllowed } = require('../server');
-  assert.equal(dedicatedMediaFallbackAllowed({ voice: { connection: null } }), true);
+  assert.equal(dedicatedMediaFallbackAllowed({ voice: { connection: null } }), false);
   assert.equal(dedicatedMediaFallbackAllowed({ voice: { connection: {} } }), false);
-  assert.equal(dedicatedMediaFallbackAllowed({}), true);
+  assert.equal(dedicatedMediaFallbackAllowed({}), false);
 });
 
 test('releases the VoiceManager connection before Streamer owns the media handshake', () => {

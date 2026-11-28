@@ -2781,7 +2781,10 @@ function primaryMediaTransportCheck(connection, mediaKind, channelId) {
   return { ok: true, method };
 }
 function dedicatedMediaFallbackAllowed(client) {
-  return !client?.voice?.connection;
+  // Primary mode intentionally has a single voice owner. A Streamer fallback
+  // would open a second Gateway voice handshake after primary setup failed,
+  // recreating the missing VOICE_SERVER_UPDATE / 20-second timeout loop.
+  return MEDIA_TRANSPORT_MODE !== 'primary' && !client?.voice?.connection;
 }
 function releasePrimaryVoiceForStreamer(client, context = {}) {
   const connection = client?.voice?.connection;
@@ -3114,7 +3117,10 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
     }
     await new Promise((resolve) => setTimeout(resolve, 300));
   }
-  if (MEDIA_TRANSPORT_MODE === 'primary'
+  // Camera recovery is handled by ensurePrimaryVoiceConnectionReady() inside
+  // startBuiltInGoLive(). Do not pre-join here and make it attempt a second
+  // VoiceManager join when the first one failed or returned a stale connection.
+  if (MEDIA_TRANSPORT_MODE === 'primary' && mediaKind !== 'camera'
       && (!primaryConnection || String(voiceConnectionChannelId(primaryConnection)) !== String(session.channelId))
       && typeof client.voice?.joinChannel === 'function') {
     try {
@@ -3167,9 +3173,9 @@ async function startSyntheticStreamUnqueued(name, guildId, mediaKind = 'go-live'
     }
   }
   if (MEDIA_TRANSPORT_MODE === 'primary' && !dedicatedMediaFallbackAllowed(client)) {
-    const error = `Primary media transport unavailable (${primaryCheck.reason}); a primary voice connection is still active`;
-    logMediaEvent('error', 'media.primary_transport_unavailable', { account: name, guildId, channelId: session.channelId, mediaKind, reason: primaryCheck.reason, primaryConnectionPresent: true });
-    logMediaEvent('warn', 'media.dedicated_fallback_blocked', { account: name, guildId, channelId: session.channelId, mediaKind, reason: primaryCheck.reason });
+    const error = `Primary media transport unavailable (${primaryCheck.reason}); dedicated voice fallback is disabled to prevent a competing handshake`;
+    logMediaEvent('error', 'media.primary_transport_unavailable', { account: name, guildId, channelId: session.channelId, mediaKind, reason: primaryCheck.reason, primaryConnectionPresent: !!client.voice?.connection });
+    logMediaEvent('warn', 'media.dedicated_fallback_blocked', { account: name, guildId, channelId: session.channelId, mediaKind, reason: 'single-primary-transport-mode' });
     return { ok: false, error };
   }
   if (MEDIA_TRANSPORT_MODE !== 'primary' || mediaKind === 'go-live') {
