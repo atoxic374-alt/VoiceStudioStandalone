@@ -912,6 +912,16 @@ test('selects primary media only when its media method and requested channel are
   assert.equal(primaryMediaTransportCheck(null, 'camera', 'room-1').reason, 'primary-voice-connection-missing');
 });
 
+test('bootstraps Go Live with confirmed video state before creating the stream transport', () => {
+  const { goLiveBootstrapState } = require('../server');
+  assert.deepEqual(goLiveBootstrapState({ selfMute: true, selfDeaf: true }), {
+    selfMute: true, selfDeaf: false, selfVideo: true, selfStream: false,
+  });
+  assert.deepEqual(goLiveBootstrapState({}), {
+    selfMute: false, selfDeaf: false, selfVideo: true, selfStream: false,
+  });
+});
+
 test('restores the historical primary VoiceManager media path as the default', () => {
   const { mediaTransportMode } = require('../server');
   assert.equal(mediaTransportMode, 'primary');

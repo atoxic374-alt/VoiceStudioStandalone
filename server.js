@@ -23,9 +23,8 @@ const AUTH_ENABLED = process.env.NODE_ENV === 'production' || process.env.VOICE_
 const app = express();
 const PORT = Number(process.env.PORT || 5050);
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data'));
-// Restore the October 21 media path: prefer the authenticated VoiceManager
-// connection for camera and Go Live. Streamer remains a guarded fallback only
-// after the primary owner is no longer active.
+// Use one authenticated VoiceManager voice connection for camera and Go Live.
+// Camera uses playVideo(); Go Live creates a StreamConnection on this owner.
 const MEDIA_TRANSPORT_MODE = 'primary';
 function isEmptyPersistedJson(file) {
   try {
@@ -2631,13 +2630,13 @@ async function ensurePrimaryVoiceConnectionReady(client, guildId, channelId, ses
     return { ok: true, connection, recovered: false };
   }
   const shard = getGatewayShard(client);
-  if (!shard || shard.status !== 0) return { ok: false, error: `Discord Gateway is not ready (status=${shard?.status ?? 'unavailable'}); reconnect the account before starting camera` };
+  if (!shard || shard.status !== 0) return { ok: false, error: `Discord Gateway is not ready (status=${shard?.status ?? 'unavailable'}); reconnect the account before starting media` };
   const cached = readCachedGatewayVoiceState(client, guildId);
   if (cached && String(cached.channelId || '') !== targetChannelId) return { ok: false, error: 'The account is no longer in the selected voice room' };
   if (!cached && String(voiceConnectionChannelId(connection) || '') !== targetChannelId) return { ok: false, error: 'The account has no confirmed voice state for the selected room' };
-  if (connection?.streamConnection) return { ok: false, error: 'A screen-share transport is still active; stop it before rebuilding the camera voice connection' };
+  if (connection?.streamConnection) return { ok: false, error: 'A screen-share transport is still active; stop it before rebuilding the primary media voice connection' };
   const channel = client?.guilds?.cache?.get?.(guildId)?.channels?.cache?.get?.(channelId);
-  if (!channel || typeof client?.voice?.joinChannel !== 'function') return { ok: false, error: 'VoiceManager or the selected voice room is unavailable for camera recovery' };
+  if (!channel || typeof client?.voice?.joinChannel !== 'function') return { ok: false, error: 'VoiceManager or the selected voice room is unavailable for media recovery' };
   try {
     if (connection) {
       try { connection._disconnect?.(); } catch {}
@@ -2647,7 +2646,7 @@ async function ensurePrimaryVoiceConnectionReady(client, guildId, channelId, ses
       selfMute: !!session.selfMute,
       selfDeaf: false,
       selfVideo: false,
-    }), MEDIA_JOIN_TIMEOUT_MS, 'Primary voice connection did not become ready for camera', {
+    }), MEDIA_JOIN_TIMEOUT_MS, 'Primary voice connection did not become ready for media', {
       onTimeout: () => cleanupTimedOutPrimaryVoice(client, targetChannelId),
       onSettledAfterTimeout: () => cleanupTimedOutPrimaryVoice(client, targetChannelId),
     });
@@ -2663,8 +2662,13 @@ async function ensurePrimaryVoiceConnectionReady(client, guildId, channelId, ses
     const failedConnection = client?.voice?.connection;
     try { failedConnection?._disconnect?.(); } catch {}
     try { if (client?.voice?.connection === failedConnection) client.voice.connection = null; } catch {}
-    return { ok: false, error: `Primary voice connection could not be recovered for camera: ${error?.message || String(error)}` };
+    return { ok: false, error: `Primary voice connection could not be recovered for media: ${error?.message || String(error)}` };
   }
+}
+function goLiveBootstrapState(session = {}) {
+  // Keep Discord's proven signaling order: announce video before requesting
+  // the stream transport, then switch to self_stream once it is ready.
+  return { selfMute: !!session.selfMute, selfDeaf: false, selfVideo: true, selfStream: false };
 }
 function waitForPrimaryVideoReady(connection, dispatcher, timeoutMs = 8000) {
   if (connection?.videoStatus === true) return Promise.resolve();
@@ -2803,15 +2807,13 @@ async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live',
   const target = validateMediaTarget(client, guildId, session.channelId);
   if (!target.ok) return { ok: false, error: target.error };
   let connection = client?.voice?.connection;
-  if (mediaKind !== 'camera' && (!connection || voiceConnectionChannelId(connection) !== String(session.channelId))) return { ok: false, error: 'The account has no active voice connection' };
+  if (mediaKind !== 'camera' && connection && voiceConnectionChannelId(connection) !== String(session.channelId)) return { ok: false, error: 'The account has moved to another voice room' };
   if (mediaKind === 'camera' && connection && voiceConnectionChannelId(connection) && voiceConnectionChannelId(connection) !== String(session.channelId)) return { ok: false, error: 'The account has moved to another voice room' };
   const cooldownError = primaryMediaRetryError(name, guildId, session.channelId, mediaKind);
   if (cooldownError) return { ok: false, error: cooldownError, cooldown: true, retryAfterMs: primaryMediaRetryAfterMs(name, guildId, session.channelId, mediaKind) };
-  if (mediaKind === 'camera') {
-    const primary = await ensurePrimaryVoiceConnectionReady(client, guildId, session.channelId, session);
-    if (!primary.ok) return primary;
-    connection = primary.connection;
-  }
+  const primary = await ensurePrimaryVoiceConnectionReady(client, guildId, session.channelId, session);
+  if (!primary.ok) return primary;
+  connection = primary.connection;
   compactPrimaryVoiceClosingListeners(connection);
   // playVideo() starts FFmpeg internally. Feed it the reusable one-hour file
   // instead of starting a second FFmpeg producer for every account.
@@ -2829,15 +2831,51 @@ async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live',
         if (typeof connection.playVideo !== 'function') throw new Error('Primary voice connection does not support camera video');
         dispatcher = connection.playVideo(source, { fps: 15, presetH26x: 'superfast', bitrate: 300, inputFFmpegArgs: ['-stream_loop', '-1', '-re'], outputFFmpegArgs: ['-g', '30'] });
       } else {
+        // Discord's known-good stream sequence first confirms self_video, then
+        // allocates the separate screenshare RTC transport, and finally flips
+        // to self_stream after media has started.
+        const bootstrap = await sendVoiceOpConfirmed(client, guildId, session.channelId, goLiveBootstrapState(session), 4500);
+        if (!bootstrap.ok) throw new Error(`Discord did not confirm the Go Live video bootstrap: ${bootstrap.error || 'voice state confirmation timed out'}`);
+        logMediaEvent('info', 'media.stream.video_bootstrap_confirmed', { account: name, guildId, channelId: session.channelId, attempt });
+        // A timed-out attempt can leave a half-open StreamConnection cached by
+        // VoiceConnection. Discard it before asking the library to create one.
+        if (connection.streamConnection) cleanupPrimaryStreamAttempt(connection, connection.streamConnection);
         // A retry creates a brand-new StreamConnection on the existing primary
         // voice session; it never opens a competing Gateway/voice handshake.
-        const connecting = connection.createStreamConnection();
-        pendingStreamConnection = connection.streamConnection;
-        attachVoiceTransportErrorHandler(pendingStreamConnection, { account: name, transport: 'primary-stream', guildId, channelId: session.channelId });
-        streamConnection = await withTimeout(connecting, MEDIA_STREAM_TIMEOUT_MS, `Discord media connection timed out after ${Math.round(MEDIA_STREAM_TIMEOUT_MS / 1000)} seconds`, {
-          onTimeout: () => cleanupPrimaryStreamAttempt(connection, pendingStreamConnection || connection.streamConnection),
-          onSettledAfterTimeout: () => cleanupPrimaryStreamAttempt(connection, pendingStreamConnection || connection.streamConnection),
-        });
+        const streamEvents = { create: 0, serverUpdate: 0 };
+        const onRawStreamEvent = (packet) => {
+          if (!['STREAM_CREATE', 'STREAM_SERVER_UPDATE'].includes(packet?.t)) return;
+          const parts = String(packet?.d?.stream_key || '').split(':');
+          if (parts[0] !== 'guild' || parts[1] !== String(guildId) || parts[2] !== String(session.channelId) || parts[3] !== String(client.user?.id)) return;
+          if (packet.t === 'STREAM_CREATE') streamEvents.create += 1;
+          else streamEvents.serverUpdate += 1;
+        };
+        client.on?.('raw', onRawStreamEvent);
+        try {
+          const connecting = connection.createStreamConnection();
+          pendingStreamConnection = connection.streamConnection;
+          attachVoiceTransportErrorHandler(pendingStreamConnection, { account: name, transport: 'primary-stream', guildId, channelId: session.channelId });
+          logMediaEvent('info', 'media.stream.handshake_started', { account: name, guildId, channelId: session.channelId, attempt, voiceStatus: connection.status, voiceTransportReady: primaryVoiceTransportReady(connection) });
+          streamConnection = await withTimeout(connecting, MEDIA_STREAM_TIMEOUT_MS, `Discord media connection timed out after ${Math.round(MEDIA_STREAM_TIMEOUT_MS / 1000)} seconds`, {
+            onTimeout: () => cleanupPrimaryStreamAttempt(connection, pendingStreamConnection || connection.streamConnection),
+            onSettledAfterTimeout: () => cleanupPrimaryStreamAttempt(connection, pendingStreamConnection || connection.streamConnection),
+          });
+          logMediaEvent('info', 'media.stream.handshake_ready', { account: name, guildId, channelId: session.channelId, attempt, ...streamEvents, streamStatus: streamConnection.status });
+        } catch (streamError) {
+          const failedStream = pendingStreamConnection || connection.streamConnection;
+          logMediaEvent('error', 'media.stream.handshake_failed', {
+            account: name, guildId, channelId: session.channelId, attempt,
+            error: streamError?.message || String(streamError), ...streamEvents,
+            voiceStatus: connection.status, voiceTransportReady: primaryVoiceTransportReady(connection),
+            streamStatus: failedStream?.status ?? null,
+            hasSession: !!failedStream?.authentication?.sessionId,
+            hasToken: !!failedStream?.authentication?.token,
+            hasEndpoint: !!failedStream?.authentication?.endpoint,
+          });
+          throw streamError;
+        } finally {
+          client.off?.('raw', onRawStreamEvent);
+        }
         pendingStreamConnection = streamConnection;
         dispatcher = await playPrimaryMediaAndWait(streamConnection, source, Promise.resolve(), isCurrent);
       }
@@ -5599,3 +5637,4 @@ Object.assign(module.exports, { releasePrimaryVoiceForStreamer });
 Object.assign(module.exports, { isNativeAddonFailure, loadNativeWebRtcAddon, loadNativeStreamerAddon });
 Object.assign(module.exports, { mediaTransportMode: MEDIA_TRANSPORT_MODE });
 Object.assign(module.exports, { mediaResetRequired });
+Object.assign(module.exports, { goLiveBootstrapState });
