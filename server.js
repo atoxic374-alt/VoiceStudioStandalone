@@ -2623,10 +2623,10 @@ function cleanupTimedOutPrimaryVoice(client, channelId, expectedConnection = nul
   try { if (client.voice.connection === connection) client.voice.connection = null; } catch {}
   return true;
 }
-async function ensurePrimaryVoiceConnectionReady(client, guildId, channelId, session = {}) {
+async function ensurePrimaryVoiceConnectionReady(client, guildId, channelId, session = {}, { forceReconnect = false } = {}) {
   let connection = client?.voice?.connection;
   const targetChannelId = String(channelId);
-  if (String(voiceConnectionChannelId(connection) || '') === targetChannelId && primaryVoiceTransportReady(connection)) {
+  if (!forceReconnect && String(voiceConnectionChannelId(connection) || '') === targetChannelId && primaryVoiceTransportReady(connection)) {
     return { ok: true, connection, recovered: false };
   }
   const shard = getGatewayShard(client);
@@ -2634,7 +2634,10 @@ async function ensurePrimaryVoiceConnectionReady(client, guildId, channelId, ses
   const cached = readCachedGatewayVoiceState(client, guildId);
   if (cached && String(cached.channelId || '') !== targetChannelId) return { ok: false, error: 'The account is no longer in the selected voice room' };
   if (!cached && String(voiceConnectionChannelId(connection) || '') !== targetChannelId) return { ok: false, error: 'The account has no confirmed voice state for the selected room' };
-  if (connection?.streamConnection) return { ok: false, error: 'A screen-share transport is still active; stop it before rebuilding the primary media voice connection' };
+  if (connection?.streamConnection) {
+    if (!forceReconnect) return { ok: false, error: 'A screen-share transport is still active; stop it before rebuilding the primary media voice connection' };
+    cleanupPrimaryStreamAttempt(connection, connection.streamConnection);
+  }
   const channel = client?.guilds?.cache?.get?.(guildId)?.channels?.cache?.get?.(channelId);
   if (!channel || typeof client?.voice?.joinChannel !== 'function') return { ok: false, error: 'VoiceManager or the selected voice room is unavailable for media recovery' };
   try {
@@ -2818,6 +2821,8 @@ async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live',
   // playVideo() starts FFmpeg internally. Feed it the reusable one-hour file
   // instead of starting a second FFmpeg producer for every account.
   const source = ensureSyntheticVideo();
+  let forcePrimaryReconnectBeforeRetry = false;
+  const maxAttempts = mediaKind === 'camera' ? 1 : 2;
   let result = await retryMediaTransportImmediately(async (attempt) => {
     let streamConnection;
     let pendingStreamConnection;
@@ -2825,6 +2830,15 @@ async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live',
     let active;
     try {
       if (!isCurrent()) return { ok: false, cancelled: true, error: 'Media start cancelled by a newer account operation' };
+      if (attempt > 1 && forcePrimaryReconnectBeforeRetry) {
+        logMediaEvent('warn', 'media.primary_voice_rebuild_started', { account: name, guildId, channelId: session.channelId, mediaKind, reason: 'stream-handshake-event-missing', attempt });
+        const repaired = await ensurePrimaryVoiceConnectionReady(client, guildId, session.channelId, session, { forceReconnect: true });
+        if (!repaired.ok) return repaired;
+        connection = repaired.connection;
+        compactPrimaryVoiceClosingListeners(connection);
+        forcePrimaryReconnectBeforeRetry = false;
+        logMediaEvent('info', 'media.primary_voice_rebuild_ready', { account: name, guildId, channelId: session.channelId, mediaKind, attempt });
+      }
       if (mediaKind === 'camera') {
         // Camera video belongs to the existing VoiceConnection. A StreamConnection
         // is Discord's separate Go Live transport and will display this as Live.
@@ -2863,9 +2877,11 @@ async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live',
           logMediaEvent('info', 'media.stream.handshake_ready', { account: name, guildId, channelId: session.channelId, attempt, ...streamEvents, streamStatus: streamConnection.status });
         } catch (streamError) {
           const failedStream = pendingStreamConnection || connection.streamConnection;
+          forcePrimaryReconnectBeforeRetry = streamEvents.create === 0 || streamEvents.serverUpdate === 0;
           logMediaEvent('error', 'media.stream.handshake_failed', {
             account: name, guildId, channelId: session.channelId, attempt,
             error: streamError?.message || String(streamError), ...streamEvents,
+            recoveryPlan: forcePrimaryReconnectBeforeRetry ? 'rebuild-primary-before-one-retry' : 'retry-stream-on-primary',
             voiceStatus: connection.status, voiceTransportReady: primaryVoiceTransportReady(connection),
             streamStatus: failedStream?.status ?? null,
             hasSession: !!failedStream?.authentication?.sessionId,
@@ -2927,7 +2943,16 @@ async function startBuiltInGoLive(name, guildId, session, mediaKind = 'go-live',
       logMediaEvent('warn', 'media.primary_attempt_failed', { account: name, guildId, channelId: session.channelId, mediaKind, attempt, error: error?.message || String(error) });
       return failureResultFromError(error);
     }
-  }, 1, { account: name, guildId, channelId: session.channelId, mediaKind });
+  }, maxAttempts, { account: name, guildId, channelId: session.channelId, mediaKind });
+  if (!result.ok && mediaKind !== 'camera' && !result.cancelled) {
+    const reset = await sendVoiceOpConfirmed(client, guildId, session.channelId, {
+      selfMute: !!session.selfMute, selfDeaf: !!session.selfDeaf, selfVideo: false, selfStream: false,
+    }, 3000);
+    logMediaEvent(reset.ok ? 'info' : 'warn', 'media.go_live_failed_state_reset', {
+      account: name, guildId, channelId: session.channelId, attempts: result.attempts,
+      confirmed: !!reset.ok, error: reset.error || null,
+    });
+  }
   return result;
 }
 function voiceConnectionChannelId(connection) {

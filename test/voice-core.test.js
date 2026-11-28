@@ -978,6 +978,39 @@ test('rebuilds a broken camera voice connection through VoiceManager without a c
   assert.equal(client.voice.connection, freshConnection);
 });
 
+test('can force-rebuild a healthy primary voice connection for a missing stream handshake event', async () => {
+  const { ensurePrimaryVoiceConnectionReady } = require('../server');
+  const guildId = 'stream-recovery-guild';
+  const channelId = 'stream-recovery-room';
+  const userId = 'stream-recovery-user';
+  const channel = { id: channelId };
+  let oldDisconnects = 0;
+  const healthyConnection = { status: 0, channel, sockets: { udp: { socket: {}, discordAddress: '127.0.0.1', discordPort: 5000, localAddress: '127.0.0.1', localPort: 5001 } }, _disconnect() { oldDisconnects += 1; } };
+  const freshConnection = { status: 0, channel, sockets: { udp: { socket: {}, discordAddress: '127.0.0.1', discordPort: 5002, localAddress: '127.0.0.1', localPort: 5003 } } };
+  const shard = { status: 0, send() {} };
+  const client = {
+    user: { id: userId },
+    ws: { shards: { first: () => shard } },
+    guilds: { cache: new Map([[guildId, {
+      id: guildId,
+      channels: { cache: new Map([[channelId, channel]]) },
+      voiceStates: { cache: new Map([[userId, { id: userId, guildId, channelId }]]) },
+    }]]) },
+    voice: { connection: healthyConnection, async joinChannel(joinedChannel, options) {
+      assert.equal(joinedChannel, channel);
+      assert.deepEqual(options, { selfMute: false, selfDeaf: false, selfVideo: false });
+      this.connection = freshConnection;
+      return freshConnection;
+    } },
+  };
+  const result = await ensurePrimaryVoiceConnectionReady(client, guildId, channelId, {}, { forceReconnect: true });
+  assert.equal(result.ok, true);
+  assert.equal(result.recovered, true);
+  assert.equal(result.connection, freshConnection);
+  assert.equal(oldDisconnects, 1);
+  assert.equal(client.voice.connection, freshConnection);
+});
+
 test('does not accept a voice event that omits requested state flags', async () => {
   const { client } = fakeClient({ confirms: false });
   const pending = sendVoiceOpConfirmed(client, 'guild-1', 'channel-1', { selfMute: true }, 80);
